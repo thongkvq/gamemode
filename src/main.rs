@@ -1,8 +1,9 @@
 #![windows_subsystem = "windows"]
 
 mod sys;
+mod ui;
 
-use eframe::egui::{self, Color32, Margin, RichText, Rounding, Stroke};
+use eframe::egui::{self, Align2, Color32, CursorIcon, FontId, Margin, Rect, RichText, Rounding, Stroke, pos2, vec2};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1552,35 +1553,7 @@ impl App {
             fonts.families.entry(egui::FontFamily::Monospace).or_default().insert(0, "consolas".into());
         }
         cc.egui_ctx.set_fonts(fonts);
-
-        let mut visuals = egui::Visuals::dark();
-        visuals.panel_fill = Color32::from_rgb(10, 14, 21);
-        visuals.window_fill = Color32::from_rgb(10, 14, 21);
-        visuals.faint_bg_color = Color32::from_rgb(15, 21, 32);
-        visuals.extreme_bg_color = Color32::from_rgb(8, 11, 16);
-
-        visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(15, 22, 33);
-        visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(26, 38, 56));
-        visuals.widgets.noninteractive.rounding = Rounding::same(6.0);
-
-        visuals.widgets.inactive.bg_fill = Color32::from_rgb(19, 28, 42);
-        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(34, 48, 70));
-        visuals.widgets.inactive.rounding = Rounding::same(6.0);
-
-        visuals.widgets.hovered.bg_fill = Color32::from_rgb(28, 42, 65);
-        visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0, 229, 255));
-        visuals.widgets.hovered.rounding = Rounding::same(6.0);
-
-        visuals.widgets.active.bg_fill = Color32::from_rgb(0, 200, 120);
-        visuals.widgets.active.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0, 255, 163));
-        visuals.widgets.active.rounding = Rounding::same(6.0);
-
-        cc.egui_ctx.set_visuals(visuals);
-        cc.egui_ctx.style_mut(|s| {
-            s.spacing.scroll = egui::style::ScrollStyle::solid();
-            s.spacing.scroll.bar_width = 8.0;
-            s.spacing.scroll.bar_inner_margin = 4.0;
-        });
+        ui::setup_visuals(&cc.egui_ctx);
 
         let cfg = load_config();
         let is_admin = sys::is_admin();
@@ -1670,41 +1643,36 @@ fn render_stat_card(
     color: Color32,
     extra: Option<&str>,
 ) {
-    egui::Frame::none()
-        .fill(Color32::from_rgb(14, 20, 30))
-        .stroke(Stroke::new(1.0, Color32::from_rgb(28, 42, 62)))
-        .rounding(Rounding::same(8.0))
-        .inner_margin(Margin::same(10.0))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(title).size(11.0).strong().color(Color32::from_rgb(0, 229, 255)));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new(sub_text).size(11.0).color(Color32::from_rgb(130, 155, 180)));
-                });
+    ui::card(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(title).size(12.0).strong().color(ui::ACCENT));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(RichText::new(sub_text).size(11.0).color(ui::TEXT_MUTED));
             });
-            ui.add_space(3.0);
-
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("{:.1} GB", used_gb)).size(20.0).strong().color(Color32::WHITE));
-                ui.label(RichText::new(format!("/ {:.1} GB", total_gb)).size(12.0).color(Color32::from_rgb(150, 175, 200)));
-            });
-            ui.add_space(4.0);
-
-            let progress = egui::ProgressBar::new(ratio)
-                .fill(color)
-                .show_percentage()
-                .animate(false);
-            ui.add(progress);
-
-            if let Some(text) = extra {
-                ui.add_space(2.0);
-                ui.label(
-                    RichText::new(text)
-                        .size(9.5)
-                        .color(Color32::from_rgb(120, 150, 180)),
-                );
-            }
         });
+        ui.add_space(4.0);
+
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("{:.1} GB", used_gb)).size(20.0).strong().color(ui::TEXT_MAIN));
+            ui.label(RichText::new(format!("/ {:.1} GB", total_gb)).size(12.0).color(ui::TEXT_MUTED));
+        });
+        ui.add_space(6.0);
+
+        let progress = egui::ProgressBar::new(ratio)
+            .fill(color)
+            .show_percentage()
+            .animate(false);
+        ui.add(progress);
+
+        if let Some(text) = extra {
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(text)
+                    .size(10.5)
+                    .color(ui::TEXT_MUTED),
+            );
+        }
+    });
 }
 
 /// Kết quả một dòng app đang chạy: người dùng vừa tick/bỏ tick hay vừa bấm "Là game".
@@ -1723,9 +1691,9 @@ fn running_app_row(
     app: &RunningApp,
     is_game: bool,
 ) -> RowAction {
-    use egui::{pos2, vec2, Align2, CursorIcon, FontId, Rect, Sense, Shape};
+    use egui::{pos2, vec2, Align2, CursorIcon, FontId, Rect, Sense};
 
-    let row_h = 42.0;
+    let row_h = 42.0_f32;
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click());
     let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
     let mut action = if resp.clicked() {
@@ -1739,55 +1707,42 @@ fn running_app_row(
     let painter = ui.painter_at(rect);
 
     let bg = if hovered {
-        Color32::from_rgb(22, 34, 52)
-    } else if *keep {
-        Color32::from_rgb(15, 24, 36)
+        ui::CARD_HOVER
     } else {
         Color32::TRANSPARENT
     };
     painter.rect_filled(rect, Rounding::same(6.0), bg);
     if *keep {
         let bar = Rect::from_min_size(rect.min + vec2(0.0, 6.0), vec2(3.0, row_h - 12.0));
-        painter.rect_filled(bar, Rounding::same(2.0), Color32::from_rgb(0, 255, 163));
+        painter.rect_filled(bar, Rounding::same(1.5), ui::SUCCESS);
     }
 
-    let box_rect = Rect::from_center_size(pos2(rect.left() + 20.0, rect.center().y), vec2(18.0, 18.0));
-    let (fill, stroke) = if *keep {
-        (Color32::from_rgb(0, 255, 163), Color32::from_rgb(0, 255, 163))
-    } else if hovered {
-        (Color32::from_rgb(20, 30, 45), Color32::from_rgb(0, 229, 255))
-    } else {
-        (Color32::from_rgb(18, 26, 38), Color32::from_rgb(50, 70, 100))
-    };
-    painter.rect(box_rect, Rounding::same(4.0), fill, Stroke::new(1.5, stroke));
-    if *keep {
-        let c = box_rect.center();
-        painter.add(Shape::line(
-            vec![c + vec2(-5.0, 0.0), c + vec2(-1.5, 3.5), c + vec2(5.0, -4.0)],
-            Stroke::new(2.4, Color32::from_rgb(8, 12, 18)),
-        ));
-    }
+    let switch_rect = Rect::from_center_size(
+        pos2(rect.left() + 22.0, rect.center().y),
+        vec2(28.0, 16.0),
+    );
+    ui::draw_switch(&painter, switch_rect, *keep, hovered);
 
     let title = app.display.clone().unwrap_or_else(|| app.exe_name.clone());
     let name_color = if *keep {
-        Color32::from_rgb(90, 210, 255)
+        ui::SUCCESS
     } else {
-        Color32::WHITE
+        ui::TEXT_MAIN
     };
 
-    let x0 = rect.left() + 40.0;
+    let x0 = rect.left() + 44.0;
     let y_top = rect.top() + 13.0;
     let name = painter.layout_no_wrap(title, FontId::proportional(13.0), name_color);
     let name_w = name.size().x;
     painter.galley(pos2(x0, y_top - name.size().y / 2.0), name, name_color);
 
-    let tag = painter.layout_no_wrap(app.exe_name.clone(), FontId::proportional(10.5), Color32::from_rgb(130, 150, 175));
-    painter.galley(pos2(x0 + name_w + 8.0, y_top - tag.size().y / 2.0), tag, Color32::WHITE);
+    let tag = painter.layout_no_wrap(app.exe_name.clone(), FontId::monospace(10.5), ui::TEXT_DIM);
+    painter.galley(pos2(x0 + name_w + 8.0, y_top - tag.size().y / 2.0), tag, ui::TEXT_DIM);
 
     let (badge, badge_color) = if *keep {
-        ("GIỮ LẠI", Color32::from_rgb(0, 255, 163))
+        ("GIỮ LẠI", ui::SUCCESS)
     } else {
-        ("SẼ TẮT", Color32::from_rgb(255, 150, 50))
+        ("SẼ TẮT", ui::WARNING)
     };
     painter.text(
         pos2(rect.right() - 10.0, y_top),
@@ -1802,7 +1757,7 @@ fn running_app_row(
         Align2::LEFT_CENTER,
         format!("{} process — tổng {}", app.count, fmt_ram(app.total_ws)),
         FontId::proportional(11.0),
-        Color32::from_rgb(115, 135, 155),
+        ui::TEXT_MUTED,
     );
 
     match app.exe_path.as_ref() {
@@ -1816,7 +1771,7 @@ fn running_app_row(
 
     // Nút nhỏ "Là game" (hoặc nhãn ✓ nếu exe đã nằm trong danh sách game).
     let btn_rect = Rect::from_min_max(
-        pos2(rect.right() - 78.0, rect.top() + 22.0),
+        pos2(rect.right() - 80.0, rect.top() + 22.0),
         pos2(rect.right() - 8.0, rect.top() + 38.0),
     );
     if is_game {
@@ -1824,17 +1779,17 @@ fn running_app_row(
             btn_rect.center(),
             Align2::CENTER_CENTER,
             "✓ LÀ GAME",
-            FontId::proportional(9.5),
-            Color32::from_rgb(0, 255, 163),
+            FontId::proportional(10.0),
+            ui::SUCCESS,
         );
     } else {
         let btn = egui::Button::new(
             RichText::new("Là game")
-                .size(9.5)
-                .color(Color32::from_rgb(160, 210, 255)),
+                .size(10.0)
+                .color(ui::ACCENT),
         )
-        .fill(Color32::from_rgb(16, 26, 40))
-        .stroke(Stroke::new(1.0_f32, Color32::from_rgb(40, 70, 105)))
+        .fill(ui::CARD_BG)
+        .stroke(Stroke::new(1.0_f32, ui::BORDER))
         .rounding(Rounding::same(4.0));
         if ui.put(btn_rect, btn).on_hover_text("Thêm exe này vào danh sách game để tự tối ưu khi mở game").clicked() {
             action = RowAction::MarkGame;
@@ -1842,87 +1797,6 @@ fn running_app_row(
     }
 
     action
-}
-
-fn service_row(ui: &mut egui::Ui, on: &mut bool, svc_name: &str, display_name: &str, desc: &str) -> bool {
-    use egui::{pos2, vec2, Align2, CursorIcon, FontId, Rect, Sense, Shape};
-
-    let row_h = 40.0;
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click());
-    let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
-    let clicked = resp.clicked();
-    if clicked {
-        *on = !*on;
-    }
-
-    let painter = ui.painter_at(rect);
-    let hovered = resp.hovered();
-
-    let bg = if hovered {
-        Color32::from_rgb(22, 34, 52)
-    } else if *on {
-        Color32::from_rgb(15, 24, 36)
-    } else {
-        Color32::TRANSPARENT
-    };
-    painter.rect_filled(rect, Rounding::same(6.0), bg);
-    if *on {
-        let bar = Rect::from_min_size(rect.min + vec2(0.0, 6.0), vec2(3.0, row_h - 12.0));
-        painter.rect_filled(bar, Rounding::same(2.0), Color32::from_rgb(0, 229, 255));
-    }
-
-    let box_rect = Rect::from_center_size(pos2(rect.left() + 20.0, rect.center().y), vec2(18.0, 18.0));
-    let (fill, stroke) = if *on {
-        (Color32::from_rgb(0, 229, 255), Color32::from_rgb(0, 229, 255))
-    } else if hovered {
-        (Color32::from_rgb(20, 30, 45), Color32::from_rgb(0, 229, 255))
-    } else {
-        (Color32::from_rgb(18, 26, 38), Color32::from_rgb(50, 70, 100))
-    };
-    painter.rect(box_rect, Rounding::same(4.0), fill, Stroke::new(1.5, stroke));
-    if *on {
-        let c = box_rect.center();
-        painter.add(Shape::line(
-            vec![c + vec2(-5.0, 0.0), c + vec2(-1.5, 3.5), c + vec2(5.0, -4.0)],
-            Stroke::new(2.4, Color32::from_rgb(8, 12, 18)),
-        ));
-    }
-
-    let is_running = sys::is_service_running(svc_name);
-    let name_color = if *on { Color32::WHITE } else { Color32::from_rgb(125, 135, 148) };
-
-    let x0 = rect.left() + 40.0;
-    let y_top = rect.top() + 12.0;
-    let name = painter.layout_no_wrap(display_name.to_string(), FontId::proportional(13.5), name_color);
-    let name_w = name.size().x;
-    painter.galley(pos2(x0, y_top - name.size().y / 2.0), name, name_color);
-
-    let tag = painter.layout_no_wrap(format!("({})", svc_name), FontId::proportional(10.5), Color32::from_rgb(130, 150, 175));
-    let tag_w = tag.size().x;
-    painter.galley(pos2(x0 + name_w + 6.0, y_top - tag.size().y / 2.0), tag, Color32::WHITE);
-
-    let (badge_txt, badge_color) = if is_running {
-        ("ĐANG CHẠY", Color32::from_rgb(0, 255, 163))
-    } else {
-        ("ĐÃ DỪNG", Color32::from_rgb(120, 130, 140))
-    };
-    painter.text(
-        pos2(x0 + name_w + tag_w + 12.0, y_top),
-        Align2::LEFT_CENTER,
-        badge_txt,
-        FontId::proportional(10.0),
-        badge_color,
-    );
-
-    painter.text(
-        pos2(x0, rect.top() + 29.0),
-        Align2::LEFT_CENTER,
-        desc,
-        FontId::proportional(11.0),
-        Color32::from_rgb(115, 135, 155),
-    );
-
-    clicked
 }
 
 /// "2026-05-05 18:50:12" -> "18:50"
@@ -1973,700 +1847,694 @@ impl eframe::App for App {
         });
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(Color32::from_rgb(10, 14, 21)).inner_margin(Margin::same(14.0)))
+            .frame(egui::Frame::none().fill(ui::BG).inner_margin(Margin::same(10.0)))
             .show(ctx, |ui| {
-                // 1. TOP HEADER BANNER
-                egui::Frame::none()
-                    .fill(Color32::from_rgb(15, 22, 33))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(32, 48, 70)))
-                    .rounding(Rounding::same(8.0))
-                    .inner_margin(Margin::symmetric(14.0, 10.0))
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("⚡").size(24.0).color(Color32::from_rgb(0, 255, 163)));
-                            ui.vertical(|ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        RichText::new("DELTA FORCE")
-                                            .size(19.0)
-                                            .strong()
-                                            .color(Color32::from_rgb(0, 255, 163)),
-                                    );
-                                    ui.label(
-                                        RichText::new("RAM PURGE")
-                                            .size(19.0)
-                                            .strong()
-                                            .color(Color32::from_rgb(0, 229, 255)),
-                                    );
-                                });
-                                ui.label(
-                                    RichText::new("TACTICAL MEMORY BOOSTER // PRO EDITION")
-                                        .size(9.5)
-                                        .strong()
-                                        .color(Color32::from_rgb(120, 145, 175)),
-                                );
-                            });
-
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if busy {
-                                    egui::Frame::none()
-                                        .fill(Color32::from_rgb(45, 28, 12))
-                                        .stroke(Stroke::new(1.0, Color32::from_rgb(255, 145, 45)))
-                                        .rounding(Rounding::same(6.0))
-                                        .inner_margin(Margin::symmetric(8.0, 4.0))
-                                        .show(ui, |ui| {
-                                            ui.label(RichText::new("● PURGING...").size(11.0).strong().color(Color32::from_rgb(255, 165, 60)));
-                                        });
-                                } else {
-                                    egui::Frame::none()
-                                        .fill(Color32::from_rgb(12, 38, 26))
-                                        .stroke(Stroke::new(1.0, Color32::from_rgb(0, 255, 163)))
-                                        .rounding(Rounding::same(6.0))
-                                        .inner_margin(Margin::symmetric(8.0, 4.0))
-                                        .show(ui, |ui| {
-                                            ui.label(RichText::new("● SYSTEM READY").size(11.0).strong().color(Color32::from_rgb(0, 255, 163)));
-                                        });
-                                }
-                            });
-                        });
-                    });
-
-                ui.add_space(8.0);
-
-                // 2. HUD METRICS (2 CỘT CÂN ĐỐI 50/50)
-                let m = self.mem;
-                let ram_used = m.total - m.avail;
-                let ram_ratio = if m.total > 0 { ram_used as f32 / m.total as f32 } else { 0.0 };
-                let ram_color = if ram_ratio > 0.85 {
-                    Color32::from_rgb(255, 60, 60)
-                } else if ram_ratio > 0.70 {
-                    Color32::from_rgb(255, 160, 40)
-                } else {
-                    Color32::from_rgb(0, 255, 163)
-                };
-
-                let commit_ratio = if m.commit_limit > 0 {
-                    m.commit_used as f32 / m.commit_limit as f32
-                } else {
-                    0.0
-                };
-                let commit_color = if commit_ratio > 0.85 {
-                    Color32::from_rgb(255, 50, 70)
-                } else if commit_ratio > 0.70 {
-                    Color32::from_rgb(255, 170, 30)
-                } else {
-                    Color32::from_rgb(0, 210, 255)
-                };
-
-                ui.columns(2, |cols| {
-                    render_stat_card(
-                        &mut cols[0],
-                        "RAM VẬT LÝ",
-                        &format!("Trống: {:.1} GB", m.avail as f64 / GB),
-                        ram_used as f64 / GB,
-                        m.total as f64 / GB,
-                        ram_ratio,
-                        ram_color,
-                        ram_extra.as_deref(),
-                    );
-                    render_stat_card(
-                        &mut cols[1],
-                        "BỘ NHỚ ẢO (PAGEFILE)",
-                        if commit_ratio > 0.85 { "⚠ NGUY HIỂM" } else { "An toàn" },
-                        m.commit_used as f64 / GB,
-                        m.commit_limit as f64 / GB,
-                        commit_ratio,
-                        commit_color,
-                        None,
-                    );
-                });
-
-                ui.add_space(8.0);
-
-                // 3. ACTION CONTROL DECK
-                let boost_btn_text = if busy {
-                    RichText::new("⏳  ĐANG THANH LỌC BỘ NHỚ & DỊCH VỤ...")
-                        .size(15.0)
-                        .strong()
-                        .color(Color32::WHITE)
-                } else {
-                    RichText::new("🚀  BẬT GAME BOOST (DỌN RAM & SERVICES)")
-                        .size(15.5)
-                        .strong()
-                        .color(Color32::BLACK)
-                };
-
-                let boost_btn = egui::Button::new(boost_btn_text)
-                    .fill(if busy {
-                        Color32::from_rgb(40, 60, 80)
-                    } else {
-                        Color32::from_rgb(0, 255, 163)
-                    })
-                    .rounding(Rounding::same(8.0));
-
-                if ui.add_sized([ui.available_width(), 44.0], boost_btn).clicked() && !busy {
-                    optimize(sh.clone(), false);
-                }
-
-                ui.add_space(6.0);
-
-                ui.columns(2, |cols| {
-                    let restore_btn = egui::Button::new(
-                        RichText::new("↩  Khôi Phục App & Services")
-                            .size(13.0)
-                            .color(Color32::from_rgb(180, 215, 245)),
-                    )
-                    .fill(Color32::from_rgb(18, 26, 38))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(42, 62, 90)))
-                    .rounding(Rounding::same(6.0));
-
-                    if cols[0].add_sized([cols[0].available_width(), 32.0], restore_btn).clicked() && !busy {
-                        restore(sh.clone());
-                    }
-
-                    let clear_btn = egui::Button::new(
-                        RichText::new("🧹  Xoá Nhật Ký")
-                            .size(13.0)
-                            .color(Color32::from_rgb(140, 165, 190)),
-                    )
-                    .fill(Color32::from_rgb(15, 22, 32))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(32, 46, 68)))
-                    .rounding(Rounding::same(6.0));
-
-                    if cols[1].add_sized([cols[1].available_width(), 32.0], clear_btn).clicked() {
-                        sh.log.lock().unwrap().clear();
-                    }
-                });
-
-                ui.add_space(6.0);
-
-                // 3b. TRẠNG THÁI SESSION ĐÃ LƯU
-                egui::Frame::none()
-                    .fill(Color32::from_rgb(12, 17, 25))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(26, 38, 56)))
-                    .rounding(Rounding::same(6.0))
-                    .inner_margin(Margin::symmetric(10.0, 6.0))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            match session_view.as_ref() {
-                                Some(s) => {
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "💾 Session đã lưu: {} app, {} service, {} Wi-Fi, DVR {} — lúc {}",
-                                            s.apps.len(),
-                                            s.services.len(),
-                                            s.wlan_autoconf_off.len(),
-                                            if s.gamedvr_prev.is_some() { "có" } else { "không" },
-                                            time_part(&s.saved_at)
-                                        ))
-                                        .size(10.5)
-                                        .color(Color32::from_rgb(0, 229, 255)),
-                                    );
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        if ui.button(RichText::new(if self.show_session { "Ẩn" } else { "Xem danh sách" }).size(10.5)).clicked() {
-                                            self.show_session = !self.show_session;
-                                        }
-                                    });
-                                }
-                                None => {
-                                    ui.label(
-                                        RichText::new("💾 Chưa có session nào được lưu — bấm Game Boost để chụp phiên hiện tại.")
-                                            .size(10.5)
-                                            .color(Color32::from_rgb(95, 125, 155)),
-                                    );
-                                }
-                            }
-                        });
-
-                        if self.show_session {
-                            if let Some(s) = session_view.as_ref() {
-                                ui.add_space(3.0);
-                                ui.label(
-                                    RichText::new("Tick app nào để Restore mở lại app đó:")
-                                        .size(9.5)
-                                        .color(Color32::from_rgb(95, 125, 155)),
-                                );
-                                egui::ScrollArea::vertical()
-                                    .id_salt("session_list")
-                                    .max_height(120.0)
-                                    .auto_shrink([false, false])
-                                    .show(ui, |ui| {
-                                        let mut sel = sh.restore_sel.lock().unwrap();
-                                        for a in s.apps.iter() {
-                                            let cwd = a.cwd.clone().unwrap_or_else(|| "(không rõ)".into());
-                                            let checked = sel.entry(app_key(a)).or_insert(true);
-                                            ui.horizontal(|ui| {
-                                                ui.checkbox(checked, "");
-                                                ui.label(
-                                                    RichText::new(format!(
-                                                        "{} [{}] — cwd: {}",
-                                                        a.display, a.exe, cwd
-                                                    ))
-                                                    .monospace()
-                                                    .size(10.0)
-                                                    .color(Color32::from_rgb(150, 185, 215)),
-                                                );
-                                            });
-                                        }
-                                        for svc in s.services.iter() {
-                                            ui.label(
-                                                RichText::new(format!("  • service: {}", svc))
-                                                    .monospace()
-                                                    .size(10.0)
-                                                    .color(Color32::from_rgb(120, 200, 170)),
-                                            );
-                                        }
-                                    });
-                            }
-                        }
-                    });
-
-                ui.add_space(8.0);
-
-                // 3c. TỰ ĐỘNG KHI CHƠI GAME (watcher + danh sách exe game)
-                egui::Frame::none()
-                    .fill(Color32::from_rgb(13, 18, 27))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(26, 38, 56)))
-                    .rounding(Rounding::same(8.0))
-                    .inner_margin(Margin::same(10.0))
-                    .show(ui, |ui| {
-                        ui.label(
-                            RichText::new("🤖 TỰ ĐỘNG KHI CHƠI GAME")
-                                .size(11.0)
-                                .strong()
-                                .color(Color32::from_rgb(0, 229, 255)),
-                        );
-                        ui.add_space(3.0);
-                        ui.label(
-                            RichText::new("Watcher quét tên process mỗi 3 giây (không mở handle vào game / ACE).")
-                                .size(9.5)
-                                .color(Color32::from_rgb(110, 135, 165)),
-                        );
-
-                        let mut changed = false;
-                        if ui
-                            .checkbox(
-                                &mut opts_view.auto_enabled,
-                                RichText::new("Tự tối ưu khi game mở").size(11.5),
-                            )
-                            .on_hover_text("Phát hiện exe game là chờ 5 giây cho game ổn định rồi tối ưu")
-                            .changed()
-                        {
-                            changed = true;
-                        }
-                        if ui
-                            .checkbox(
-                                &mut opts_view.auto_restore,
-                                RichText::new("Tự Restore khi game tắt").size(11.5),
-                            )
-                            .on_hover_text("Game tắt liên tục 15 giây thì khôi phục app & service (chỉ khi phiên này do auto tối ưu)")
-                            .changed()
-                        {
-                            changed = true;
-                        }
-
-                        // Chạy cùng Windows bằng Task Scheduler (quyền cao nhất, không bật UAC).
-                        let mut task_on = self.task_on;
-                        if ui
-                            .checkbox(
-                                &mut task_on,
-                                RichText::new("Chạy cùng Windows (Task Scheduler, quyền cao nhất)").size(11.5),
-                            )
-                            .on_hover_text("Tạo task \"GameMode\" chạy lúc đăng nhập với /RL HIGHEST — không hiện UAC")
-                            .changed()
-                        {
-                            let r = if task_on { sys::task_create() } else { sys::task_delete() };
-                            match r {
-                                Ok(_) => {
-                                    self.task_on = task_on;
-                                    self.last_task_check = Instant::now();
-                                    sh.log(
-                                        if task_on {
-                                            "  ✔ [TASK] Đã tạo task GameMode: tự chạy cùng Windows với quyền cao nhất.".into()
-                                        } else {
-                                            "  • [TASK] Đã xoá task GameMode.".into()
-                                        },
-                                        Color32::from_rgb(0, 255, 163),
-                                    );
-                                }
-                                Err(e) => {
-                                    self.last_task_check = Instant::now() - Duration::from_secs(20);
-                                    sh.log(
-                                        format!("  ⚠ [TASK] Không đổi được task GameMode: {}", e),
-                                        Color32::from_rgb(255, 120, 120),
-                                    );
-                                }
-                            }
-                        }
-
-                        ui.add_space(4.0);
-                        ui.label(
-                            RichText::new("Danh sách exe game (exe trong danh sách này luôn được GIỮ LẠI khi tối ưu):")
-                                .size(9.5)
-                                .color(Color32::from_rgb(110, 135, 165)),
-                        );
-
-                        let mut remove: Option<String> = None;
-                        egui::ScrollArea::vertical()
-                            .id_salt("game_list")
-                            .max_height(84.0)
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                for exe in games_view.iter() {
+                        // 1. TOP HEADER BANNER
+                        ui::card(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("⚡").size(24.0).color(ui::ACCENT));
+                                ui.vertical(|ui| {
                                     ui.horizontal(|ui| {
-                                        let path = sh.game_paths.lock().unwrap().get(exe).cloned();
-                                        let label = match path {
-                                            Some(p) => format!("{}  —  {}", exe, p),
-                                            None => format!("{}  —  (chưa biết đường dẫn)", exe),
-                                        };
                                         ui.label(
-                                            RichText::new(label)
-                                                .monospace()
-                                                .size(10.0)
-                                                .color(Color32::from_rgb(150, 185, 215)),
+                                            RichText::new("DELTA FORCE")
+                                                .size(18.0)
+                                                .strong()
+                                                .color(ui::SUCCESS),
                                         );
-                                        if ui
-                                            .small_button(RichText::new("✖").size(10.0))
-                                            .on_hover_text("Xoá khỏi danh sách game")
-                                            .clicked()
-                                        {
-                                            remove = Some(exe.clone());
-                                        }
+                                        ui.label(
+                                            RichText::new("RAM PURGE")
+                                                .size(18.0)
+                                                .strong()
+                                                .color(ui::ACCENT),
+                                        );
                                     });
-                                }
-                            });
-                        if let Some(exe) = remove {
-                            sh.games.lock().unwrap().retain(|e| e != &exe);
-                            self.save();
-                        }
-
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.game_input)
-                                    .hint_text("vd: game-client-win64-shipping.exe")
-                                    .desired_width(210.0),
-                            );
-                            if ui.button(RichText::new("Thêm").size(11.0)).clicked() {
-                                let exe = self.game_input.trim().to_lowercase();
-                                if !exe.is_empty() {
-                                    let mut games = sh.games.lock().unwrap();
-                                    if !games.contains(&exe) {
-                                        games.push(exe.clone());
-                                    }
-                                    drop(games);
-                                    self.game_input.clear();
-                                    self.save();
-                                    sh.log(
-                                        format!("  • [GAME] Đã thêm {} vào danh sách game.", exe),
-                                        Color32::from_rgb(0, 229, 255),
+                                    ui.label(
+                                        RichText::new("TACTICAL MEMORY BOOSTER // PRO EDITION")
+                                            .size(9.5)
+                                            .strong()
+                                            .color(ui::TEXT_MUTED),
                                     );
-                                }
-                            }
-                            ui.label(
-                                RichText::new("(hoặc bấm 'Là game' ở tab ỨNG DỤNG ĐANG CHẠY)")
-                                    .size(9.5)
-                                    .color(Color32::from_rgb(110, 135, 165)),
-                            );
-                        });
+                                });
 
-                        if changed {
-                            *sh.opts.lock().unwrap() = opts_view;
-                            self.save();
-                        }
-                    });
-
-                ui.add_space(8.0);
-
-                // 3d. TỐI ƯU KHI CHƠI (4 tuỳ chọn)
-                egui::Frame::none()
-                    .fill(Color32::from_rgb(13, 18, 27))
-                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(26, 38, 56)))
-                    .rounding(Rounding::same(8.0))
-                    .inner_margin(Margin::same(10.0))
-                    .show(ui, |ui| {
-                        ui.label(
-                            RichText::new("⚙ TỐI ƯU KHI CHƠI")
-                                .size(11.0)
-                                .strong()
-                                .color(Color32::from_rgb(0, 229, 255)),
-                        );
-                        ui.add_space(3.0);
-
-                        if ui
-                            .checkbox(
-                                &mut opts_view.standby,
-                                RichText::new("Xả standby list (RAM chờ) khi tối ưu").size(11.5),
-                            )
-                            .on_hover_text("Thay cho trim working-set cũ: không đẩy RAM app đang chạy ra pagefile. Lúc đang chơi, nếu Free < 1 GB và Standby > 1 GB thì tự xả (cách nhau tối thiểu 60 giây)")
-                            .changed()
-                        {
-                            opts_changed = true;
-                        }
-                        if ui
-                            .checkbox(
-                                &mut opts_view.gpu,
-                                RichText::new("Ép game dùng GPU rời (NVIDIA)").size(11.5),
-                            )
-                            .on_hover_text("Ghi HKCU\\Software\\Microsoft\\DirectX\\UserGpuPreferences = GpuPreference=2; — áp dụng từ lần mở game SAU, không hoàn tác khi Restore")
-                            .changed()
-                        {
-                            opts_changed = true;
-                        }
-                        if ui
-                            .checkbox(
-                                &mut opts_view.wlan,
-                                RichText::new("Tắt quét Wi-Fi nền khi chơi").size(11.5),
-                            )
-                            .on_hover_text("Tắt autoconf của interface Wi-Fi đang kết nối")
-                            .changed()
-                        {
-                            opts_changed = true;
-                        }
-                        ui.label(
-                            RichText::new("Khi tắt quét Wi-Fi: mạng vẫn giữ kết nối hiện tại nhưng KHÔNG tự kết nối lại nếu rớt; Restore sẽ bật lại.")
-                                .size(9.5)
-                                .color(Color32::from_rgb(255, 170, 60)),
-                        );
-                        if ui
-                            .checkbox(
-                                &mut opts_view.gamedvr,
-                                RichText::new("Tắt Game DVR / ghi clip nền của Windows khi chơi").size(11.5),
-                            )
-                            .on_hover_text("Đặt GameDVR_Enabled và AppCaptureEnabled về 0; Restore ghi lại đúng giá trị cũ")
-                            .changed()
-                        {
-                            opts_changed = true;
-                        }
-
-                        if opts_changed {
-                            *sh.opts.lock().unwrap() = opts_view;
-                            self.save();
-                        }
-                    });
-
-                ui.add_space(8.0);
-
-                // 4. DANH SÁCH CẤU HÌNH: TABS CHO ỨNG DỤNG VÀ SERVICES
-                egui::Frame::none()
-                    .fill(Color32::from_rgb(13, 18, 27))
-                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(26, 38, 56)))
-                    .rounding(Rounding::same(8.0))
-                    .inner_margin(Margin::same(10.0))
-                    .show(ui, |ui| {
-                        let kept = {
-                            let keep = sh.keep.lock().unwrap();
-                            apps_snapshot
-                                .iter()
-                                .filter(|a| keep_decision(&keep, &a.exe_lower))
-                                .count()
-                        };
-                        let svc_sel = sh.svc.lock().unwrap().iter().filter(|&&x| x).count();
-
-                        // Tab Switcher
-                        ui.horizontal(|ui| {
-                            let is_app = self.tab == ConfigTab::Apps;
-                            let app_tab_btn = egui::Button::new(
-                                RichText::new(format!("💻 ỨNG DỤNG ĐANG CHẠY ({}/{})", kept, apps_snapshot.len()))
-                                    .size(11.5)
-                                    .strong()
-                                    .color(if is_app { Color32::from_rgb(0, 255, 163) } else { Color32::GRAY }),
-                            )
-                            .fill(if is_app { Color32::from_rgb(18, 30, 45) } else { Color32::from_rgb(11, 15, 22) })
-                            .stroke(Stroke::new(1.0, if is_app { Color32::from_rgb(0, 255, 163) } else { Color32::from_rgb(28, 40, 58) }))
-                            .rounding(Rounding::same(6.0));
-
-                            if ui.add(app_tab_btn).clicked() {
-                                self.tab = ConfigTab::Apps;
-                            }
-
-                            let is_svc = self.tab == ConfigTab::Services;
-                            let svc_tab_btn = egui::Button::new(
-                                RichText::new(format!("🛠 SERVICES HỆ THỐNG ({}/{})", svc_sel, SERVICE_TARGETS.len()))
-                                    .size(11.5)
-                                    .strong()
-                                    .color(if is_svc { Color32::from_rgb(0, 229, 255) } else { Color32::GRAY }),
-                            )
-                            .fill(if is_svc { Color32::from_rgb(18, 30, 45) } else { Color32::from_rgb(11, 15, 22) })
-                            .stroke(Stroke::new(1.0, if is_svc { Color32::from_rgb(0, 229, 255) } else { Color32::from_rgb(28, 40, 58) }))
-                            .rounding(Rounding::same(6.0));
-
-                            if ui.add(svc_tab_btn).clicked() {
-                                self.tab = ConfigTab::Services;
-                            }
-
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if self.tab == ConfigTab::Apps {
-                                    if ui.add_enabled(!scanning, egui::Button::new(RichText::new(if scanning { "Đang quét..." } else { "🔄 Làm mới" }).size(10.5))).clicked() {
-                                        self.start_scan();
-                                    }
-                                    if ui.button(RichText::new("Giữ tất cả").size(10.5)).clicked() {
-                                        let mut keep = sh.keep.lock().unwrap();
-                                        for a in apps_snapshot.iter() {
-                                            keep.insert(a.exe_lower.clone(), true);
-                                        }
-                                        drop(keep);
-                                        self.save();
-                                    }
-                                    if ui.button(RichText::new("Bỏ giữ tất cả").size(10.5)).clicked() {
-                                        let mut keep = sh.keep.lock().unwrap();
-                                        for a in apps_snapshot.iter() {
-                                            keep.insert(a.exe_lower.clone(), false);
-                                        }
-                                        drop(keep);
-                                        self.save();
-                                    }
-                                    if ui.button(RichText::new("Mặc định").size(10.5)).clicked() {
-                                        let mut keep = sh.keep.lock().unwrap();
-                                        for a in apps_snapshot.iter() {
-                                            keep.insert(a.exe_lower.clone(), default_keep(&a.exe_lower));
-                                        }
-                                        drop(keep);
-                                        self.save();
-                                    }
-                                } else {
-                                    if ui.button(RichText::new("Mặc định").size(10.5)).clicked() {
-                                        let mut svc = sh.svc.lock().unwrap();
-                                        for (i, (_, _, _, def)) in SERVICE_TARGETS.iter().enumerate() {
-                                            svc[i] = *def;
-                                        }
-                                        drop(svc);
-                                        self.save();
-                                    }
-                                    if ui.button(RichText::new("Chọn hết").size(10.5)).clicked() {
-                                        for x in sh.svc.lock().unwrap().iter_mut() {
-                                            *x = true;
-                                        }
-                                        self.save();
-                                    }
-                                }
-                            });
-                        });
-
-                        ui.add_space(4.0);
-
-                        // Banner trạng thái Admin & Lưu cấu hình
-                        ui.horizontal(|ui| {
-                            let (status, color) = match self.saved_at {
-                                Some((t, true)) if t.elapsed() < Duration::from_millis(2500) => {
-                                    ("✔ Đã lưu lựa chọn", Color32::from_rgb(0, 255, 163))
-                                }
-                                Some((t, false)) if t.elapsed() < Duration::from_millis(4000) => {
-                                    ("⚠ Không lưu được cấu hình", Color32::from_rgb(255, 100, 100))
-                                }
-                                _ => ("💾 Tự động ghi nhớ cho lần sau", Color32::from_rgb(95, 125, 155)),
-                            };
-                            ui.label(RichText::new(status).size(10.5).color(color));
-
-                            if self.tab == ConfigTab::Services {
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if self.is_admin {
-                                        ui.label(RichText::new("✔ QUYỀN ADMIN").size(10.0).strong().color(Color32::from_rgb(0, 255, 163)));
+                                    if busy {
+                                        egui::Frame::none()
+                                            .fill(ui::CARD_HOVER)
+                                            .stroke(Stroke::new(1.0_f32, ui::WARNING))
+                                            .rounding(Rounding::same(6.0))
+                                            .inner_margin(Margin::symmetric(8.0, 4.0))
+                                            .show(ui, |ui| {
+                                                ui.label(RichText::new("● PURGING...").size(11.0).strong().color(ui::WARNING));
+                                            });
                                     } else {
-                                        let btn = egui::Button::new(
-                                            RichText::new("🛡 Cấp Quyền Admin").size(10.0).strong().color(Color32::from_rgb(255, 180, 40)),
-                                        )
-                                        .fill(Color32::from_rgb(45, 30, 12))
-                                        .stroke(Stroke::new(1.0, Color32::from_rgb(255, 160, 40)))
-                                        .rounding(Rounding::same(4.0));
-                                        if ui.add(btn).clicked() {
-                                            restart_as_admin();
-                                        }
+                                        egui::Frame::none()
+                                            .fill(ui::CARD_HOVER)
+                                            .stroke(Stroke::new(1.0_f32, ui::SUCCESS))
+                                            .rounding(Rounding::same(6.0))
+                                            .inner_margin(Margin::symmetric(8.0, 4.0))
+                                            .show(ui, |ui| {
+                                                ui.label(RichText::new("● SYSTEM READY").size(11.0).strong().color(ui::SUCCESS));
+                                            });
                                     }
                                 });
-                            }
+                            });
                         });
+
+                        ui.add_space(10.0);
+
+                        // 2. HUD METRICS (2 CỘT CÂN ĐỐI 50/50)
+                        let m = self.mem;
+                        let ram_used = m.total - m.avail;
+                        let ram_ratio = if m.total > 0 { ram_used as f32 / m.total as f32 } else { 0.0 };
+                        let ram_color = if ram_ratio > 0.85 {
+                            ui::DANGER
+                        } else if ram_ratio > 0.70 {
+                            ui::WARNING
+                        } else {
+                            ui::SUCCESS
+                        };
+
+                        let commit_ratio = if m.commit_limit > 0 {
+                            m.commit_used as f32 / m.commit_limit as f32
+                        } else {
+                            0.0
+                        };
+                        let commit_color = if commit_ratio > 0.85 {
+                            ui::DANGER
+                        } else if commit_ratio > 0.70 {
+                            ui::WARNING
+                        } else {
+                            ui::ACCENT
+                        };
+
+                        ui.columns(2, |cols| {
+                            render_stat_card(
+                                &mut cols[0],
+                                "RAM VẬT LÝ",
+                                &format!("Trống: {:.1} GB", m.avail as f64 / GB),
+                                ram_used as f64 / GB,
+                                m.total as f64 / GB,
+                                ram_ratio,
+                                ram_color,
+                                ram_extra.as_deref(),
+                            );
+                            render_stat_card(
+                                &mut cols[1],
+                                "BỘ NHỚ ẢO (PAGEFILE)",
+                                if commit_ratio > 0.85 { "⚠ NGUY HIỂM" } else { "An toàn" },
+                                m.commit_used as f64 / GB,
+                                m.commit_limit as f64 / GB,
+                                commit_ratio,
+                                commit_color,
+                                None,
+                            );
+                        });
+
+                        ui.add_space(10.0);
+
+                        // 3. ACTION CONTROL DECK
+                        let boost_btn_text = if busy {
+                            "⏳  ĐANG THANH LỌC BỘ NHỚ & DỊCH VỤ..."
+                        } else {
+                            "🚀  BẬT GAME BOOST (DỌN RAM & SERVICES)"
+                        };
+
+                        let boost_btn = ui::primary_button(boost_btn_text, busy);
+                        if ui.add_sized([ui.available_width(), 44.0], boost_btn).clicked() && !busy {
+                            optimize(sh.clone(), false);
+                        }
 
                         ui.add_space(6.0);
 
-                        // ScrollArea danh sách
-                        egui::ScrollArea::vertical()
-                            .id_salt(if self.tab == ConfigTab::Apps { "app_list" } else { "svc_list" })
-                            .max_height(175.0)
-                            .auto_shrink([false, false])
-                            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
-                            .show(ui, |ui| {
-                                let mut changed = false;
-                                match self.tab {
-                                    ConfigTab::Apps => {
-                                        if apps_snapshot.is_empty() {
-                                            ui.add_space(8.0);
-                                            ui.label(
-                                                RichText::new(if scanning {
-                                                    "Đang quét các app đang chạy..."
-                                                } else {
-                                                    "Không thấy app nào đang chạy ngoài các process hệ thống được loại trừ."
-                                                })
-                                                .size(11.5)
-                                                .color(Color32::from_rgb(120, 145, 175)),
-                                            );
-                                            ui.add_space(8.0);
-                                        }
-                                        let keep_view = sh.keep.lock().unwrap().clone();
-                                        for a in apps_snapshot.iter() {
-                                            let mut k = keep_decision(&keep_view, &a.exe_lower);
-                                            let is_game = games_view.contains(&a.exe_lower);
-                                            match running_app_row(ui, &mut k, a, is_game) {
-                                                RowAction::ToggleKeep => {
-                                                    sh.keep.lock().unwrap().insert(a.exe_lower.clone(), k);
-                                                    changed = true;
-                                                }
-                                                RowAction::MarkGame => mark_as_game(&sh, a),
-                                                RowAction::None => {}
+                        ui.columns(2, |cols| {
+                            let restore_btn = ui::ghost_button("↩  Khôi Phục App & Services");
+                            if cols[0].add_sized([cols[0].available_width(), 34.0], restore_btn).clicked() && !busy {
+                                restore(sh.clone());
+                            }
+
+                            let clear_btn = ui::ghost_button("🧹  Xoá Nhật Ký");
+                            if cols[1].add_sized([cols[1].available_width(), 34.0], clear_btn).clicked() {
+                                sh.log.lock().unwrap().clear();
+                            }
+                        });
+
+                        ui.add_space(10.0);
+
+                        // 3b. TRẠNG THÁI SESSION ĐÃ LƯU
+                        ui::card(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                match session_view.as_ref() {
+                                    Some(s) => {
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "💾 Session đã lưu: {} app, {} service, {} Wi-Fi, DVR {} — lúc {}",
+                                                s.apps.len(),
+                                                s.services.len(),
+                                                s.wlan_autoconf_off.len(),
+                                                if s.gamedvr_prev.is_some() { "có" } else { "không" },
+                                                time_part(&s.saved_at)
+                                            ))
+                                            .size(11.0)
+                                            .color(ui::ACCENT),
+                                        );
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            if ui.add(ui::ghost_button_sized(if self.show_session { "Ẩn" } else { "Xem danh sách" }, 10.5)).clicked() {
+                                                self.show_session = !self.show_session;
                                             }
-                                            ui.add_space(2.0);
-                                        }
+                                        });
                                     }
-                                    ConfigTab::Services => {
-                                        let mut svc = sh.svc.lock().unwrap();
-                                        for (i, (svc_name, display_name, desc, _)) in SERVICE_TARGETS.iter().enumerate() {
-                                            if service_row(ui, &mut svc[i], svc_name, display_name, desc) {
-                                                changed = true;
-                                            }
-                                            ui.add_space(2.0);
-                                        }
+                                    None => {
+                                        ui.label(
+                                            RichText::new("💾 Chưa có session nào được lưu — bấm Game Boost để chụp phiên hiện tại.")
+                                                .size(11.0)
+                                                .color(ui::TEXT_MUTED),
+                                        );
                                     }
-                                }
-                                if changed {
-                                    self.save();
                                 }
                             });
-                    });
 
-                ui.add_space(8.0);
+                            if self.show_session {
+                                if let Some(s) = session_view.as_ref() {
+                                    ui.add_space(6.0);
+                                    ui.label(
+                                        RichText::new("Tick app nào để Restore mở lại app đó:")
+                                            .size(10.5)
+                                            .color(ui::TEXT_MUTED),
+                                    );
+                                    ui.add_space(4.0);
+                                    egui::ScrollArea::vertical()
+                                        .id_salt("session_list")
+                                        .max_height(120.0)
+                                        .auto_shrink([false, false])
+                                        .show(ui, |ui| {
+                                            let mut sel = sh.restore_sel.lock().unwrap();
+                                            for a in s.apps.iter() {
+                                                let cwd = a.cwd.clone().unwrap_or_else(|| "(không rõ)".into());
+                                                let checked = sel.entry(app_key(a)).or_insert(true);
+                                                ui.horizontal(|ui| {
+                                                    ui::compact_switch(ui, checked);
+                                                    ui.label(
+                                                        RichText::new(format!(
+                                                            "{} [{}] — cwd: {}",
+                                                            a.display, a.exe, cwd
+                                                        ))
+                                                        .monospace()
+                                                        .size(10.5)
+                                                        .color(ui::TEXT_MAIN),
+                                                    );
+                                                });
+                                                ui.add_space(2.0);
+                                            }
+                                            for svc in s.services.iter() {
+                                                ui.label(
+                                                    RichText::new(format!("  • service: {}", svc))
+                                                        .monospace()
+                                                        .size(10.5)
+                                                        .color(ui::SUCCESS),
+                                                );
+                                            }
+                                        });
+                                }
+                            }
+                        });
 
-                // 5. TERMINAL LOG
-                egui::Frame::none()
-                    .fill(Color32::from_rgb(8, 11, 16))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(22, 33, 48)))
-                    .rounding(Rounding::same(8.0))
-                    .inner_margin(Margin::same(10.0))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
+                        ui.add_space(10.0);
+
+                        // 3c. TỰ ĐỘNG KHI CHƠI GAME (watcher + danh sách exe game)
+                        ui::card(ui, |ui| {
+                            ui::section_header(
+                                ui,
+                                "🤖",
+                                "Tự động khi chơi game",
+                                Some("Watcher quét tên process mỗi 3 giây (không mở handle vào game / ACE)"),
+                            );
+                            ui.add_space(6.0);
+
+                            let mut changed = false;
+                            if ui::toggle_row(
+                                ui,
+                                &mut opts_view.auto_enabled,
+                                "Tự tối ưu khi game mở",
+                                "Chờ 5 giây cho game ổn định rồi dọn RAM & service",
+                            ) {
+                                changed = true;
+                            }
+                            ui.add_space(2.0);
+                            if ui::toggle_row(
+                                ui,
+                                &mut opts_view.auto_restore,
+                                "Tự Restore khi game tắt",
+                                "Game tắt liên tục 15 giây thì khôi phục (phiên do auto tối ưu)",
+                            ) {
+                                changed = true;
+                            }
+                            ui.add_space(2.0);
+
+                            // Chạy cùng Windows bằng Task Scheduler
+                            let mut task_on = self.task_on;
+                            if ui::toggle_row(
+                                ui,
+                                &mut task_on,
+                                "Chạy cùng Windows (Task Scheduler, quyền cao nhất)",
+                                "Tạo task 'GameMode' chạy lúc đăng nhập với /RL HIGHEST — không hiện UAC",
+                            ) {
+                                let r = if task_on { sys::task_create() } else { sys::task_delete() };
+                                match r {
+                                    Ok(_) => {
+                                        self.task_on = task_on;
+                                        self.last_task_check = Instant::now();
+                                        sh.log(
+                                            if task_on {
+                                                "  ✔ [TASK] Đã tạo task GameMode: tự chạy cùng Windows với quyền cao nhất.".into()
+                                            } else {
+                                                "  • [TASK] Đã xoá task GameMode.".into()
+                                            },
+                                            ui::SUCCESS,
+                                        );
+                                    }
+                                    Err(e) => {
+                                        self.last_task_check = Instant::now() - Duration::from_secs(20);
+                                        sh.log(
+                                            format!("  ⚠ [TASK] Không đổi được task GameMode: {}", e),
+                                            ui::DANGER,
+                                        );
+                                    }
+                                }
+                            }
+
+                            ui.add_space(8.0);
                             ui.label(
-                                RichText::new("TERMINAL LOG // NHẬT KÝ HỆ THỐNG")
+                                RichText::new("DANH SÁCH GAME ĐƯỢC GIỮ LẠI:")
                                     .size(11.0)
                                     .strong()
-                                    .color(Color32::from_rgb(0, 229, 255)),
+                                    .color(ui::TEXT_MUTED),
                             );
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.label(
-                                    RichText::new("AUTO-SCROLL")
-                                        .size(10.0)
-                                        .color(Color32::from_rgb(80, 120, 160)),
-                                );
-                            });
-                        });
-                        ui.add_space(4.0);
+                            ui.add_space(4.0);
 
-                        let log_height = ui.available_height().max(100.0);
-                        egui::ScrollArea::vertical()
-                            .stick_to_bottom(true)
-                            .max_height(log_height)
-                            .show(ui, |ui| {
-                                for (line, color) in sh.log.lock().unwrap().iter() {
-                                    ui.label(RichText::new(line).monospace().size(11.0).color(*color));
+                            let mut remove: Option<String> = None;
+                            if games_view.is_empty() {
+                                ui.label(RichText::new("Chưa có game nào").size(11.0).color(ui::TEXT_DIM));
+                            } else {
+                                egui::ScrollArea::vertical()
+                                    .id_salt("game_list")
+                                    .max_height(84.0)
+                                    .auto_shrink([false, true])
+                                    .show(ui, |ui| {
+                                        for exe in games_view.iter() {
+                                            let path = sh.game_paths.lock().unwrap().get(exe).cloned();
+                                            let row_h = 24.0_f32;
+                                            let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), egui::Sense::hover());
+                                            let painter = ui.painter_at(rect);
+
+                                            let del_rect = Rect::from_center_size(
+                                                pos2(rect.right() - 10.0, rect.center().y),
+                                                vec2(18.0, 18.0),
+                                            );
+                                            let del_resp = ui.interact(del_rect, ui.id().with(exe), egui::Sense::click())
+                                                .on_hover_cursor(CursorIcon::PointingHand)
+                                                .on_hover_text("Xoá khỏi danh sách game");
+                                            let del_color = if del_resp.hovered() { ui::DANGER } else { ui::TEXT_DIM };
+                                            painter.text(
+                                                del_rect.center(),
+                                                Align2::CENTER_CENTER,
+                                                "✕",
+                                                FontId::proportional(12.0),
+                                                del_color,
+                                            );
+                                            if del_resp.clicked() {
+                                                remove = Some(exe.clone());
+                                            }
+
+                                            let text_max_w = (rect.width() - 28.0).max(40.0);
+                                            let exe_galley = painter.layout_no_wrap(
+                                                exe.clone(),
+                                                FontId::monospace(11.0),
+                                                ui::TEXT_MAIN,
+                                            );
+                                            let exe_w = exe_galley.size().x;
+                                            painter.galley(
+                                                pos2(rect.left() + 2.0, rect.center().y - exe_galley.size().y / 2.0),
+                                                exe_galley,
+                                                ui::TEXT_MAIN,
+                                            );
+
+                                            let path_desc = match path {
+                                                Some(ref p) => format!(" — {}", p),
+                                                None => " — (chưa biết đường dẫn)".to_string(),
+                                            };
+                                            let path_max_w = (text_max_w - exe_w - 8.0).max(0.0);
+                                            if path_max_w > 20.0 {
+                                                let path_galley = painter.layout(
+                                                    path_desc,
+                                                    FontId::proportional(10.5),
+                                                    ui::TEXT_DIM,
+                                                    path_max_w,
+                                                );
+                                                painter.galley(
+                                                    pos2(rect.left() + 2.0 + exe_w + 6.0, rect.center().y - path_galley.size().y / 2.0),
+                                                    path_galley,
+                                                    ui::TEXT_DIM,
+                                                );
+                                            }
+                                            ui.add_space(2.0);
+                                        }
+                                    });
+                            }
+                            if let Some(exe) = remove {
+                                sh.games.lock().unwrap().retain(|e| e != &exe);
+                                self.save();
+                            }
+
+                            ui.add_space(6.0);
+
+                            ui.horizontal(|ui| {
+                                let btn_w = 64.0_f32;
+                                let spacing = 6.0_f32;
+                                let edit_w = (ui.available_width() - btn_w - spacing).max(100.0_f32);
+
+                                let edit = egui::TextEdit::singleline(&mut self.game_input)
+                                    .hint_text("vd: game-client-win64-shipping.exe")
+                                    .desired_width(edit_w)
+                                    .min_size(vec2(edit_w, 30.0));
+                                ui.add(edit);
+
+                                let add_btn = egui::Button::new(
+                                    RichText::new("Thêm")
+                                        .size(12.0)
+                                        .strong()
+                                        .color(ui::ACCENT),
+                                )
+                                .fill(ui::CARD_BG)
+                                .stroke(Stroke::new(1.0_f32, ui::ACCENT))
+                                .min_size(vec2(btn_w, 30.0))
+                                .rounding(Rounding::same(6.0));
+
+                                if ui.add(add_btn).clicked() {
+                                    let exe = self.game_input.trim().to_lowercase();
+                                    if !exe.is_empty() {
+                                        let mut games = sh.games.lock().unwrap();
+                                        if !games.contains(&exe) {
+                                            games.push(exe.clone());
+                                        }
+                                        drop(games);
+                                        self.game_input.clear();
+                                        self.save();
+                                        sh.log(
+                                            format!("  • [GAME] Đã thêm {} vào danh sách game.", exe),
+                                            ui::ACCENT,
+                                        );
+                                    }
                                 }
                             });
+
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new("(hoặc bấm 'Là game' ở tab ỨNG DỤNG ĐANG CHẠY)")
+                                    .size(11.0)
+                                    .color(ui::TEXT_MUTED),
+                            );
+
+                            if changed {
+                                *sh.opts.lock().unwrap() = opts_view;
+                                self.save();
+                            }
+                        });
+
+                        ui.add_space(10.0);
+
+                        // 3d. TỐI ƯU KHI CHƠI (4 tuỳ chọn)
+                        ui::card(ui, |ui| {
+                            ui::section_header(
+                                ui,
+                                "⚙",
+                                "Tối ưu khi chơi",
+                                None,
+                            );
+                            ui.add_space(6.0);
+
+                            if ui::toggle_row(
+                                ui,
+                                &mut opts_view.standby,
+                                "Xả standby list (RAM chờ) khi tối ưu",
+                                "Không đẩy app ra pagefile; lúc chơi tự xả nếu Free < 1 GB & Standby > 1 GB",
+                            ) {
+                                opts_changed = true;
+                            }
+                            ui.add_space(2.0);
+
+                            if ui::toggle_row(
+                                ui,
+                                &mut opts_view.gpu,
+                                "Ép game dùng GPU rời (NVIDIA)",
+                                "Ghi UserGpuPreferences = 2 trong DirectX registry cho game",
+                            ) {
+                                opts_changed = true;
+                            }
+                            ui.add_space(2.0);
+
+                            if ui::toggle_row(
+                                ui,
+                                &mut opts_view.wlan,
+                                "Tắt quét Wi-Fi nền khi chơi",
+                                "Tắt autoconf của card Wi-Fi đang kết nối để giảm giật lag đột ngột",
+                            ) {
+                                opts_changed = true;
+                            }
+
+                            // Callout ghi chú Wi-Fi ngay dưới toggle Wi-Fi
+                            ui.add_space(2.0);
+                            ui::callout_warning(
+                                ui,
+                                "Mạng vẫn giữ kết nối hiện tại nhưng KHÔNG tự kết nối lại nếu rớt; Restore sẽ bật lại.",
+                            );
+                            ui.add_space(4.0);
+
+                            if ui::toggle_row(
+                                ui,
+                                &mut opts_view.gamedvr,
+                                "Tắt Game DVR / quay màn hình nền của Windows",
+                                "Đặt GameDVR_Enabled và AppCaptureEnabled về 0; Restore khôi phục lại",
+                            ) {
+                                opts_changed = true;
+                            }
+
+                            if opts_changed {
+                                *sh.opts.lock().unwrap() = opts_view;
+                                self.save();
+                            }
+                        });
+
+                        ui.add_space(10.0);
+
+                        // 4. DANH SÁCH CẤU HÌNH: TABS CHO ỨNG DỤNG VÀ SERVICES
+                        ui::card(ui, |ui| {
+                            let kept = {
+                                let keep = sh.keep.lock().unwrap();
+                                apps_snapshot
+                                    .iter()
+                                    .filter(|a| keep_decision(&keep, &a.exe_lower))
+                                    .count()
+                            };
+                            let svc_sel = sh.svc.lock().unwrap().iter().filter(|&&x| x).count();
+
+                            // Tab Switcher
+                            ui.horizontal(|ui| {
+                                let is_app = self.tab == ConfigTab::Apps;
+                                let app_tab_btn = ui::tab_button(
+                                    &format!("💻 ỨNG DỤNG ĐANG CHẠY ({}/{})", kept, apps_snapshot.len()),
+                                    is_app,
+                                    ui::SUCCESS,
+                                );
+                                if ui.add(app_tab_btn).clicked() {
+                                    self.tab = ConfigTab::Apps;
+                                }
+
+                                let is_svc = self.tab == ConfigTab::Services;
+                                let svc_tab_btn = ui::tab_button(
+                                    &format!("🛠 SERVICES HỆ THỐNG ({}/{})", svc_sel, SERVICE_TARGETS.len()),
+                                    is_svc,
+                                    ui::ACCENT,
+                                );
+                                if ui.add(svc_tab_btn).clicked() {
+                                    self.tab = ConfigTab::Services;
+                                }
+
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if self.tab == ConfigTab::Apps {
+                                        if ui.add_enabled(
+                                            !scanning,
+                                            ui::ghost_button_sized(if scanning { "Đang quét..." } else { "🔄 Làm mới" }, 10.5),
+                                        ).clicked() {
+                                            self.start_scan();
+                                        }
+                                        if ui.add(ui::ghost_button_sized("Giữ tất cả", 10.5)).clicked() {
+                                            let mut keep = sh.keep.lock().unwrap();
+                                            for a in apps_snapshot.iter() {
+                                                keep.insert(a.exe_lower.clone(), true);
+                                            }
+                                            drop(keep);
+                                            self.save();
+                                        }
+                                        if ui.add(ui::ghost_button_sized("Bỏ giữ tất cả", 10.5)).clicked() {
+                                            let mut keep = sh.keep.lock().unwrap();
+                                            for a in apps_snapshot.iter() {
+                                                keep.insert(a.exe_lower.clone(), false);
+                                            }
+                                            drop(keep);
+                                            self.save();
+                                        }
+                                        if ui.add(ui::ghost_button_sized("Mặc định", 10.5)).clicked() {
+                                            let mut keep = sh.keep.lock().unwrap();
+                                            for a in apps_snapshot.iter() {
+                                                keep.insert(a.exe_lower.clone(), default_keep(&a.exe_lower));
+                                            }
+                                            drop(keep);
+                                            self.save();
+                                        }
+                                    } else {
+                                        if ui.add(ui::ghost_button_sized("Mặc định", 10.5)).clicked() {
+                                            let mut svc = sh.svc.lock().unwrap();
+                                            for (i, (_, _, _, def)) in SERVICE_TARGETS.iter().enumerate() {
+                                                svc[i] = *def;
+                                            }
+                                            drop(svc);
+                                            self.save();
+                                        }
+                                        if ui.add(ui::ghost_button_sized("Chọn hết", 10.5)).clicked() {
+                                            for x in sh.svc.lock().unwrap().iter_mut() {
+                                                *x = true;
+                                            }
+                                            self.save();
+                                        }
+                                    }
+                                });
+                            });
+
+                            ui.add_space(4.0);
+
+                            // Banner trạng thái Admin & Lưu cấu hình
+                            ui.horizontal(|ui| {
+                                let (status, color) = match self.saved_at {
+                                    Some((t, true)) if t.elapsed() < Duration::from_millis(2500) => {
+                                        ("✔ Đã lưu lựa chọn", ui::SUCCESS)
+                                    }
+                                    Some((t, false)) if t.elapsed() < Duration::from_millis(4000) => {
+                                        ("⚠ Không lưu được cấu hình", ui::DANGER)
+                                    }
+                                    _ => ("💾 Tự động ghi nhớ cho lần sau", ui::TEXT_MUTED),
+                                };
+                                ui.label(RichText::new(status).size(10.5).color(color));
+
+                                if self.tab == ConfigTab::Services {
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if self.is_admin {
+                                            ui.label(RichText::new("✔ QUYỀN ADMIN").size(10.0).strong().color(ui::SUCCESS));
+                                        } else {
+                                            let btn = egui::Button::new(
+                                                RichText::new("🛡 Cấp Quyền Admin").size(10.0).strong().color(ui::WARNING),
+                                            )
+                                            .fill(ui::CARD_HOVER)
+                                            .stroke(Stroke::new(1.0_f32, ui::WARNING))
+                                            .rounding(Rounding::same(4.0));
+                                            if ui.add(btn).clicked() {
+                                                restart_as_admin();
+                                            }
+                                        }
+                                    });
+                                }
+                            });
+
+                            ui.add_space(6.0);
+
+                            // ScrollArea danh sách
+                            egui::ScrollArea::vertical()
+                                .id_salt(if self.tab == ConfigTab::Apps { "app_list" } else { "svc_list" })
+                                .max_height(175.0)
+                                .auto_shrink([false, false])
+                                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                                .show(ui, |ui| {
+                                    let mut changed = false;
+                                    match self.tab {
+                                        ConfigTab::Apps => {
+                                            if apps_snapshot.is_empty() {
+                                                ui.add_space(8.0);
+                                                ui.label(
+                                                    RichText::new(if scanning {
+                                                        "Đang quét các app đang chạy..."
+                                                    } else {
+                                                        "Không thấy app nào đang chạy ngoài các process hệ thống được loại trừ."
+                                                    })
+                                                    .size(11.5)
+                                                    .color(ui::TEXT_MUTED),
+                                                );
+                                                ui.add_space(8.0);
+                                            }
+                                            let keep_view = sh.keep.lock().unwrap().clone();
+                                            for a in apps_snapshot.iter() {
+                                                let mut k = keep_decision(&keep_view, &a.exe_lower);
+                                                let is_game = games_view.contains(&a.exe_lower);
+                                                match running_app_row(ui, &mut k, a, is_game) {
+                                                    RowAction::ToggleKeep => {
+                                                        sh.keep.lock().unwrap().insert(a.exe_lower.clone(), k);
+                                                        changed = true;
+                                                    }
+                                                    RowAction::MarkGame => mark_as_game(&sh, a),
+                                                    RowAction::None => {}
+                                                }
+                                                ui.add_space(2.0);
+                                            }
+                                        }
+                                        ConfigTab::Services => {
+                                            let mut svc = sh.svc.lock().unwrap();
+                                            for (i, (svc_name, display_name, desc, _)) in SERVICE_TARGETS.iter().enumerate() {
+                                                let is_running = sys::is_service_running(svc_name);
+                                                if ui::service_row(ui, &mut svc[i], svc_name, display_name, desc, is_running) {
+                                                    changed = true;
+                                                }
+                                                ui.add_space(2.0);
+                                            }
+                                        }
+                                    }
+                                    if changed {
+                                        self.save();
+                                    }
+                                });
+                        });
+
+                        ui.add_space(10.0);
+
+                        // 5. TERMINAL LOG
+                        ui::card(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new("TERMINAL LOG // NHẬT KÝ HỆ THỐNG")
+                                        .size(11.5)
+                                        .strong()
+                                        .color(ui::ACCENT),
+                                );
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    ui.label(
+                                        RichText::new("AUTO-SCROLL")
+                                            .size(10.0)
+                                            .color(ui::TEXT_DIM),
+                                    );
+                                });
+                            });
+                            ui.add_space(6.0);
+
+                            let log_height = ui.available_height().max(100.0);
+                            egui::ScrollArea::vertical()
+                                .stick_to_bottom(true)
+                                .max_height(log_height)
+                                .show(ui, |ui| {
+                                    for (line, color) in sh.log.lock().unwrap().iter() {
+                                        ui.label(RichText::new(line).monospace().size(11.0).color(*color));
+                                    }
+                                });
+                        });
                     });
             });
     }
