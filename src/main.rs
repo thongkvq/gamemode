@@ -5,7 +5,7 @@ mod sys;
 use eframe::egui::{self, Color32, Margin, RichText, Rounding, Stroke};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -162,11 +162,40 @@ const DEFAULT_KEEP: &[&str] = &[
     "windowsterminal.exe",
     "openconsole.exe",
     "msedgewebview2.exe",
+    // NitroSense (Acer): quạt & profile hiệu năng, phải giữ để máy không bị khóa quạt.
+    "psagent.exe",
+    "psadminagent.exe",
 ];
+
+/// Exe game mặc định (dùng khi config chưa có dòng `game:` nào).
+const DEFAULT_GAMES: &[&str] = &["deltaforceclient-win64-shipping.exe"];
 /// Tiền tố tên exe mặc định được giữ (Tailscale: tailscale.exe, tailscaled.exe...).
 const DEFAULT_KEEP_PREFIX: &[&str] = &["tailscale", "deltaforce", "df_garena", "sguard", "unrealcef", "ace-", "gamebar"];
 /// Chuỗi con trong tên exe mặc định được giữ (JBL Quantum).
 const DEFAULT_KEEP_CONTAINS: &[&str] = &["quantum", "-win64-shipping", "无极画质"];
+
+/// Process anti-cheat ACE của Delta Force. Cùng với exe game, đây là nhóm TUYỆT ĐỐI chỉ được
+/// quan sát tên: không mở quyền đọc bộ nhớ, không đọc command line / thư mục làm việc.
+const ACE_SKIP: &[&str] = &[
+    "sguard64.exe",
+    "sguard.exe",
+    "sguardsvc64.exe",
+    "ace-",
+    "anticheatexpert.exe",
+];
+
+/// Danh sách exe không được mở quyền đọc bộ nhớ: exe game + process anti-cheat.
+fn skip_list(games: &[String]) -> Vec<String> {
+    let mut v: Vec<String> = games.iter().map(|g| g.to_lowercase()).collect();
+    v.extend(ACE_SKIP.iter().map(|s| s.to_string()));
+    v
+}
+
+/// Tên exe (viết thường) có nằm trong nhóm game / anti-cheat không.
+fn is_ace_or_game(name_lower: &str, skip: &[String]) -> bool {
+    skip.iter()
+        .any(|s| name_lower == s.as_str() || name_lower.starts_with(s.as_str()))
+}
 
 /// Chuỗi (viết thường) trong command line chứng tỏ process là process PHỤ do app khác mở:
 /// COM server, renderer/GPU helper của Chrome, helper do Chrome/extension mở, hay helper
@@ -235,24 +264,111 @@ fn is_never_kill(exe_lower: &str, exe_path: Option<&str>) -> bool {
     false
 }
 
-/// Đọc cấu hình: `keep:<exe>=1/0` cho app, `svc:<tên>=1/0` cho service.
+/// Tuỳ chọn tối ưu khi chơi (khối "Tối ưu khi chơi" + khối "Tự động khi chơi game").
+#[derive(Clone, Copy)]
+struct Opts {
+    /// Xả standby list khi tối ưu và khi RAM trống thấp lúc đang chơi.
+    standby: bool,
+    /// Ép game dùng GPU rời (GpuPreference=2).
+    gpu: bool,
+    /// Tắt quét nền Wi-Fi khi chơi.
+    wlan: bool,
+    /// Tắt Game DVR / App Capture khi chơi.
+    gamedvr: bool,
+    /// Tự tối ưu khi phát hiện game mở.
+    auto_enabled: bool,
+    /// Tự Restore khi game đã tắt.
+    auto_restore: bool,
+}
+
+impl Default for Opts {
+    fn default() -> Self {
+        Self {
+            standby: true,
+            gpu: true,
+            wlan: true,
+            gamedvr: true,
+            auto_enabled: false,
+            auto_restore: true,
+        }
+    }
+}
+
+/// Toàn bộ nội dung gamemode.cfg.
+struct Config {
+    keep: HashMap<String, bool>,
+    svcs: Vec<bool>,
+    /// Danh sách exe game (viết thường).
+    games: Vec<String>,
+    /// Đường dẫn exe đã biết của từng game: exe (viết thường) -> đường dẫn đầy đủ.
+    game_paths: HashMap<String, String>,
+    opts: Opts,
+}
+
+fn is_on(v: &str) -> bool {
+    v.trim() == "1"
+}
+
+/// Đọc cấu hình: `keep:<exe>=1/0`, `svc:<tên>=1/0`, `game:<exe>=1`, `gamepath:<exe>=<path>`,
+/// `auto:enabled/restore=1/0`, `opt:standby/gpu/wlan/gamedvr=1/0`.
 /// Các dòng `app:...` của bản cũ được bỏ qua (không còn danh sách app cố định).
-fn load_config() -> (HashMap<String, bool>, Vec<bool>) {
+fn load_config() -> Config {
     let text = std::fs::read_to_string(config_path()).unwrap_or_default();
     let mut keep_saved: HashMap<String, bool> = HashMap::new();
     let mut svc_saved: HashMap<String, bool> = HashMap::new();
+    let mut games: Vec<String> = Vec::new();
+    let mut game_paths: HashMap<String, String> = HashMap::new();
+    let mut opts = Opts::default();
 
     for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
         if let Some(rest) = line.strip_prefix("keep:") {
             if let Some((k, v)) = rest.rsplit_once('=') {
-                keep_saved.insert(k.trim().to_lowercase(), v.trim() == "1");
+                keep_saved.insert(k.trim().to_lowercase(), is_on(v));
             }
         } else if let Some(rest) = line.strip_prefix("svc:") {
             if let Some((k, v)) = rest.rsplit_once('=') {
-                svc_saved.insert(k.trim().to_string(), v.trim() == "1");
+                svc_saved.insert(k.trim().to_string(), is_on(v));
+            }
+        } else if let Some(rest) = line.strip_prefix("gamepath:") {
+            // Đường dẫn có thể chứa '=' -> cắt ở dấu '=' đầu tiên.
+            if let Some((k, v)) = rest.split_once('=') {
+                let exe = k.trim().to_lowercase();
+                let path = v.trim().to_string();
+                if !exe.is_empty() && !path.is_empty() {
+                    game_paths.insert(exe, path);
+                }
+            }
+        } else if let Some(rest) = line.strip_prefix("game:") {
+            if let Some((k, v)) = rest.rsplit_once('=') {
+                let exe = k.trim().to_lowercase();
+                if is_on(v) && !exe.is_empty() && !games.contains(&exe) {
+                    games.push(exe);
+                }
+            }
+        } else if let Some(rest) = line.strip_prefix("opt:") {
+            if let Some((k, v)) = rest.rsplit_once('=') {
+                match k.trim() {
+                    "standby" => opts.standby = is_on(v),
+                    "gpu" => opts.gpu = is_on(v),
+                    "wlan" => opts.wlan = is_on(v),
+                    "gamedvr" => opts.gamedvr = is_on(v),
+                    _ => {}
+                }
+            }
+        } else if let Some(rest) = line.strip_prefix("auto:") {
+            if let Some((k, v)) = rest.rsplit_once('=') {
+                match k.trim() {
+                    "enabled" => opts.auto_enabled = is_on(v),
+                    "restore" => opts.auto_restore = is_on(v),
+                    _ => {}
+                }
             }
         }
         // dòng "app:..." / dòng rác của bản cũ: bỏ qua
+    }
+
+    if games.is_empty() {
+        games = DEFAULT_GAMES.iter().map(|s| s.to_string()).collect();
     }
 
     let svcs = SERVICE_TARGETS
@@ -260,19 +376,42 @@ fn load_config() -> (HashMap<String, bool>, Vec<bool>) {
         .map(|(name, _, _, def)| svc_saved.get(*name).copied().unwrap_or(*def))
         .collect();
 
-    (keep_saved, svcs)
+    Config {
+        keep: keep_saved,
+        svcs,
+        games,
+        game_paths,
+        opts,
+    }
 }
 
-fn save_config(keep: &HashMap<String, bool>, svcs: &[bool]) -> bool {
+fn write_config(cfg: &Config) -> bool {
     let mut lines: Vec<String> = Vec::new();
-    let mut keys: Vec<&String> = keep.keys().collect();
+    let mut keys: Vec<&String> = cfg.keep.keys().collect();
     keys.sort();
     for k in keys {
-        lines.push(format!("keep:{}={}", k, if keep[k] { 1 } else { 0 }));
+        lines.push(format!("keep:{}={}", k, if cfg.keep[k] { 1 } else { 0 }));
     }
-    for ((name, _, _, _), on) in SERVICE_TARGETS.iter().zip(svcs) {
+    for ((name, _, _, _), on) in SERVICE_TARGETS.iter().zip(&cfg.svcs) {
         lines.push(format!("svc:{}={}", name, if *on { 1 } else { 0 }));
     }
+    let mut games: Vec<&String> = cfg.games.iter().collect();
+    games.sort();
+    for exe in games {
+        lines.push(format!("game:{}={}", exe, 1));
+    }
+    let mut paths: Vec<(&String, &String)> = cfg.game_paths.iter().collect();
+    paths.sort_by(|a, b| a.0.cmp(b.0));
+    for (exe, path) in paths {
+        lines.push(format!("gamepath:{}={}", exe, path));
+    }
+    let o = &cfg.opts;
+    lines.push(format!("auto:enabled={}", if o.auto_enabled { 1 } else { 0 }));
+    lines.push(format!("auto:restore={}", if o.auto_restore { 1 } else { 0 }));
+    lines.push(format!("opt:standby={}", if o.standby { 1 } else { 0 }));
+    lines.push(format!("opt:gpu={}", if o.gpu { 1 } else { 0 }));
+    lines.push(format!("opt:wlan={}", if o.wlan { 1 } else { 0 }));
+    lines.push(format!("opt:gamedvr={}", if o.gamedvr { 1 } else { 0 }));
     std::fs::write(config_path(), lines.join("\n")).is_ok()
 }
 
@@ -295,6 +434,14 @@ struct SessionApp {
     cwd: Option<String>,
 }
 
+/// Giá trị registry "trước khi tool sửa" của một tuỳ chọn Game DVR.
+/// `value = None` nghĩa là value KHÔNG tồn tại lúc chụp -> Restore phải xoá nó đi.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
+struct RegPrev {
+    #[serde(default)]
+    value: Option<u32>,
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
 struct SessionData {
     #[serde(default)]
@@ -303,6 +450,15 @@ struct SessionData {
     apps: Vec<SessionApp>,
     #[serde(default)]
     services: Vec<String>,
+    /// GUID các interface Wi-Fi đã bị tắt quét nền (autoconf) trong phiên.
+    #[serde(default)]
+    wlan_autoconf_off: Vec<String>,
+    /// Giá trị `GameDVR_Enabled` trước khi tool đặt về 0.
+    #[serde(default)]
+    gamedvr_prev: Option<RegPrev>,
+    /// Giá trị `AppCaptureEnabled` trước khi tool đặt về 0.
+    #[serde(default)]
+    appcapture_prev: Option<RegPrev>,
 }
 
 impl SessionData {
@@ -332,6 +488,19 @@ impl SessionData {
         for s in services {
             if !self.services.iter().any(|x| x.eq_ignore_ascii_case(&s)) {
                 self.services.push(s);
+            }
+        }
+    }
+
+    /// Gộp danh sách GUID Wi-Fi đã tắt quét nền vào session (không ghi đè, loại trùng).
+    fn merge_wlan(&mut self, guids: &[String]) {
+        for g in guids {
+            if !self
+                .wlan_autoconf_off
+                .iter()
+                .any(|x| x.eq_ignore_ascii_case(g))
+            {
+                self.wlan_autoconf_off.push(g.clone());
             }
         }
     }
@@ -414,10 +583,12 @@ fn fmt_ram(bytes: u64) -> String {
 }
 
 /// Quét app đang chạy thuộc session của user hiện tại, gom theo tên exe, sắp xếp RAM giảm dần.
-fn scan_running_apps() -> Vec<RunningApp> {
+/// `skip` = exe game + anti-cheat: không mở quyền đọc bộ nhớ và không hiện trong danh sách
+/// (game luôn được giữ lại nên không có gì để chọn).
+fn scan_running_apps(skip: &[String]) -> Vec<RunningApp> {
     let me = std::process::id();
     let my_session = sys::current_session();
-    let all = sys::snapshot();
+    let all = sys::snapshot_skip(skip);
     let parent = all.iter().find(|p| p.pid == me).map(|p| p.ppid).unwrap_or(0);
 
     let mut map: HashMap<String, RunningApp> = HashMap::new();
@@ -427,6 +598,10 @@ fn scan_running_apps() -> Vec<RunningApp> {
         }
         let exe_lower = p.name.to_lowercase();
         if exe_lower.is_empty() || is_never_kill(&exe_lower, p.exe_path.as_deref()) {
+            continue;
+        }
+        // Game + anti-cheat: luôn được giữ, không hiện trong danh sách để chọn.
+        if is_ace_or_game(&exe_lower, skip) {
             continue;
         }
         let entry = map.entry(exe_lower.clone()).or_insert_with(|| RunningApp {
@@ -472,30 +647,897 @@ enum ConfigTab {
     Services,
 }
 
-struct App {
-    /// Lựa chọn "Giữ lại" theo tên exe (viết thường) — lưu vào config.
-    keep: HashMap<String, bool>,
-    svc_enabled: Vec<bool>,
-    tab: ConfigTab,
+/// Trạng thái dùng chung giữa UI và watcher. Watcher chạy ở thread riêng nên KHÔNG đọc
+/// được field của `App`; mọi lựa chọn nó cần đều nằm trong các `Arc<Mutex<..>>` ở đây.
+#[derive(Clone)]
+struct Shared {
     log: Arc<Mutex<Vec<(String, Color32)>>>,
     busy: Arc<AtomicBool>,
-    mem: sys::Mem,
-    last_mem: Instant,
-    saved_at: Option<(Instant, bool)>,
-    is_admin: bool,
-    /// App đang chạy thực tế (quét ở thread nền).
-    running: Arc<Mutex<Vec<RunningApp>>>,
-    scanning: Arc<AtomicBool>,
     /// Session đã lưu (đọc từ session.json) để hiển thị.
     session: Arc<Mutex<Option<SessionData>>>,
+    /// App đang chạy thực tế (quét ở thread nền).
+    running: Arc<Mutex<Vec<RunningApp>>>,
+    /// Lựa chọn "Giữ lại" theo tên exe (viết thường) — lưu vào config.
+    keep: Arc<Mutex<HashMap<String, bool>>>,
+    svc: Arc<Mutex<Vec<bool>>>,
+    /// Danh sách exe game (viết thường).
+    games: Arc<Mutex<Vec<String>>>,
+    /// Đường dẫn exe đã biết của từng game: exe (viết thường) -> đường dẫn đầy đủ.
+    game_paths: Arc<Mutex<HashMap<String, String>>>,
+    opts: Arc<Mutex<Opts>>,
+    /// App nào của session được tick để Restore mở lại.
+    restore_sel: Arc<Mutex<HashMap<String, bool>>>,
+    is_admin: bool,
+    /// Lần tối ưu gần nhất do watcher khởi động (điều kiện để auto-restore chạy).
+    last_auto: Arc<AtomicBool>,
+    /// Số lần tối ưu đã chạy: watcher dùng để không tối ưu lặp khi người dùng vừa bấm tay.
+    opt_count: Arc<AtomicUsize>,
+}
+
+impl Shared {
+    fn save_config(&self) -> bool {
+        let cfg = Config {
+            keep: self.keep.lock().unwrap().clone(),
+            svcs: self.svc.lock().unwrap().clone(),
+            games: self.games.lock().unwrap().clone(),
+            game_paths: self.game_paths.lock().unwrap().clone(),
+            opts: *self.opts.lock().unwrap(),
+        };
+        write_config(&cfg)
+    }
+
+    fn log(&self, text: String, color: Color32) {
+        self.log.lock().unwrap().push((text, color));
+    }
+
+    fn opts(&self) -> Opts {
+        *self.opts.lock().unwrap()
+    }
+}
+
+/// Bắt đầu tối ưu ở thread nền. Dùng chung cho nút trên UI và watcher.
+fn optimize(sh: Shared, from_auto: bool) {
+    if sh.busy.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    sh.last_auto.store(from_auto, Ordering::SeqCst);
+    sh.opt_count.fetch_add(1, Ordering::SeqCst);
+    std::thread::spawn(move || {
+        do_optimize(&sh);
+        sh.busy.store(false, Ordering::SeqCst);
+    });
+}
+
+/// Bắt đầu Restore ở thread nền (UI và watcher dùng chung).
+fn restore(sh: Shared) {
+    if sh.busy.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(move || {
+        do_restore(&sh);
+        sh.busy.store(false, Ordering::SeqCst);
+    });
+}
+
+/// Thêm một app đang chạy vào danh sách game, lưu đường dẫn exe và (nếu bật) đặt GPU rời.
+fn mark_as_game(sh: &Shared, app: &RunningApp) {
+    {
+        let mut games = sh.games.lock().unwrap();
+        if !games.contains(&app.exe_lower) {
+            games.push(app.exe_lower.clone());
+        }
+    }
+    let path = app
+        .exe_path
+        .as_ref()
+        .filter(|p| !p.trim().is_empty())
+        .cloned();
+    if let Some(p) = path.as_ref() {
+        sh.game_paths
+            .lock()
+            .unwrap()
+            .insert(app.exe_lower.clone(), p.clone());
+    }
+    let ok = sh.save_config();
+    sh.log(
+        format!(
+            "  • [GAME] Đã thêm {} vào danh sách game{}.",
+            app.exe_lower,
+            if path.is_none() { " (chưa rõ đường dẫn exe)" } else { "" }
+        ),
+        Color32::from_rgb(0, 229, 255),
+    );
+    if !ok {
+        sh.log(
+            "  ⚠ [GAME] Không ghi được gamemode.cfg — danh sách game sẽ mất khi thoát.".into(),
+            Color32::from_rgb(255, 120, 120),
+        );
+    }
+    if let Some(p) = path {
+        if sh.opts().gpu {
+            match sys::ensure_gpu_high_perf(&p) {
+                Ok(true) => sh.log(
+                    format!("  ✔ [GPU] Đã đặt GPU rời cho {} (áp dụng từ lần mở game sau).", p),
+                    Color32::from_rgb(0, 255, 163),
+                ),
+                Ok(false) => sh.log(
+                    format!("  • [GPU] {} đã đặt GPU rời từ trước.", p),
+                    Color32::from_rgb(130, 150, 170),
+                ),
+                Err(e) => sh.log(
+                    format!("  ⚠ [GPU] Không ghi được GPU rời cho {}: {}", p, e),
+                    Color32::from_rgb(255, 120, 120),
+                ),
+            }
+        }
+    }
+}
+
+/// Thân của tối ưu: tắt app / service / WLAN / Game DVR, xả standby, lưu session.
+fn do_optimize(sh: &Shared) {
+    let log = sh.log.clone();
+    let push = |s: String, c: Color32| log.lock().unwrap().push((s, c));
+    log.lock().unwrap().clear();
+
+    let keep = sh.keep.lock().unwrap().clone();
+    let svcs = sh.svc.lock().unwrap().clone();
+    let games: Vec<String> = sh.games.lock().unwrap().clone();
+    let opts = sh.opts();
+    let is_admin = sh.is_admin;
+
+    let before_mem = sys::memory();
+    let before = before_mem.avail;
+    push(
+        format!("▶ [DEPLOY] Bắt đầu thanh lọc | RAM khả dụng ban đầu: {:.1} GB", before as f64 / GB),
+        Color32::from_rgb(0, 229, 255),
+    );
+
+    let me = std::process::id();
+    let my_session = sys::current_session();
+    // Exe game + anti-cheat: chỉ lấy tên/đường dẫn, không mở quyền đọc bộ nhớ.
+    let skip = skip_list(&games);
+    let snap = sys::snapshot_skip(&skip);
+    let parent = snap.iter().find(|p| p.pid == me).map(|p| p.ppid).unwrap_or(0);
+
+    // 0. Ghi nhớ đường dẫn exe của game đang chạy (để ép GPU rời cả khi game đã tắt).
+    {
+        let mut paths = sh.game_paths.lock().unwrap();
+        for p in snap.iter() {
+            let exe = p.name.to_lowercase();
+            if !games.contains(&exe) {
+                continue;
+            }
+            if let Some(path) = p.exe_path.as_ref().filter(|x| !x.trim().is_empty()) {
+                if paths.get(&exe).map(|v| v != path).unwrap_or(true) {
+                    paths.insert(exe, path.clone());
+                }
+            }
+        }
+    }
+
+    // 1. Quét app đang chạy -> nhóm theo tên exe, bỏ nhóm được tick "Giữ lại".
+    //    Exe nằm trong danh sách game LUÔN được giữ lại, bất kể config ghi gì.
+    let mut groups: HashMap<String, Vec<u32>> = HashMap::new();
+    let mut labels: HashMap<String, String> = HashMap::new();
+    let mut kept_exes: HashSet<String> = HashSet::new();
+    for p in snap.iter() {
+        if p.pid == 0 || p.pid == me || p.pid == parent || p.session != my_session {
+            continue;
+        }
+        let exe = p.name.to_lowercase();
+        if exe.is_empty() || is_never_kill(&exe, p.exe_path.as_deref()) {
+            continue;
+        }
+        // Game + anti-cheat (ACE): tuyệt đối không tắt, không mở quyền đọc bộ nhớ.
+        if keep_decision(&keep, &exe) || is_ace_or_game(&exe, &skip) {
+            kept_exes.insert(exe);
+            continue;
+        }
+        groups.entry(exe.clone()).or_default().push(p.pid);
+        labels
+            .entry(exe)
+            .or_insert_with(|| p.display_name.clone().unwrap_or_else(|| p.name.clone()));
+    }
+    push(
+        format!(
+            "  • [SCAN] {} app sẽ tắt / {} app được giữ lại (session user hiện tại).",
+            groups.len(),
+            kept_exes.len()
+        ),
+        Color32::from_rgb(50, 215, 255),
+    );
+
+    // 2. Gom "process gốc" của từng app để lưu session (TRƯỚC khi tắt).
+    //    Cửa sổ phải đọc trước khi gửi WM_CLOSE, sau đó app đã đóng nên không còn gì để đọc.
+    let window_pids = sys::pids_with_user_window();
+    let mut startup_lower: Option<Vec<String>> = None;
+    let mut session_apps: Vec<SessionApp> = Vec::new();
+    let mut skipped_children = 0usize;
+    for pids in groups.values() {
+        // Nhóm exe này có cửa sổ top-level thật không (điều kiện 3).
+        let group_has_window = pids.iter().any(|p| window_pids.contains(p));
+        for &pid in pids.iter() {
+            let Some(info) = snap.iter().find(|p| p.pid == pid) else { continue };
+
+            // (1) Không phải process con của app khác: parent phải là explorer.exe, hoặc
+            //     không còn trong snapshot, hoặc là process Windows (svchost do Task
+            //     Scheduler mở...). Giữ quy tắc cũ: cùng tên exe với parent -> không phải gốc.
+            if let Some(parent) = snap.iter().find(|p| p.pid == info.ppid && p.pid != 0) {
+                if parent.name.eq_ignore_ascii_case(&info.name) {
+                    continue;
+                }
+                let windows_parent = parent.name.eq_ignore_ascii_case("explorer.exe")
+                    || parent
+                        .exe_path
+                        .as_deref()
+                        .is_some_and(|p| p.to_lowercase().starts_with(r"c:\windows\"));
+                if !windows_parent {
+                    skipped_children += 1;
+                    continue;
+                }
+            }
+
+            let path = info.exe_path.clone().unwrap_or_default();
+
+            // App đóng gói (WindowsApps) không mở lại được bằng đường dẫn exe.
+            if is_packaged_path(&path) {
+                continue;
+            }
+
+            // (2) Command line không chứa dấu hiệu process phụ.
+            let cmdline = info
+                .cmdline
+                .clone()
+                .filter(|c| !c.trim().is_empty())
+                .unwrap_or_else(|| format!("\"{}\"", path));
+            if is_child_process_cmdline(&cmdline) || is_never_restore_exe(&info.name) {
+                skipped_children += 1;
+                continue;
+            }
+
+            // (3) App người dùng thật: có cửa sổ top-level, hoặc có trong lệnh tự khởi động
+            //     (giữ được app chạy ẩn dưới khay như Zalo).
+            let is_user_app = group_has_window || {
+                let startup = startup_lower.get_or_insert_with(|| {
+                    sys::startup_commands()
+                        .iter()
+                        .map(|s| s.to_lowercase())
+                        .collect()
+                });
+                in_startup_entries(&path, startup)
+            };
+            if !is_user_app {
+                skipped_children += 1;
+                continue;
+            }
+
+            session_apps.push(SessionApp {
+                exe: info.name.clone(),
+                display: info.display_name.clone().unwrap_or_else(|| info.name.clone()),
+                path,
+                cmdline,
+                cwd: sys::working_dir_of(pid),
+            });
+        }
+    }
+    if skipped_children > 0 {
+        push(
+            format!(
+                "  • [SESSION] Bỏ qua {} process phụ / không phải app người dùng.",
+                skipped_children
+            ),
+            Color32::from_rgb(130, 150, 170),
+        );
+    }
+
+    // 3. Ép GPU rời cho các exe game đã biết đường dẫn (thiết lập lâu dài, không hoàn tác).
+    if opts.gpu {
+        let paths = sh.game_paths.lock().unwrap().clone();
+        let mut written = 0usize;
+        let mut already = 0usize;
+        for exe in games.iter() {
+            let Some(path) = paths.get(exe) else { continue };
+            match sys::ensure_gpu_high_perf(path) {
+                Ok(true) => {
+                    written += 1;
+                    push(
+                        format!("  ✔ [GPU] Đặt GPU rời cho {} — áp dụng từ lần mở game sau.", exe),
+                        Color32::from_rgb(0, 255, 163),
+                    );
+                }
+                Ok(false) => already += 1,
+                Err(e) => push(
+                    format!("  ⚠ [GPU] Không đặt được GPU rời cho {}: {}", exe, e),
+                    Color32::from_rgb(255, 120, 120),
+                ),
+            }
+        }
+        if already > 0 {
+            push(
+                format!("  • [GPU] {} game đã đặt GPU rời từ trước — áp dụng từ lần mở game sau.", already),
+                Color32::from_rgb(130, 150, 170),
+            );
+        }
+        if written == 0 && already == 0 && games.iter().all(|g| !paths.contains_key(g)) {
+            push(
+                "  • [GPU] Chưa biết đường dẫn exe game — mở game rồi bấm 'Là game' để lưu vị trí.".into(),
+                Color32::from_rgb(130, 150, 170),
+            );
+        }
+    }
+
+    // 4. Tạm dừng các Services được chọn (nếu có quyền Admin)
+    let mut newly_stopped = Vec::new();
+    for ((svc_name, display_name, _, _), on) in SERVICE_TARGETS.iter().zip(&svcs) {
+        if !on {
+            continue;
+        }
+        if sys::is_service_running(svc_name) {
+            if is_admin {
+                match sys::stop_service(svc_name) {
+                    Ok(_) => {
+                        newly_stopped.push(svc_name.to_string());
+                        push(
+                            format!("  ✔ [STOP SVC] Tạm dừng service: {:<20} ({})", display_name, svc_name),
+                            Color32::from_rgb(0, 255, 163),
+                        );
+                    }
+                    Err(sys::SERVICE_TIMEOUT) => {
+                        // Lệnh dừng đã gửi, service đang dừng chậm: vẫn lưu để Restore bật lại.
+                        newly_stopped.push(svc_name.to_string());
+                        push(
+                            format!("  • [STOP SVC] {} phản hồi chậm, đang dừng ngầm ({})", display_name, svc_name),
+                            Color32::from_rgb(255, 160, 40),
+                        );
+                    }
+                    Err(e) => {
+                        push(
+                            format!("  ⚠ [WARN SVC] Lỗi dừng service {}: mã lỗi {}", svc_name, e),
+                            Color32::from_rgb(255, 120, 120),
+                        );
+                    }
+                }
+            } else {
+                push(
+                    format!("  ⚠ [SKIP SVC] Bỏ qua {}: Cần quyền Administrator để dừng service.", display_name),
+                    Color32::from_rgb(255, 160, 40),
+                );
+            }
+        }
+    }
+
+    // 5. Tắt quét nền Wi-Fi (autoconf) của interface đang kết nối, nhớ GUID để Restore bật lại.
+    let mut wlan_off: Vec<String> = Vec::new();
+    if opts.wlan {
+        match sys::wlan_interfaces() {
+            Ok(list) => {
+                for it in list.iter().filter(|i| i.connected) {
+                    match it.autoconf {
+                        Some(true) => match sys::set_wlan_autoconf(&it.guid, false) {
+                            Ok(_) => {
+                                wlan_off.push(it.guid.clone());
+                                push(
+                                    format!("  ✔ [WLAN] Đã tắt quét Wi-Fi nền: {}", it.description),
+                                    Color32::from_rgb(0, 255, 163),
+                                );
+                            }
+                            Err(e) => push(
+                                format!("  ⚠ [WLAN] Không tắt được quét nền ({}): {}", it.description, e),
+                                Color32::from_rgb(255, 120, 120),
+                            ),
+                        },
+                        Some(false) => push(
+                            format!("  • [WLAN] {} đã tắt quét nền từ trước.", it.description),
+                            Color32::from_rgb(130, 150, 170),
+                        ),
+                        None => push(
+                            format!("  ⚠ [WLAN] Không đọc được trạng thái quét nền: {}", it.description),
+                            Color32::from_rgb(255, 160, 40),
+                        ),
+                    }
+                }
+            }
+            Err(e) => push(
+                format!("  ⚠ [WLAN] Không truy vấn được Wi-Fi: {}", e),
+                Color32::from_rgb(255, 120, 120),
+            ),
+        }
+    }
+
+    // 6. Tắt Game DVR / App Capture, lưu giá trị cũ vào session để Restore ghi lại.
+    let mut gamedvr_prev: Option<RegPrev> = None;
+    let mut appcapture_prev: Option<RegPrev> = None;
+    if opts.gamedvr {
+        let existing = SessionData::load().unwrap_or_default();
+        // Session đã có giá trị "trước đó" thì giữ nguyên: giá trị hiện tại có thể đã bị tool sửa.
+        gamedvr_prev = existing
+            .gamedvr_prev
+            .clone()
+            .or_else(|| Some(RegPrev { value: sys::gamedvr_enabled() }));
+        appcapture_prev = existing
+            .appcapture_prev
+            .clone()
+            .or_else(|| Some(RegPrev { value: sys::appcapture_enabled() }));
+        match sys::set_gamedvr_enabled(Some(0)) {
+            Ok(_) => push(
+                "  ✔ [DVR] Đã tắt Game DVR (GameDVR_Enabled = 0).".into(),
+                Color32::from_rgb(0, 255, 163),
+            ),
+            Err(e) => push(
+                format!("  ⚠ [DVR] Không tắt được Game DVR: {}", e),
+                Color32::from_rgb(255, 120, 120),
+            ),
+        }
+        match sys::set_appcapture_enabled(Some(0)) {
+            Ok(_) => push(
+                "  ✔ [DVR] Đã tắt ghi lại clip nền (AppCaptureEnabled = 0).".into(),
+                Color32::from_rgb(0, 255, 163),
+            ),
+            Err(e) => push(
+                format!("  ⚠ [DVR] Không tắt được AppCaptureEnabled: {}", e),
+                Color32::from_rgb(255, 120, 120),
+            ),
+        }
+    }
+
+    // 7. Ghi session.json (gộp với session cũ nếu còn) trước khi tắt app.
+    let mut data = SessionData::load().unwrap_or_default();
+    data.saved_at = sys::local_time_string();
+    let apps_before = data.apps.len();
+    data.merge(session_apps, newly_stopped);
+    data.merge_wlan(&wlan_off);
+    if let Some(p) = gamedvr_prev {
+        data.gamedvr_prev = Some(p);
+    }
+    if let Some(p) = appcapture_prev {
+        data.appcapture_prev = Some(p);
+    }
+    if data.save() {
+        push(
+            format!(
+                "  💾 [SESSION] Đã lưu {} app{} + {} service vào session.json ({}).",
+                data.apps.len(),
+                if data.apps.len() > apps_before && apps_before > 0 {
+                    " (gộp với phiên trước)"
+                } else {
+                    ""
+                },
+                data.services.len(),
+                data.saved_at
+            ),
+            Color32::from_rgb(0, 229, 255),
+        );
+    } else {
+        push(
+            "  ⚠ [SESSION] Không ghi được session.json — Restore sẽ thiếu dữ liệu.".into(),
+            Color32::from_rgb(255, 120, 120),
+        );
+    }
+    *sh.session.lock().unwrap() = Some(data);
+
+    // 8. Tắt app: WM_CLOSE trước (chờ tối đa 3s cho app kịp lưu), rồi TerminateProcess.
+    let mut killed_any = false;
+    let mut groups_sorted: Vec<(&String, &Vec<u32>)> = groups.iter().collect();
+    groups_sorted.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    // Gửi WM_CLOSE cho tất cả app cùng lúc, chờ chung tối đa 3s (không chờ 3s mỗi app).
+    let all_pids: Vec<u32> = groups.values().flatten().copied().collect();
+    sys::close_gracefully(&all_pids, Duration::from_secs(3));
+    for (exe, pids) in groups_sorted {
+        let label = labels.get(exe).cloned().unwrap_or_else(|| exe.clone());
+        let alive_after = pids.iter().filter(|&&p| sys::is_alive(p)).count();
+        let mut freed = 0u64;
+        let mut killed = 0usize;
+        for &pid in pids.iter() {
+            // Process đã tự thoát sau WM_CLOSE thì TerminateProcess trả về lỗi - bỏ qua.
+            if let Some(ws) = sys::kill(pid) {
+                freed += ws;
+                killed += 1;
+            }
+        }
+        killed_any = true;
+        push(
+            format!(
+                "  ✖ [TERMINATE] {:<20} ({} tác vụ, {} còn sống sau WM_CLOSE, {} bị ép tắt) -> Giải phóng {}",
+                label,
+                pids.len(),
+                alive_after,
+                killed,
+                fmt_ram(freed)
+            ),
+            Color32::from_rgb(255, 145, 45),
+        );
+    }
+    if !killed_any {
+        push(
+            "  • [SKIP APPS] Không có app nền nào cần tắt (tất cả đang được giữ lại).".into(),
+            Color32::from_rgb(130, 150, 170),
+        );
+    }
+
+    // 9. Xả standby list một lần sau khi đã tắt app (thay cho trim working-set cũ).
+    if opts.standby {
+        match sys::memory_lists() {
+            Some(before_lists) => match sys::purge_standby() {
+                Ok(_) => {
+                    std::thread::sleep(Duration::from_millis(500));
+                    let after_lists = sys::memory_lists().unwrap_or(before_lists);
+                    push(
+                        format!(
+                            "  ✔ [STANDBY] Xả standby list: Free {:.2} GB / Standby {:.2} GB -> Free {:.2} GB / Standby {:.2} GB",
+                            before_lists.free_bytes as f64 / GB,
+                            before_lists.standby_bytes as f64 / GB,
+                            after_lists.free_bytes as f64 / GB,
+                            after_lists.standby_bytes as f64 / GB
+                        ),
+                        Color32::from_rgb(50, 215, 255),
+                    );
+                }
+                Err(e) => push(
+                    format!("  ⚠ [STANDBY] Không xả được standby list: {}", e),
+                    Color32::from_rgb(255, 120, 120),
+                ),
+            },
+            None => push(
+                "  ⚠ [STANDBY] Không đọc được danh sách trang bộ nhớ của Windows.".into(),
+                Color32::from_rgb(255, 120, 120),
+            ),
+        }
+    }
+
+    // 10. Lưu lại config (đường dẫn exe game mới biết) rồi cập nhật danh sách app cho UI.
+    if !sh.save_config() {
+        push(
+            "  ⚠ [CONFIG] Không ghi được gamemode.cfg.".into(),
+            Color32::from_rgb(255, 120, 120),
+        );
+    }
+
+    std::thread::sleep(Duration::from_millis(1000));
+    let after_mem = sys::memory();
+    let after = after_mem.avail;
+    let net_freed = (after as f64 - before as f64) / GB;
+
+    push(
+        format!(
+            "✔ [SUCCESS] HOÀN TẤT! RAM trống hiện tại: {:.1} GB (Tăng +{:.1} GB)",
+            after as f64 / GB,
+            net_freed.max(0.0)
+        ),
+        Color32::from_rgb(0, 255, 163),
+    );
+    push(
+        "★ [READY] Toàn bộ tài nguyên CPU & RAM đã tối ưu cho DELTA FORCE!".into(),
+        Color32::from_rgb(0, 255, 163),
+    );
+
+    *sh.running.lock().unwrap() = scan_running_apps(&skip);
+}
+
+/// Thân của Restore: mở lại app, bật lại service, Wi-Fi autoconf, Game DVR.
+fn do_restore(sh: &Shared) {
+    log_clear(sh);
+    let sel = sh.restore_sel.lock().unwrap().clone();
+    sh.log(
+        "▶ [RESTORE] Đang khôi phục lại các ứng dụng & dịch vụ hệ thống...".into(),
+        Color32::from_rgb(0, 229, 255),
+    );
+
+    let Some(data) = SessionData::load() else {
+        sh.log(
+            format!("  ⚠ Không tìm thấy {} — chưa có phiên nào được lưu.", session_path().display()),
+            Color32::from_rgb(255, 140, 140),
+        );
+        return;
+    };
+
+    // 1. Mở lại app đã tắt (bỏ qua app đang chạy sẵn), chạy bằng quyền user thường.
+    let running: HashSet<String> = sys::list_processes().into_iter().map(|p| p.name.to_lowercase()).collect();
+    let mut opened = 0usize;
+    let mut failed = 0usize;
+    let mut skipped = 0usize;
+    for app in data.apps.iter() {
+        let key = app_key(app);
+        let path = if !app.path.trim().is_empty() {
+            app.path.clone()
+        } else {
+            extract_exe_path(&app.cmdline).unwrap_or_default()
+        };
+        // Session cũ còn entry rác: process phụ (COM server, helper, renderer...) và app đóng gói.
+        if is_child_process_cmdline(&app.cmdline) || is_packaged_path(&path) || is_never_restore_exe(&app.exe) {
+            skipped += 1;
+            sh.log(
+                format!("  • Bỏ qua process phụ: {} ({})", app.display, app.exe),
+                Color32::from_rgb(130, 150, 170),
+            );
+            continue;
+        }
+        if !sel.get(&key).copied().unwrap_or(true) {
+            skipped += 1;
+            sh.log(
+                format!("  • Bỏ qua (không được tick): {}", app.display),
+                Color32::from_rgb(130, 150, 170),
+            );
+            continue;
+        }
+        if running.contains(&app.exe.to_lowercase()) {
+            sh.log(
+                format!("  • {} đã đang chạy sẵn.", app.display),
+                Color32::from_rgb(130, 150, 170),
+            );
+            continue;
+        }
+        if path.trim().is_empty() {
+            failed += 1;
+            sh.log(
+                format!("  ⚠ {} — không có đường dẫn exe để mở.", app.display),
+                Color32::from_rgb(255, 120, 120),
+            );
+            continue;
+        }
+        let cmd = if app.cmdline.trim().is_empty() {
+            format!("\"{}\"", path)
+        } else {
+            app.cmdline.clone()
+        };
+        match sys::launch_as_standard_user(&cmd, &path, app.cwd.as_deref()) {
+            Ok(()) => {
+                opened += 1;
+                sh.log(
+                    format!("  ✔ Đã mở lại {} ({})", app.display, app.exe),
+                    Color32::from_rgb(0, 255, 163),
+                );
+            }
+            Err(e) => {
+                failed += 1;
+                sh.log(
+                    format!("  ⚠ Không mở được {} ({}): {}", app.display, app.exe, e),
+                    Color32::from_rgb(255, 120, 120),
+                );
+            }
+        }
+    }
+    if skipped > 0 {
+        sh.log(
+            format!("  • Đã bỏ qua {} entry (process phụ / không được tick).", skipped),
+            Color32::from_rgb(130, 150, 170),
+        );
+    }
+
+    // 2. Bật lại các Services đã dừng trong phiên.
+    for svc_name in data.services.iter() {
+        match sys::start_service(svc_name) {
+            Ok(_) => sh.log(
+                format!("  ✔ Khởi động lại service: {}", svc_name),
+                Color32::from_rgb(0, 255, 163),
+            ),
+            // 1056 = ERROR_SERVICE_ALREADY_RUNNING: service đã tự chạy lại, không phải lỗi.
+            Err(sys::SERVICE_TIMEOUT) => sh.log(
+                format!("  • Service {} khởi động chậm, đang chạy ngầm.", svc_name),
+                Color32::from_rgb(255, 160, 40),
+            ),
+            Err(1056) => sh.log(
+                format!("  • Service {} đã đang chạy sẵn.", svc_name),
+                Color32::from_rgb(130, 150, 170),
+            ),
+            Err(e) => sh.log(
+                format!("  ⚠ Lỗi khởi động service {}: mã lỗi {}", svc_name, e),
+                Color32::from_rgb(255, 120, 120),
+            ),
+        }
+    }
+
+    // 3. Bật lại quét nền Wi-Fi cho các interface đã tắt (áp dụng cả khi không có app nào cần mở).
+    for guid in data.wlan_autoconf_off.iter() {
+        match sys::set_wlan_autoconf(guid, true) {
+            Ok(_) => sh.log(
+                format!("  ✔ Đã bật lại quét Wi-Fi nền cho interface {}.", guid),
+                Color32::from_rgb(0, 255, 163),
+            ),
+            Err(e) => sh.log(
+                format!("  ⚠ Không bật lại được quét Wi-Fi nền ({}): {}", guid, e),
+                Color32::from_rgb(255, 120, 120),
+            ),
+        }
+    }
+
+    // 4. Ghi lại giá trị Game DVR / App Capture trước khi tool sửa (None = xoá value).
+    if let Some(prev) = data.gamedvr_prev.as_ref() {
+        match sys::set_gamedvr_enabled(prev.value) {
+            Ok(_) => sh.log(
+                format!("  ✔ Đã trả GameDVR_Enabled về {:?}.", prev.value),
+                Color32::from_rgb(0, 255, 163),
+            ),
+            Err(e) => sh.log(
+                format!("  ⚠ Không trả lại được GameDVR_Enabled: {}", e),
+                Color32::from_rgb(255, 120, 120),
+            ),
+        }
+    }
+    if let Some(prev) = data.appcapture_prev.as_ref() {
+        match sys::set_appcapture_enabled(prev.value) {
+            Ok(_) => sh.log(
+                format!("  ✔ Đã trả AppCaptureEnabled về {:?}.", prev.value),
+                Color32::from_rgb(0, 255, 163),
+            ),
+            Err(e) => sh.log(
+                format!("  ⚠ Không trả lại được AppCaptureEnabled: {}", e),
+                Color32::from_rgb(255, 120, 120),
+            ),
+        }
+    }
+
+    // 5. Đã mở xong -> session.json chuyển thành session.last.json.
+    let sp = session_path();
+    let archived = sp.with_file_name("session.last.json");
+    if std::fs::rename(&sp, &archived).is_err() {
+        let _ = std::fs::remove_file(&sp);
+    }
+    *sh.session.lock().unwrap() = None;
+
+    sh.log(
+        format!(
+            "✔ Đã gửi lệnh khôi phục xong: {} app mở được, {} lỗi, {} bỏ qua, {} service.",
+            opened,
+            failed,
+            skipped,
+            data.services.len()
+        ),
+        Color32::from_rgb(140, 165, 190),
+    );
+}
+
+fn log_clear(sh: &Shared) {
+    sh.log.lock().unwrap().clear();
+}
+
+/// Watcher chạy suốt đời app ở thread riêng: tự tối ưu khi game mở, tự Restore khi game tắt,
+/// và xả standby list khi RAM trống xuống thấp trong lúc chơi.
+/// Không phụ thuộc `update()` nên vẫn hoạt động khi cửa sổ bị thu nhỏ.
+fn start_watcher(sh: Shared) {
+    std::thread::spawn(move || {
+        const SCAN: Duration = Duration::from_secs(3);
+        const GAME_STABLE: Duration = Duration::from_secs(5);
+        const GAME_GONE: Duration = Duration::from_secs(15);
+        const MEM_CHECK: Duration = Duration::from_secs(5);
+        const PURGE_GAP: Duration = Duration::from_secs(60);
+        const LOW_FREE: u64 = 1024 * 1024 * 1024;
+        const HIGH_STANDBY: u64 = 1024 * 1024 * 1024;
+
+        let mut game_seen: Option<(Instant, usize)> = None;
+        let mut game_gone: Option<Instant> = None;
+        let mut optimized = false;
+        let mut last_mem_check = Instant::now();
+        let mut last_purge = Instant::now() - PURGE_GAP;
+
+        loop {
+            std::thread::sleep(SCAN);
+            let opts = sh.opts();
+            let games: Vec<String> = sh.games.lock().unwrap().clone();
+            if games.is_empty() {
+                continue;
+            }
+            let names: Vec<String> = sys::list_processes()
+                .into_iter()
+                .map(|p| p.name.to_lowercase())
+                .collect();
+            let up: Vec<String> = games
+                .iter()
+                .filter(|g| names.iter().any(|n| n == *g))
+                .cloned()
+                .collect();
+            let any = !up.is_empty();
+
+            if any {
+                game_gone = None;
+                if opts.auto_enabled && !optimized {
+                    let (since, count_at_seen) = *game_seen
+                        .get_or_insert_with(|| (Instant::now(), sh.opt_count.load(Ordering::SeqCst)));
+                    if since.elapsed() >= GAME_STABLE && !sh.busy.load(Ordering::SeqCst) {
+                        // Người dùng vừa bấm tối ưu bằng tay trong lúc chờ -> không chạy lặp.
+                        if sh.opt_count.load(Ordering::SeqCst) != count_at_seen {
+                            optimized = true;
+                            game_seen = None;
+                            continue;
+                        }
+                        sh.log(
+                            format!("[AUTO] Phát hiện {}", up.join(", ")),
+                            Color32::from_rgb(0, 229, 255),
+                        );
+                        optimized = true;
+                        game_seen = None;
+                        optimize(sh.clone(), true);
+                    }
+                }
+            } else {
+                game_seen = None;
+                let since = *game_gone.get_or_insert_with(Instant::now);
+                if since.elapsed() >= GAME_GONE {
+                    // Chỉ tự Restore khi phiên game này do auto khởi động, và không chạy lặp.
+                    if opts.auto_restore
+                        && optimized
+                        && sh.last_auto.load(Ordering::SeqCst)
+                        && !sh.busy.load(Ordering::SeqCst)
+                    {
+                        optimized = false;
+                        sh.log(
+                            "[AUTO] Game đã tắt 15 giây — tự khôi phục lại hệ thống.".into(),
+                            Color32::from_rgb(0, 229, 255),
+                        );
+                        restore(sh.clone());
+                    } else if !sh.busy.load(Ordering::SeqCst) {
+                        optimized = false;
+                    }
+                }
+            }
+
+            // Trong phiên game: RAM trống thấp mà standby nhiều -> xả, tối thiểu 60 giây một lần.
+            if any
+                && opts.standby
+                && !sh.busy.load(Ordering::SeqCst)
+                && last_mem_check.elapsed() >= MEM_CHECK
+                && last_purge.elapsed() >= PURGE_GAP
+            {
+                last_mem_check = Instant::now();
+                if let Some(lists) = sys::memory_lists() {
+                    if lists.free_bytes < LOW_FREE && lists.standby_bytes > HIGH_STANDBY {
+                        match sys::purge_standby() {
+                            Ok(_) => {
+                                last_purge = Instant::now();
+                                let after = sys::memory_lists().unwrap_or(lists);
+                                sh.log(
+                                    format!(
+                                        "  ✔ [AUTO] Xả standby khi đang chơi: Free {:.2} GB / Standby {:.2} GB -> Free {:.2} GB / Standby {:.2} GB",
+                                        lists.free_bytes as f64 / GB,
+                                        lists.standby_bytes as f64 / GB,
+                                        after.free_bytes as f64 / GB,
+                                        after.standby_bytes as f64 / GB
+                                    ),
+                                    Color32::from_rgb(50, 215, 255),
+                                );
+                            }
+                            Err(e) => {
+                                last_purge = Instant::now();
+                                sh.log(
+                                    format!("  ⚠ [AUTO] Không xả được standby khi đang chơi: {}", e),
+                                    Color32::from_rgb(255, 120, 120),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Cờ `--minimized`: egui 0.29 không có `ViewportBuilder::with_minimized`, phải gửi
+/// `ViewportCommand::Minimized(true)` sau khi cửa sổ đã tạo (xem `App::update`).
+static START_MINIMIZED: AtomicBool = AtomicBool::new(false);
+
+struct App {
+    sh: Shared,
+    tab: ConfigTab,
+    mem: sys::Mem,
+    /// Free / Standby đọc từ danh sách trang bộ nhớ; None nếu không đọc được.
+    mem_lists: Option<sys::MemLists>,
+    last_mem: Instant,
+    last_ml: Instant,
+    saved_at: Option<(Instant, bool)>,
+    is_admin: bool,
+    scanning: Arc<AtomicBool>,
     show_session: bool,
-    /// App nào của session được tick để Restore mở lại (mặc định bật, không lưu ra file).
-    restore_sel: HashMap<String, bool>,
+    /// Ô nhập exe game mới.
+    game_input: String,
+    /// Task "GameMode" trong Task Scheduler (cache, hỏi lại định kỳ).
+    task_on: bool,
+    last_task_check: Instant,
+    /// Còn phải thu nhỏ cửa sổ lần đầu (cờ --minimized).
+    minimize_pending: bool,
 }
 
 impl App {
     fn save(&mut self) {
-        let ok = save_config(&self.keep, &self.svc_enabled);
+        let ok = self.sh.save_config();
         self.saved_at = Some((Instant::now(), ok));
     }
 
@@ -540,7 +1582,7 @@ impl App {
             s.spacing.scroll.bar_inner_margin = 4.0;
         });
 
-        let (keep, svcs) = load_config();
+        let cfg = load_config();
         let is_admin = sys::is_admin();
         let session = SessionData::load();
         // Mặc định tick hết: người dùng bỏ tick app nào thì Restore không mở app đó.
@@ -549,10 +1591,7 @@ impl App {
             .map(|s| s.apps.iter().map(|a| (app_key(a), true)).collect())
             .unwrap_or_default();
 
-        let mut app = Self {
-            keep,
-            svc_enabled: svcs,
-            tab: ConfigTab::Apps,
+        let sh = Shared {
             log: Arc::new(Mutex::new(vec![
                 ("[SYSTEM] DELTA FORCE TACTICAL RAM SUITE READY".into(), Color32::from_rgb(0, 229, 255)),
                 (
@@ -569,18 +1608,39 @@ impl App {
                 ),
             ])),
             busy: Arc::new(AtomicBool::new(false)),
+            running: Arc::new(Mutex::new(Vec::new())),
+            session: Arc::new(Mutex::new(session)),
+            keep: Arc::new(Mutex::new(cfg.keep)),
+            svc: Arc::new(Mutex::new(cfg.svcs)),
+            games: Arc::new(Mutex::new(cfg.games)),
+            game_paths: Arc::new(Mutex::new(cfg.game_paths)),
+            opts: Arc::new(Mutex::new(cfg.opts)),
+            restore_sel: Arc::new(Mutex::new(restore_sel)),
+            is_admin,
+            last_auto: Arc::new(AtomicBool::new(false)),
+            opt_count: Arc::new(AtomicUsize::new(0)),
+        };
+
+        let mut app = Self {
+            sh: sh.clone(),
+            tab: ConfigTab::Apps,
             mem: sys::memory(),
+            mem_lists: sys::memory_lists(),
             last_mem: Instant::now(),
+            last_ml: Instant::now(),
             saved_at: None,
             is_admin,
-            running: Arc::new(Mutex::new(Vec::new())),
             scanning: Arc::new(AtomicBool::new(false)),
-            session: Arc::new(Mutex::new(session)),
             show_session: false,
-            restore_sel,
+            game_input: String::new(),
+            task_on: sys::task_exists(),
+            last_task_check: Instant::now(),
+            minimize_pending: START_MINIMIZED.load(Ordering::SeqCst),
         };
         app.save();
         app.start_scan();
+        // Watcher sống độc lập với UI: vẫn tự tối ưu khi cửa sổ bị thu nhỏ.
+        start_watcher(sh);
         app
     }
 
@@ -589,411 +1649,13 @@ impl App {
         if self.scanning.swap(true, Ordering::SeqCst) {
             return;
         }
-        let running = self.running.clone();
+        let running = self.sh.running.clone();
         let scanning = self.scanning.clone();
+        let skip = skip_list(&self.sh.games.lock().unwrap().clone());
         std::thread::spawn(move || {
-            let list = scan_running_apps();
+            let list = scan_running_apps(&skip);
             *running.lock().unwrap() = list;
             scanning.store(false, Ordering::SeqCst);
-        });
-    }
-
-    fn run_optimize(&mut self) {
-        let keep = self.keep.clone();
-        let svcs = self.svc_enabled.clone();
-        let log = self.log.clone();
-        let busy = self.busy.clone();
-        let is_admin = self.is_admin;
-        let running_arc = self.running.clone();
-        let session_arc = self.session.clone();
-        busy.store(true, Ordering::SeqCst);
-
-        std::thread::spawn(move || {
-            let push = |s: String, c: Color32| log.lock().unwrap().push((s, c));
-            log.lock().unwrap().clear();
-
-            let before_mem = sys::memory();
-            let before = before_mem.avail;
-            push(
-                format!("▶ [DEPLOY] Bắt đầu thanh lọc | RAM khả dụng ban đầu: {:.1} GB", before as f64 / GB),
-                Color32::from_rgb(0, 229, 255),
-            );
-
-            // 1. Quét app đang chạy -> nhóm theo tên exe, bỏ nhóm được tick "Giữ lại".
-            let me = std::process::id();
-            let my_session = sys::current_session();
-            let snap = sys::snapshot();
-            let parent = snap.iter().find(|p| p.pid == me).map(|p| p.ppid).unwrap_or(0);
-
-            let mut groups: HashMap<String, Vec<u32>> = HashMap::new();
-            let mut labels: HashMap<String, String> = HashMap::new();
-            let mut kept_exes: HashSet<String> = HashSet::new();
-            for p in snap.iter() {
-                if p.pid == 0 || p.pid == me || p.pid == parent || p.session != my_session {
-                    continue;
-                }
-                let exe = p.name.to_lowercase();
-                if exe.is_empty() || is_never_kill(&exe, p.exe_path.as_deref()) {
-                    continue;
-                }
-                if keep_decision(&keep, &exe) {
-                    kept_exes.insert(exe);
-                    continue;
-                }
-                groups.entry(exe.clone()).or_default().push(p.pid);
-                labels
-                    .entry(exe)
-                    .or_insert_with(|| p.display_name.clone().unwrap_or_else(|| p.name.clone()));
-            }
-            push(
-                format!(
-                    "  • [SCAN] {} app sẽ tắt / {} app được giữ lại (session user hiện tại).",
-                    groups.len(),
-                    kept_exes.len()
-                ),
-                Color32::from_rgb(50, 215, 255),
-            );
-
-            // 2. Gom "process gốc" của từng app để lưu session (TRƯỚC khi tắt).
-            //    Cửa sổ phải đọc trước khi gửi WM_CLOSE, sau đó app đã đóng nên không còn gì để đọc.
-            let window_pids = sys::pids_with_user_window();
-            let mut startup_lower: Option<Vec<String>> = None;
-            let mut session_apps: Vec<SessionApp> = Vec::new();
-            let mut skipped_children = 0usize;
-            for pids in groups.values() {
-                // Nhóm exe này có cửa sổ top-level thật không (điều kiện 3).
-                let group_has_window = pids.iter().any(|p| window_pids.contains(p));
-                for &pid in pids.iter() {
-                    let Some(info) = snap.iter().find(|p| p.pid == pid) else { continue };
-
-                    // (1) Không phải process con của app khác: parent phải là explorer.exe, hoặc
-                    //     không còn trong snapshot, hoặc là process Windows (svchost do Task
-                    //     Scheduler mở...). Giữ quy tắc cũ: cùng tên exe với parent -> không phải gốc.
-                    if let Some(parent) = snap.iter().find(|p| p.pid == info.ppid && p.pid != 0) {
-                        if parent.name.eq_ignore_ascii_case(&info.name) {
-                            continue;
-                        }
-                        let windows_parent = parent.name.eq_ignore_ascii_case("explorer.exe")
-                            || parent
-                                .exe_path
-                                .as_deref()
-                                .is_some_and(|p| p.to_lowercase().starts_with(r"c:\windows\"));
-                        if !windows_parent {
-                            skipped_children += 1;
-                            continue;
-                        }
-                    }
-
-                    let path = info.exe_path.clone().unwrap_or_default();
-
-                    // App đóng gói (WindowsApps) không mở lại được bằng đường dẫn exe.
-                    if is_packaged_path(&path) {
-                        continue;
-                    }
-
-                    // (2) Command line không chứa dấu hiệu process phụ.
-                    let cmdline = info
-                        .cmdline
-                        .clone()
-                        .filter(|c| !c.trim().is_empty())
-                        .unwrap_or_else(|| format!("\"{}\"", path));
-                    if is_child_process_cmdline(&cmdline) || is_never_restore_exe(&info.name) {
-                        skipped_children += 1;
-                        continue;
-                    }
-
-                    // (3) App người dùng thật: có cửa sổ top-level, hoặc có trong lệnh tự khởi động
-                    //     (giữ được app chạy ẩn dưới khay như Zalo).
-                    let is_user_app = group_has_window || {
-                        let startup = startup_lower
-                            .get_or_insert_with(|| {
-                                sys::startup_commands()
-                                    .iter()
-                                    .map(|s| s.to_lowercase())
-                                    .collect()
-                            });
-                        in_startup_entries(&path, startup)
-                    };
-                    if !is_user_app {
-                        skipped_children += 1;
-                        continue;
-                    }
-
-                    session_apps.push(SessionApp {
-                        exe: info.name.clone(),
-                        display: info.display_name.clone().unwrap_or_else(|| info.name.clone()),
-                        path,
-                        cmdline,
-                        cwd: sys::working_dir_of(pid),
-                    });
-                }
-            }
-            if skipped_children > 0 {
-                push(
-                    format!(
-                        "  • [SESSION] Bỏ qua {} process phụ / không phải app người dùng.",
-                        skipped_children
-                    ),
-                    Color32::from_rgb(130, 150, 170),
-                );
-            }
-
-            // 3. Tạm dừng các Services được chọn (nếu có quyền Admin)
-            let mut newly_stopped = Vec::new();
-            for ((svc_name, display_name, _, _), on) in SERVICE_TARGETS.iter().zip(&svcs) {
-                if !on {
-                    continue;
-                }
-                if sys::is_service_running(svc_name) {
-                    if is_admin {
-                        match sys::stop_service(svc_name) {
-                            Ok(_) => {
-                                newly_stopped.push(svc_name.to_string());
-                                push(
-                                    format!("  ✔ [STOP SVC] Tạm dừng service: {:<20} ({})", display_name, svc_name),
-                                    Color32::from_rgb(0, 255, 163),
-                                );
-                            }
-                            Err(sys::SERVICE_TIMEOUT) => {
-                                // Lệnh dừng đã gửi, service đang dừng chậm: vẫn lưu để Restore bật lại.
-                                newly_stopped.push(svc_name.to_string());
-                                push(
-                                    format!("  • [STOP SVC] {} phản hồi chậm, đang dừng ngầm ({})", display_name, svc_name),
-                                    Color32::from_rgb(255, 160, 40),
-                                );
-                            }
-                            Err(e) => {
-                                push(
-                                    format!("  ⚠ [WARN SVC] Lỗi dừng service {}: mã lỗi {}", svc_name, e),
-                                    Color32::from_rgb(255, 120, 120),
-                                );
-                            }
-                        }
-                    } else {
-                        push(
-                            format!("  ⚠ [SKIP SVC] Bỏ qua {}: Cần quyền Administrator để dừng service.", display_name),
-                            Color32::from_rgb(255, 160, 40),
-                        );
-                    }
-                }
-            }
-
-            // 4. Ghi session.json (gộp với session cũ nếu còn) trước khi tắt app.
-            let mut data = SessionData::load().unwrap_or_default();
-            data.saved_at = sys::local_time_string();
-            let apps_before = data.apps.len();
-            data.merge(session_apps, newly_stopped);
-            if data.save() {
-                push(
-                    format!(
-                        "  💾 [SESSION] Đã lưu {} app{} + {} service vào session.json ({}).",
-                        data.apps.len(),
-                        if data.apps.len() > apps_before && apps_before > 0 {
-                            " (gộp với phiên trước)"
-                        } else {
-                            ""
-                        },
-                        data.services.len(),
-                        data.saved_at
-                    ),
-                    Color32::from_rgb(0, 229, 255),
-                );
-            } else {
-                push(
-                    "  ⚠ [SESSION] Không ghi được session.json — Restore sẽ thiếu dữ liệu.".into(),
-                    Color32::from_rgb(255, 120, 120),
-                );
-            }
-            *session_arc.lock().unwrap() = Some(data);
-
-            // 5. Tắt app: WM_CLOSE trước (chờ tối đa 3s cho app kịp lưu), rồi TerminateProcess.
-            let mut killed_any = false;
-            let mut groups_sorted: Vec<(&String, &Vec<u32>)> = groups.iter().collect();
-            groups_sorted.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
-            // Gửi WM_CLOSE cho tất cả app cùng lúc, chờ chung tối đa 3s (không chờ 3s mỗi app).
-            let all_pids: Vec<u32> = groups.values().flatten().copied().collect();
-            sys::close_gracefully(&all_pids, Duration::from_secs(3));
-            for (exe, pids) in groups_sorted {
-                let label = labels.get(exe).cloned().unwrap_or_else(|| exe.clone());
-                let alive_after = pids.iter().filter(|&&p| sys::is_alive(p)).count();
-                let mut freed = 0u64;
-                let mut killed = 0usize;
-                for &pid in pids.iter() {
-                    // Process đã tự thoát sau WM_CLOSE thì TerminateProcess trả về lỗi - bỏ qua.
-                    if let Some(ws) = sys::kill(pid) {
-                        freed += ws;
-                        killed += 1;
-                    }
-                }
-                killed_any = true;
-                push(
-                    format!(
-                        "  ✖ [TERMINATE] {:<20} ({} tác vụ, {} còn sống sau WM_CLOSE, {} bị ép tắt) -> Giải phóng {}",
-                        label,
-                        pids.len(),
-                        alive_after,
-                        killed,
-                        fmt_ram(freed)
-                    ),
-                    Color32::from_rgb(255, 145, 45),
-                );
-            }
-            if !killed_any {
-                push(
-                    "  • [SKIP APPS] Không có app nền nào cần tắt (tất cả đang được giữ lại).".into(),
-                    Color32::from_rgb(130, 150, 170),
-                );
-            }
-
-            // 6. Ép Working-set nhả RAM
-            let mut trimmed = 0u64;
-            for p in sys::list_processes().iter().filter(|p| p.pid > 4 && p.pid != me) {
-                trimmed += sys::trim(p.pid);
-            }
-            push(
-                format!("  〰 [TRIM WORKING-SET] Đã thu hồi cache toàn hệ thống -> Giảm {}", fmt_ram(trimmed)),
-                Color32::from_rgb(50, 215, 255),
-            );
-
-            std::thread::sleep(Duration::from_millis(1000));
-            let after_mem = sys::memory();
-            let after = after_mem.avail;
-            let net_freed = (after as f64 - before as f64) / GB;
-
-            push(
-                format!(
-                    "✔ [SUCCESS] HOÀN TẤT! RAM trống hiện tại: {:.1} GB (Tăng +{:.1} GB)",
-                    after as f64 / GB,
-                    net_freed.max(0.0)
-                ),
-                Color32::from_rgb(0, 255, 163),
-            );
-            push(
-                "★ [READY] Toàn bộ tài nguyên CPU & RAM đã tối ưu cho DELTA FORCE!".into(),
-                Color32::from_rgb(0, 255, 163),
-            );
-
-            // 7. Danh sách app đã thay đổi -> quét lại cho UI.
-            *running_arc.lock().unwrap() = scan_running_apps();
-            busy.store(false, Ordering::SeqCst);
-        });
-    }
-
-    fn run_restore(&self) {
-        let log = self.log.clone();
-        let session_arc = self.session.clone();
-        let restore_sel = self.restore_sel.clone();
-        let busy = self.busy.clone();
-        busy.store(true, Ordering::SeqCst);
-        log.lock().unwrap().clear();
-        // Chạy nền: mở app / bật service có thể chậm, không được làm đứng giao diện.
-        std::thread::spawn(move || {
-            (|| {
-                log.lock().unwrap().push(("▶ [RESTORE] Đang khôi phục lại các ứng dụng & dịch vụ hệ thống...".into(), Color32::from_rgb(0, 229, 255)));
-
-                let Some(data) = SessionData::load() else {
-                    log.lock().unwrap().push((
-                        format!("  ⚠ Không tìm thấy {} — chưa có phiên nào được lưu.", session_path().display()),
-                        Color32::from_rgb(255, 140, 140),
-                    ));
-                    return;
-                };
-
-                // 1. Mở lại app đã tắt (bỏ qua app đang chạy sẵn), chạy bằng quyền user thường.
-                let running: HashSet<String> = sys::list_processes().into_iter().map(|p| p.name.to_lowercase()).collect();
-                let mut opened = 0usize;
-                let mut failed = 0usize;
-                let mut skipped = 0usize;
-                for app in data.apps.iter() {
-                    let key = app_key(app);
-                    let path = if !app.path.trim().is_empty() {
-                        app.path.clone()
-                    } else {
-                        extract_exe_path(&app.cmdline).unwrap_or_default()
-                    };
-                    // Session cũ còn entry rác: process phụ (COM server, helper, renderer...) và app đóng gói.
-                    if is_child_process_cmdline(&app.cmdline) || is_packaged_path(&path) || is_never_restore_exe(&app.exe) {
-                        skipped += 1;
-                        log.lock().unwrap().push((
-                            format!("  • Bỏ qua process phụ: {} ({})", app.display, app.exe),
-                            Color32::from_rgb(130, 150, 170),
-                        ));
-                        continue;
-                    }
-                    if !restore_sel.get(&key).copied().unwrap_or(true) {
-                        skipped += 1;
-                        log.lock().unwrap().push((
-                            format!("  • Bỏ qua (không được tick): {}", app.display),
-                            Color32::from_rgb(130, 150, 170),
-                        ));
-                        continue;
-                    }
-                    if running.contains(&app.exe.to_lowercase()) {
-                        log.lock().unwrap().push((format!("  • {} đã đang chạy sẵn.", app.display), Color32::from_rgb(130, 150, 170)));
-                        continue;
-                    }
-                    if path.trim().is_empty() {
-                        failed += 1;
-                        log.lock().unwrap().push((format!("  ⚠ {} — không có đường dẫn exe để mở.", app.display), Color32::from_rgb(255, 120, 120)));
-                        continue;
-                    }
-                    let cmd = if app.cmdline.trim().is_empty() {
-                        format!("\"{}\"", path)
-                    } else {
-                        app.cmdline.clone()
-                    };
-                    match sys::launch_as_standard_user(&cmd, &path, app.cwd.as_deref()) {
-                        Ok(()) => {
-                            opened += 1;
-                            log.lock().unwrap().push((format!("  ✔ Đã mở lại {} ({})", app.display, app.exe), Color32::from_rgb(0, 255, 163)));
-                        }
-                        Err(e) => {
-                            failed += 1;
-                            log.lock().unwrap().push((
-                                format!("  ⚠ Không mở được {} ({}): {}", app.display, app.exe, e),
-                                Color32::from_rgb(255, 120, 120),
-                            ));
-                        }
-                    }
-                }
-                if skipped > 0 {
-                    log.lock().unwrap().push((
-                        format!("  • Đã bỏ qua {} entry (process phụ / không được tick).", skipped),
-                        Color32::from_rgb(130, 150, 170),
-                    ));
-                }
-
-                // 2. Bật lại các Services đã dừng trong phiên.
-                for svc_name in data.services.iter() {
-                    match sys::start_service(svc_name) {
-                        Ok(_) => log.lock().unwrap().push((format!("  ✔ Khởi động lại service: {}", svc_name), Color32::from_rgb(0, 255, 163))),
-                        // 1056 = ERROR_SERVICE_ALREADY_RUNNING: service đã tự chạy lại, không phải lỗi.
-                        Err(sys::SERVICE_TIMEOUT) => log.lock().unwrap().push((format!("  • Service {} khởi động chậm, đang chạy ngầm.", svc_name), Color32::from_rgb(255, 160, 40))),
-                        Err(1056) => log.lock().unwrap().push((format!("  • Service {} đã đang chạy sẵn.", svc_name), Color32::from_rgb(130, 150, 170))),
-                        Err(e) => log.lock().unwrap().push((format!("  ⚠ Lỗi khởi động service {}: mã lỗi {}", svc_name, e), Color32::from_rgb(255, 120, 120))),
-                    }
-                }
-
-                // 3. Đã mở xong -> session.json chuyển thành session.last.json.
-                let sp = session_path();
-                let archived = sp.with_file_name("session.last.json");
-                if std::fs::rename(&sp, &archived).is_err() {
-                    let _ = std::fs::remove_file(&sp);
-                }
-                *session_arc.lock().unwrap() = None;
-
-                log.lock().unwrap().push((
-                    format!(
-                        "✔ Đã gửi lệnh khôi phục xong: {} app mở được, {} lỗi, {} bỏ qua, {} service.",
-                        opened,
-                        failed,
-                        skipped,
-                        data.services.len()
-                    ),
-                    Color32::from_rgb(140, 165, 190),
-                ));
-            })();
-            busy.store(false, Ordering::SeqCst);
         });
     }
 }
@@ -1006,6 +1668,7 @@ fn render_stat_card(
     total_gb: f64,
     ratio: f32,
     color: Color32,
+    extra: Option<&str>,
 ) {
     egui::Frame::none()
         .fill(Color32::from_rgb(14, 20, 30))
@@ -1032,21 +1695,46 @@ fn render_stat_card(
                 .show_percentage()
                 .animate(false);
             ui.add(progress);
+
+            if let Some(text) = extra {
+                ui.add_space(2.0);
+                ui.label(
+                    RichText::new(text)
+                        .size(9.5)
+                        .color(Color32::from_rgb(120, 150, 180)),
+                );
+            }
         });
 }
 
-/// Một dòng app đang chạy: tick "Giữ lại" = không tắt app này.
-fn running_app_row(ui: &mut egui::Ui, keep: &mut bool, app: &RunningApp) -> bool {
+/// Kết quả một dòng app đang chạy: người dùng vừa tick/bỏ tick hay vừa bấm "Là game".
+#[derive(PartialEq, Clone, Copy)]
+enum RowAction {
+    None,
+    ToggleKeep,
+    MarkGame,
+}
+
+/// Một dòng app đang chạy: tick "Giữ lại" = không tắt app này; nút nhỏ "Là game" = thêm nhanh
+/// exe vào danh sách game để watcher tự tối ưu.
+fn running_app_row(
+    ui: &mut egui::Ui,
+    keep: &mut bool,
+    app: &RunningApp,
+    is_game: bool,
+) -> RowAction {
     use egui::{pos2, vec2, Align2, CursorIcon, FontId, Rect, Sense, Shape};
 
     let row_h = 42.0;
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click());
     let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
-    let clicked = resp.clicked();
-    let hovered = resp.hovered();
-    if clicked {
+    let mut action = if resp.clicked() {
         *keep = !*keep;
-    }
+        RowAction::ToggleKeep
+    } else {
+        RowAction::None
+    };
+    let hovered = resp.hovered();
 
     let painter = ui.painter_at(rect);
 
@@ -1126,7 +1814,34 @@ fn running_app_row(ui: &mut egui::Ui, keep: &mut bool, app: &RunningApp) -> bool
         }
     }
 
-    clicked
+    // Nút nhỏ "Là game" (hoặc nhãn ✓ nếu exe đã nằm trong danh sách game).
+    let btn_rect = Rect::from_min_max(
+        pos2(rect.right() - 78.0, rect.top() + 22.0),
+        pos2(rect.right() - 8.0, rect.top() + 38.0),
+    );
+    if is_game {
+        painter.text(
+            btn_rect.center(),
+            Align2::CENTER_CENTER,
+            "✓ LÀ GAME",
+            FontId::proportional(9.5),
+            Color32::from_rgb(0, 255, 163),
+        );
+    } else {
+        let btn = egui::Button::new(
+            RichText::new("Là game")
+                .size(9.5)
+                .color(Color32::from_rgb(160, 210, 255)),
+        )
+        .fill(Color32::from_rgb(16, 26, 40))
+        .stroke(Stroke::new(1.0_f32, Color32::from_rgb(40, 70, 105)))
+        .rounding(Rounding::same(4.0));
+        if ui.put(btn_rect, btn).on_hover_text("Thêm exe này vào danh sách game để tự tối ưu khi mở game").clicked() {
+            action = RowAction::MarkGame;
+        }
+    }
+
+    action
 }
 
 fn service_row(ui: &mut egui::Ui, on: &mut bool, svc_name: &str, display_name: &str, desc: &str) -> bool {
@@ -1221,15 +1936,41 @@ fn time_part(saved_at: &str) -> String {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.minimize_pending {
+            self.minimize_pending = false;
+            // Khởi động cùng Windows: thu nhỏ ngay, watcher vẫn chạy bình thường.
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
         if self.last_mem.elapsed() > Duration::from_millis(800) {
             self.mem = sys::memory();
             self.last_mem = Instant::now();
         }
+        // Danh sách trang bộ nhớ (free / standby) — rẻ, chỉ đọc khi thẻ RAM cần hiển thị.
+        if self.last_ml.elapsed() > Duration::from_millis(2000) {
+            self.mem_lists = sys::memory_lists();
+            self.last_ml = Instant::now();
+        }
+        // Trạng thái task "GameMode" hỏi lại định kỳ (schtasks là tiến trình riêng, khá tốn).
+        if self.last_task_check.elapsed() > Duration::from_secs(20) {
+            self.task_on = sys::task_exists();
+            self.last_task_check = Instant::now();
+        }
         ctx.request_repaint_after(Duration::from_millis(400));
-        let busy = self.busy.load(Ordering::SeqCst);
+        let sh = self.sh.clone();
+        let busy = sh.busy.load(Ordering::SeqCst);
         let scanning = self.scanning.load(Ordering::SeqCst);
-        let apps_snapshot: Vec<RunningApp> = self.running.lock().unwrap().clone();
-        let session_view: Option<SessionData> = self.session.lock().unwrap().clone();
+        let apps_snapshot: Vec<RunningApp> = sh.running.lock().unwrap().clone();
+        let session_view: Option<SessionData> = sh.session.lock().unwrap().clone();
+        let games_view: Vec<String> = sh.games.lock().unwrap().clone();
+        let mut opts_view = sh.opts();
+        let mut opts_changed = false;
+        let ram_extra = self.mem_lists.map(|l| {
+            format!(
+                "Free {:.1} GB · Standby {:.1} GB",
+                l.free_bytes as f64 / GB,
+                l.standby_bytes as f64 / GB
+            )
+        });
 
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(Color32::from_rgb(10, 14, 21)).inner_margin(Margin::same(14.0)))
@@ -1326,6 +2067,7 @@ impl eframe::App for App {
                         m.total as f64 / GB,
                         ram_ratio,
                         ram_color,
+                        ram_extra.as_deref(),
                     );
                     render_stat_card(
                         &mut cols[1],
@@ -1335,6 +2077,7 @@ impl eframe::App for App {
                         m.commit_limit as f64 / GB,
                         commit_ratio,
                         commit_color,
+                        None,
                     );
                 });
 
@@ -1362,7 +2105,7 @@ impl eframe::App for App {
                     .rounding(Rounding::same(8.0));
 
                 if ui.add_sized([ui.available_width(), 44.0], boost_btn).clicked() && !busy {
-                    self.run_optimize();
+                    optimize(sh.clone(), false);
                 }
 
                 ui.add_space(6.0);
@@ -1378,7 +2121,7 @@ impl eframe::App for App {
                     .rounding(Rounding::same(6.0));
 
                     if cols[0].add_sized([cols[0].available_width(), 32.0], restore_btn).clicked() && !busy {
-                        self.run_restore();
+                        restore(sh.clone());
                     }
 
                     let clear_btn = egui::Button::new(
@@ -1391,7 +2134,7 @@ impl eframe::App for App {
                     .rounding(Rounding::same(6.0));
 
                     if cols[1].add_sized([cols[1].available_width(), 32.0], clear_btn).clicked() {
-                        self.log.lock().unwrap().clear();
+                        sh.log.lock().unwrap().clear();
                     }
                 });
 
@@ -1409,9 +2152,11 @@ impl eframe::App for App {
                                 Some(s) => {
                                     ui.label(
                                         RichText::new(format!(
-                                            "💾 Session đã lưu: {} app, {} service — lúc {}",
+                                            "💾 Session đã lưu: {} app, {} service, {} Wi-Fi, DVR {} — lúc {}",
                                             s.apps.len(),
                                             s.services.len(),
+                                            s.wlan_autoconf_off.len(),
+                                            if s.gamedvr_prev.is_some() { "có" } else { "không" },
                                             time_part(&s.saved_at)
                                         ))
                                         .size(10.5)
@@ -1446,9 +2191,10 @@ impl eframe::App for App {
                                     .max_height(120.0)
                                     .auto_shrink([false, false])
                                     .show(ui, |ui| {
+                                        let mut sel = sh.restore_sel.lock().unwrap();
                                         for a in s.apps.iter() {
                                             let cwd = a.cwd.clone().unwrap_or_else(|| "(không rõ)".into());
-                                            let checked = self.restore_sel.entry(app_key(a)).or_insert(true);
+                                            let checked = sel.entry(app_key(a)).or_insert(true);
                                             ui.horizontal(|ui| {
                                                 ui.checkbox(checked, "");
                                                 ui.label(
@@ -1477,18 +2223,244 @@ impl eframe::App for App {
 
                 ui.add_space(8.0);
 
-                // 4. DANH SÁCH CẤU HÌNH: TABS CHO ỨNG DỤNG VÀ SERVICES
+                // 3c. TỰ ĐỘNG KHI CHƠI GAME (watcher + danh sách exe game)
                 egui::Frame::none()
                     .fill(Color32::from_rgb(13, 18, 27))
                     .stroke(Stroke::new(1.0, Color32::from_rgb(26, 38, 56)))
                     .rounding(Rounding::same(8.0))
                     .inner_margin(Margin::same(10.0))
                     .show(ui, |ui| {
-                        let kept = apps_snapshot
-                            .iter()
-                            .filter(|a| keep_decision(&self.keep, &a.exe_lower))
-                            .count();
-                        let svc_sel = self.svc_enabled.iter().filter(|&&x| x).count();
+                        ui.label(
+                            RichText::new("🤖 TỰ ĐỘNG KHI CHƠI GAME")
+                                .size(11.0)
+                                .strong()
+                                .color(Color32::from_rgb(0, 229, 255)),
+                        );
+                        ui.add_space(3.0);
+                        ui.label(
+                            RichText::new("Watcher quét tên process mỗi 3 giây (không mở handle vào game / ACE).")
+                                .size(9.5)
+                                .color(Color32::from_rgb(110, 135, 165)),
+                        );
+
+                        let mut changed = false;
+                        if ui
+                            .checkbox(
+                                &mut opts_view.auto_enabled,
+                                RichText::new("Tự tối ưu khi game mở").size(11.5),
+                            )
+                            .on_hover_text("Phát hiện exe game là chờ 5 giây cho game ổn định rồi tối ưu")
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                        if ui
+                            .checkbox(
+                                &mut opts_view.auto_restore,
+                                RichText::new("Tự Restore khi game tắt").size(11.5),
+                            )
+                            .on_hover_text("Game tắt liên tục 15 giây thì khôi phục app & service (chỉ khi phiên này do auto tối ưu)")
+                            .changed()
+                        {
+                            changed = true;
+                        }
+
+                        // Chạy cùng Windows bằng Task Scheduler (quyền cao nhất, không bật UAC).
+                        let mut task_on = self.task_on;
+                        if ui
+                            .checkbox(
+                                &mut task_on,
+                                RichText::new("Chạy cùng Windows (Task Scheduler, quyền cao nhất)").size(11.5),
+                            )
+                            .on_hover_text("Tạo task \"GameMode\" chạy lúc đăng nhập với /RL HIGHEST — không hiện UAC")
+                            .changed()
+                        {
+                            let r = if task_on { sys::task_create() } else { sys::task_delete() };
+                            match r {
+                                Ok(_) => {
+                                    self.task_on = task_on;
+                                    self.last_task_check = Instant::now();
+                                    sh.log(
+                                        if task_on {
+                                            "  ✔ [TASK] Đã tạo task GameMode: tự chạy cùng Windows với quyền cao nhất.".into()
+                                        } else {
+                                            "  • [TASK] Đã xoá task GameMode.".into()
+                                        },
+                                        Color32::from_rgb(0, 255, 163),
+                                    );
+                                }
+                                Err(e) => {
+                                    self.last_task_check = Instant::now() - Duration::from_secs(20);
+                                    sh.log(
+                                        format!("  ⚠ [TASK] Không đổi được task GameMode: {}", e),
+                                        Color32::from_rgb(255, 120, 120),
+                                    );
+                                }
+                            }
+                        }
+
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new("Danh sách exe game (exe trong danh sách này luôn được GIỮ LẠI khi tối ưu):")
+                                .size(9.5)
+                                .color(Color32::from_rgb(110, 135, 165)),
+                        );
+
+                        let mut remove: Option<String> = None;
+                        egui::ScrollArea::vertical()
+                            .id_salt("game_list")
+                            .max_height(84.0)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                for exe in games_view.iter() {
+                                    ui.horizontal(|ui| {
+                                        let path = sh.game_paths.lock().unwrap().get(exe).cloned();
+                                        let label = match path {
+                                            Some(p) => format!("{}  —  {}", exe, p),
+                                            None => format!("{}  —  (chưa biết đường dẫn)", exe),
+                                        };
+                                        ui.label(
+                                            RichText::new(label)
+                                                .monospace()
+                                                .size(10.0)
+                                                .color(Color32::from_rgb(150, 185, 215)),
+                                        );
+                                        if ui
+                                            .small_button(RichText::new("✖").size(10.0))
+                                            .on_hover_text("Xoá khỏi danh sách game")
+                                            .clicked()
+                                        {
+                                            remove = Some(exe.clone());
+                                        }
+                                    });
+                                }
+                            });
+                        if let Some(exe) = remove {
+                            sh.games.lock().unwrap().retain(|e| e != &exe);
+                            self.save();
+                        }
+
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.game_input)
+                                    .hint_text("vd: game-client-win64-shipping.exe")
+                                    .desired_width(210.0),
+                            );
+                            if ui.button(RichText::new("Thêm").size(11.0)).clicked() {
+                                let exe = self.game_input.trim().to_lowercase();
+                                if !exe.is_empty() {
+                                    let mut games = sh.games.lock().unwrap();
+                                    if !games.contains(&exe) {
+                                        games.push(exe.clone());
+                                    }
+                                    drop(games);
+                                    self.game_input.clear();
+                                    self.save();
+                                    sh.log(
+                                        format!("  • [GAME] Đã thêm {} vào danh sách game.", exe),
+                                        Color32::from_rgb(0, 229, 255),
+                                    );
+                                }
+                            }
+                            ui.label(
+                                RichText::new("(hoặc bấm 'Là game' ở tab ỨNG DỤNG ĐANG CHẠY)")
+                                    .size(9.5)
+                                    .color(Color32::from_rgb(110, 135, 165)),
+                            );
+                        });
+
+                        if changed {
+                            *sh.opts.lock().unwrap() = opts_view;
+                            self.save();
+                        }
+                    });
+
+                ui.add_space(8.0);
+
+                // 3d. TỐI ƯU KHI CHƠI (4 tuỳ chọn)
+                egui::Frame::none()
+                    .fill(Color32::from_rgb(13, 18, 27))
+                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(26, 38, 56)))
+                    .rounding(Rounding::same(8.0))
+                    .inner_margin(Margin::same(10.0))
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new("⚙ TỐI ƯU KHI CHƠI")
+                                .size(11.0)
+                                .strong()
+                                .color(Color32::from_rgb(0, 229, 255)),
+                        );
+                        ui.add_space(3.0);
+
+                        if ui
+                            .checkbox(
+                                &mut opts_view.standby,
+                                RichText::new("Xả standby list (RAM chờ) khi tối ưu").size(11.5),
+                            )
+                            .on_hover_text("Thay cho trim working-set cũ: không đẩy RAM app đang chạy ra pagefile. Lúc đang chơi, nếu Free < 1 GB và Standby > 1 GB thì tự xả (cách nhau tối thiểu 60 giây)")
+                            .changed()
+                        {
+                            opts_changed = true;
+                        }
+                        if ui
+                            .checkbox(
+                                &mut opts_view.gpu,
+                                RichText::new("Ép game dùng GPU rời (NVIDIA)").size(11.5),
+                            )
+                            .on_hover_text("Ghi HKCU\\Software\\Microsoft\\DirectX\\UserGpuPreferences = GpuPreference=2; — áp dụng từ lần mở game SAU, không hoàn tác khi Restore")
+                            .changed()
+                        {
+                            opts_changed = true;
+                        }
+                        if ui
+                            .checkbox(
+                                &mut opts_view.wlan,
+                                RichText::new("Tắt quét Wi-Fi nền khi chơi").size(11.5),
+                            )
+                            .on_hover_text("Tắt autoconf của interface Wi-Fi đang kết nối")
+                            .changed()
+                        {
+                            opts_changed = true;
+                        }
+                        ui.label(
+                            RichText::new("Khi tắt quét Wi-Fi: mạng vẫn giữ kết nối hiện tại nhưng KHÔNG tự kết nối lại nếu rớt; Restore sẽ bật lại.")
+                                .size(9.5)
+                                .color(Color32::from_rgb(255, 170, 60)),
+                        );
+                        if ui
+                            .checkbox(
+                                &mut opts_view.gamedvr,
+                                RichText::new("Tắt Game DVR / ghi clip nền của Windows khi chơi").size(11.5),
+                            )
+                            .on_hover_text("Đặt GameDVR_Enabled và AppCaptureEnabled về 0; Restore ghi lại đúng giá trị cũ")
+                            .changed()
+                        {
+                            opts_changed = true;
+                        }
+
+                        if opts_changed {
+                            *sh.opts.lock().unwrap() = opts_view;
+                            self.save();
+                        }
+                    });
+
+                ui.add_space(8.0);
+
+                // 4. DANH SÁCH CẤU HÌNH: TABS CHO ỨNG DỤNG VÀ SERVICES
+                egui::Frame::none()
+                    .fill(Color32::from_rgb(13, 18, 27))
+                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(26, 38, 56)))
+                    .rounding(Rounding::same(8.0))
+                    .inner_margin(Margin::same(10.0))
+                    .show(ui, |ui| {
+                        let kept = {
+                            let keep = sh.keep.lock().unwrap();
+                            apps_snapshot
+                                .iter()
+                                .filter(|a| keep_decision(&keep, &a.exe_lower))
+                                .count()
+                        };
+                        let svc_sel = sh.svc.lock().unwrap().iter().filter(|&&x| x).count();
 
                         // Tab Switcher
                         ui.horizontal(|ui| {
@@ -1528,32 +2500,40 @@ impl eframe::App for App {
                                         self.start_scan();
                                     }
                                     if ui.button(RichText::new("Giữ tất cả").size(10.5)).clicked() {
+                                        let mut keep = sh.keep.lock().unwrap();
                                         for a in apps_snapshot.iter() {
-                                            self.keep.insert(a.exe_lower.clone(), true);
+                                            keep.insert(a.exe_lower.clone(), true);
                                         }
+                                        drop(keep);
                                         self.save();
                                     }
                                     if ui.button(RichText::new("Bỏ giữ tất cả").size(10.5)).clicked() {
+                                        let mut keep = sh.keep.lock().unwrap();
                                         for a in apps_snapshot.iter() {
-                                            self.keep.insert(a.exe_lower.clone(), false);
+                                            keep.insert(a.exe_lower.clone(), false);
                                         }
+                                        drop(keep);
                                         self.save();
                                     }
                                     if ui.button(RichText::new("Mặc định").size(10.5)).clicked() {
+                                        let mut keep = sh.keep.lock().unwrap();
                                         for a in apps_snapshot.iter() {
-                                            self.keep.insert(a.exe_lower.clone(), default_keep(&a.exe_lower));
+                                            keep.insert(a.exe_lower.clone(), default_keep(&a.exe_lower));
                                         }
+                                        drop(keep);
                                         self.save();
                                     }
                                 } else {
                                     if ui.button(RichText::new("Mặc định").size(10.5)).clicked() {
+                                        let mut svc = sh.svc.lock().unwrap();
                                         for (i, (_, _, _, def)) in SERVICE_TARGETS.iter().enumerate() {
-                                            self.svc_enabled[i] = *def;
+                                            svc[i] = *def;
                                         }
+                                        drop(svc);
                                         self.save();
                                     }
                                     if ui.button(RichText::new("Chọn hết").size(10.5)).clicked() {
-                                        for x in self.svc_enabled.iter_mut() {
+                                        for x in sh.svc.lock().unwrap().iter_mut() {
                                             *x = true;
                                         }
                                         self.save();
@@ -1621,18 +2601,25 @@ impl eframe::App for App {
                                             );
                                             ui.add_space(8.0);
                                         }
+                                        let keep_view = sh.keep.lock().unwrap().clone();
                                         for a in apps_snapshot.iter() {
-                                            let mut k = keep_decision(&self.keep, &a.exe_lower);
-                                            if running_app_row(ui, &mut k, a) {
-                                                self.keep.insert(a.exe_lower.clone(), k);
-                                                changed = true;
+                                            let mut k = keep_decision(&keep_view, &a.exe_lower);
+                                            let is_game = games_view.contains(&a.exe_lower);
+                                            match running_app_row(ui, &mut k, a, is_game) {
+                                                RowAction::ToggleKeep => {
+                                                    sh.keep.lock().unwrap().insert(a.exe_lower.clone(), k);
+                                                    changed = true;
+                                                }
+                                                RowAction::MarkGame => mark_as_game(&sh, a),
+                                                RowAction::None => {}
                                             }
                                             ui.add_space(2.0);
                                         }
                                     }
                                     ConfigTab::Services => {
+                                        let mut svc = sh.svc.lock().unwrap();
                                         for (i, (svc_name, display_name, desc, _)) in SERVICE_TARGETS.iter().enumerate() {
-                                            if service_row(ui, &mut self.svc_enabled[i], svc_name, display_name, desc) {
+                                            if service_row(ui, &mut svc[i], svc_name, display_name, desc) {
                                                 changed = true;
                                             }
                                             ui.add_space(2.0);
@@ -1676,7 +2663,7 @@ impl eframe::App for App {
                             .stick_to_bottom(true)
                             .max_height(log_height)
                             .show(ui, |ui| {
-                                for (line, color) in self.log.lock().unwrap().iter() {
+                                for (line, color) in sh.log.lock().unwrap().iter() {
                                     ui.label(RichText::new(line).monospace().size(11.0).color(*color));
                                 }
                             });
@@ -1710,25 +2697,147 @@ fn main() -> eframe::Result<()> {
     }
 
     // --selftest: đọc mọi process như khi lưu session (cmdline, cwd), KHÔNG tắt gì.
+    // Ghi thêm trạng thái standby/Wi-Fi/Game DVR/GPU/task để kiểm tra trên máy thật.
     if std::env::args().any(|a| a == "--selftest") {
-        let snap = sys::snapshot();
+        let cfg = load_config();
+        let skip = skip_list(&cfg.games);
+        let snap = sys::snapshot_skip(&skip);
         let mut lines = Vec::new();
         let mut cwd_ok = 0;
         for p in snap.iter() {
+            // Không đọc bộ nhớ của game / anti-cheat kể cả khi chạy selftest.
+            if is_ace_or_game(&p.name.to_lowercase(), &skip) {
+                lines.push(format!("{}\t{}\tskip(cmdline/cwd)\t{:?}", p.pid, p.name, p.exe_path));
+                continue;
+            }
             let cwd = sys::working_dir_of(p.pid);
             cwd_ok += cwd.is_some() as usize;
             lines.push(format!("{}	{}	{}	{:?}", p.pid, p.name, p.cmdline.is_some(), cwd));
         }
-        let apps = scan_running_apps();
+        let apps = scan_running_apps(&skip);
         lines.insert(0, format!("processes={} cwd_ok={} apps_listed={}", snap.len(), cwd_ok, apps.len()));
         for a in apps.iter() {
             lines.push(format!("APP	{}	{}	{}", a.exe_name, a.count, fmt_ram(a.total_ws)));
         }
+
+        lines.push(String::new());
+        lines.push("=== MEMORY LISTS (standby) ===".into());
+        match sys::memory_lists() {
+            Some(l) => lines.push(format!(
+                "free_bytes={} ({:.2} GB) standby_bytes={} ({:.2} GB)",
+                l.free_bytes,
+                l.free_bytes as f64 / GB,
+                l.standby_bytes,
+                l.standby_bytes as f64 / GB
+            )),
+            None => lines.push("memory_lists() = None (không gọi được NtQuerySystemInformation class 80)".into()),
+        }
+
+        lines.push(String::new());
+        lines.push("=== WLAN INTERFACES ===".into());
+        match sys::wlan_interfaces() {
+            Ok(list) => {
+                if list.is_empty() {
+                    lines.push("(không có interface Wi-Fi nào)".into());
+                }
+                for it in list.iter() {
+                    lines.push(format!(
+                        "{}	state={}	connected={}	autoconf={:?}",
+                        it.guid, it.state, it.connected, it.autoconf
+                    ));
+                }
+            }
+            Err(e) => lines.push(format!("lỗi: {}", e)),
+        }
+
+        lines.push(String::new());
+        lines.push("=== GAME DVR ===".into());
+        lines.push(format!("GameDVR_Enabled = {:?}", sys::gamedvr_enabled()));
+        lines.push(format!("AppCaptureEnabled = {:?}", sys::appcapture_enabled()));
+
+        lines.push(String::new());
+        lines.push("=== USER GPU PREFERENCES ===".into());
+        let prefs = sys::gpu_prefs();
+        if prefs.is_empty() {
+            lines.push("(chưa có value nào)".into());
+        }
+        for p in prefs.iter() {
+            lines.push(format!("{}	=	{}", p.path, p.value));
+        }
+
+        lines.push(String::new());
+        lines.push("=== TASK SCHEDULER ===".into());
+        lines.push(format!("task \"GameMode\" tồn tại = {}", sys::task_exists()));
+
+        lines.push(String::new());
+        lines.push("=== CONFIG ĐANG ĐỌC ===".into());
+        lines.push(format!(
+            "auto:enabled={} auto:restore={} opt:standby={} opt:gpu={} opt:wlan={} opt:gamedvr={}",
+            cfg.opts.auto_enabled as u8,
+            cfg.opts.auto_restore as u8,
+            cfg.opts.standby as u8,
+            cfg.opts.gpu as u8,
+            cfg.opts.wlan as u8,
+            cfg.opts.gamedvr as u8
+        ));
+        lines.push(format!("game list = {:?}", cfg.games));
+        lines.push(format!("game paths = {:?}", cfg.game_paths));
+
         let _ = std::fs::write(config_path().with_file_name("selftest.txt"), lines.join("
 "));
         return Ok(());
     }
 
+    // --purgetest: xả standby list một lần, ghi free/standby trước & sau ra purgetest.txt.
+    // --tasktest: tạo task "GameMode", đọc lại XML, rồi xoá (chỉ để kiểm tra cách quote đường dẫn).
+    if std::env::args().any(|a| a == "--tasktest") {
+        let created = sys::task_create();
+        use std::os::windows::process::CommandExt;
+        let xml = std::process::Command::new("schtasks")
+            .args(["/Query", "/TN", "GameMode", "/XML"])
+            .creation_flags(0x0800_0000)
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default();
+        let deleted = sys::task_delete();
+        let _ = std::fs::write(
+            config_path().with_file_name("tasktest.txt"),
+            format!("create={:?}
+delete={:?}
+{}", created, deleted, xml),
+        );
+        return Ok(());
+    }
+
+    if std::env::args().any(|a| a == "--purgetest") {
+        let before = sys::memory_lists();
+        let result = sys::purge_standby();
+        let after = sys::memory_lists();
+        let fmt = |m: Option<sys::MemLists>| match m {
+            Some(l) => format!(
+                "free={} ({:.2} GB) standby={} ({:.2} GB)",
+                l.free_bytes,
+                l.free_bytes as f64 / GB,
+                l.standby_bytes,
+                l.standby_bytes as f64 / GB
+            ),
+            None => "không đọc được".to_string(),
+        };
+        let text = format!(
+            "admin={}\ntrước: {}\nkết quả purge: {:?}\nsau: {}\n",
+            sys::is_admin(),
+            fmt(before),
+            result,
+            fmt(after)
+        );
+        let _ = std::fs::write(config_path().with_file_name("purgetest.txt"), text);
+        return Ok(());
+    }
+
+    let minimized = std::env::args().any(|a| a == "--minimized");
+    if minimized {
+        START_MINIMIZED.store(true, Ordering::SeqCst);
+    }
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("DELTA FORCE - TACTICAL RAM PURGE")
         .with_inner_size([500.0, 760.0])

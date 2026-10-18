@@ -17,6 +17,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_LibraryLoader",
     "Win32_System_RemoteDesktop",
     "Win32_Storage_FileSystem",
+    "Win32_NetworkManagement_WiFi",
     "Win32_UI_WindowsAndMessaging",
     "Win32_Security",
 ] }

@@ -1,6 +1,6 @@
-//! Win32 helpers: liệt kê / tắt process, ép nhả RAM, đọc trạng thái bộ nhớ,
+//! Win32 helpers: liệt kê / tắt process, đọc & xả danh sách trang RAM (standby list),
 //! quét app đang chạy (session người dùng), lấy command line và khởi chạy lại
-//! app bằng quyền user thường.
+//! app bằng quyền user thường, Wi-Fi (WLAN API), registry Game DVR / GPU và Task Scheduler.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
@@ -8,12 +8,18 @@ use std::mem::{size_of, transmute, zeroed};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, HANDLE, HWND, INVALID_HANDLE_VALUE, LPARAM, STILL_ACTIVE, SYSTEMTIME,
-    WPARAM,
+    CloseHandle, GetLastError, HANDLE, HWND, INVALID_HANDLE_VALUE, LPARAM, LUID, STILL_ACTIVE,
+    SYSTEMTIME, WPARAM,
+};
+use windows_sys::Win32::NetworkManagement::WiFi::{
+    WlanCloseHandle, WlanEnumInterfaces, WlanFreeMemory, WlanOpenHandle, WlanQueryInterface,
+    WlanSetInterface, wlan_interface_state_connected, wlan_intf_opcode_autoconf_enabled,
+    WLAN_INTERFACE_INFO_LIST,
 };
 use windows_sys::Win32::Security::{
-    DuplicateTokenEx, GetTokenInformation, SecurityImpersonation, TokenElevation, TokenPrimary,
-    TOKEN_DUPLICATE, TOKEN_ELEVATION, TOKEN_QUERY,
+    AdjustTokenPrivileges, DuplicateTokenEx, GetTokenInformation, LookupPrivilegeValueW,
+    SecurityImpersonation, TokenElevation, TokenPrimary, SE_PRIVILEGE_ENABLED,
+    TOKEN_ADJUST_PRIVILEGES, TOKEN_DUPLICATE, TOKEN_ELEVATION, TOKEN_PRIVILEGES, TOKEN_QUERY,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW,
@@ -23,9 +29,7 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
-use windows_sys::Win32::System::ProcessStatus::{
-    K32EmptyWorkingSet, K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
-};
+use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
 use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows_sys::Win32::System::SystemInformation::{
     GetLocalTime, GlobalMemoryStatusEx, MEMORYSTATUSEX,
@@ -33,7 +37,7 @@ use windows_sys::Win32::System::SystemInformation::{
 use windows_sys::Win32::System::Threading::{
     CreateProcessWithTokenW, GetCurrentProcess, GetExitCodeProcess, OpenProcess, OpenProcessToken,
     QueryFullProcessImageNameW, TerminateProcess, PROCESS_INFORMATION,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA, PROCESS_TERMINATE, PROCESS_VM_READ,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, PROCESS_VM_READ,
     STARTUPINFOW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -98,7 +102,22 @@ pub fn list_processes() -> Vec<Proc> {
 
 /// Quét toàn bộ process kèm session, exe, command line, tên hiển thị và RAM.
 /// Tốn vài chục ms -> chỉ gọi trong thread nền.
-pub fn snapshot() -> Vec<ProcInfo> {
+/// Process có tên trong `skip` (game + anti-cheat ACE) chỉ được mở bằng
+/// PROCESS_QUERY_LIMITED_INFORMATION để lấy đường dẫn exe — KHÔNG yêu cầu quyền đọc bộ nhớ,
+/// không đọc command line / thư mục làm việc / working set. `skip` là tên exe viết thường
+/// (khớp đúng hoặc khớp tiền tố, ví dụ "ace-").
+pub fn snapshot_skip(skip: &[String]) -> Vec<ProcInfo> {
+    snapshot_inner(skip)
+}
+
+fn is_skipped(name_lower: &str, skip: &[String]) -> bool {
+    !skip.is_empty()
+        && skip
+            .iter()
+            .any(|s| name_lower == s.as_str() || name_lower.starts_with(s.as_str()))
+}
+
+fn snapshot_inner(skip: &[String]) -> Vec<ProcInfo> {
     let mut out: Vec<ProcInfo> = Vec::new();
     let mut desc_cache: HashMap<String, Option<String>> = HashMap::new();
     unsafe {
@@ -126,18 +145,26 @@ pub fn snapshot() -> Vec<ProcInfo> {
                 };
 
                 if pid > 4 {
-                    if let Some(h) = open_query(pid) {
-                        info.ws = working_set(h);
-                        info.exe_path = exe_path_of(h);
-                        CloseHandle(h);
-                    }
-                    info.cmdline = command_line_of(pid);
-                    if let Some(p) = info.exe_path.as_ref() {
-                        let desc = desc_cache
-                            .entry(p.to_lowercase())
-                            .or_insert_with(|| file_description(p))
-                            .clone();
-                        info.display_name = desc;
+                    if is_skipped(&info.name.to_lowercase(), skip) {
+                        // Game / anti-cheat: chỉ đọc đường dẫn exe, không đụng tới bộ nhớ.
+                        if let Some(h) = open_limited(pid) {
+                            info.exe_path = exe_path_of(h);
+                            CloseHandle(h);
+                        }
+                    } else {
+                        if let Some(h) = open_query(pid) {
+                            info.ws = working_set(h);
+                            info.exe_path = exe_path_of(h);
+                            CloseHandle(h);
+                        }
+                        info.cmdline = command_line_of(pid);
+                        if let Some(p) = info.exe_path.as_ref() {
+                            let desc = desc_cache
+                                .entry(p.to_lowercase())
+                                .or_insert_with(|| file_description(p))
+                                .clone();
+                            info.display_name = desc;
+                        }
                     }
                 }
                 out.push(info);
@@ -166,6 +193,14 @@ pub fn session_of(pid: u32) -> u32 {
 
 pub fn current_session() -> u32 {
     session_of(std::process::id())
+}
+
+/// Mở process chỉ để đọc thông tin cơ bản (không có quyền đọc bộ nhớ / ghi).
+fn open_limited(pid: u32) -> Option<HANDLE> {
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        (!h.is_null()).then_some(h)
+    }
 }
 
 /// Mở process với quyền tối thiểu cần cho việc đọc thông tin.
@@ -525,18 +560,448 @@ pub fn startup_commands() -> Vec<String> {
 }
 
 
-pub fn trim(pid: u32) -> u64 {
-    unsafe {
-        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SET_QUOTA, 0, pid);
-        if h.is_null() {
-            return 0;
-        }
-        let before = working_set(h);
-        K32EmptyWorkingSet(h);
-        let after = working_set(h);
-        CloseHandle(h);
-        before.saturating_sub(after)
+/// Thông tin danh sách trang bộ nhớ (`SystemMemoryListInformation` = 80):
+/// số byte hoàn toàn trống và số byte đang nằm trong standby list.
+#[derive(Clone, Copy, Default)]
+pub struct MemLists {
+    pub free_bytes: u64,
+    pub standby_bytes: u64,
+}
+
+/// SYSTEM_MEMORY_LIST_INFORMATION (toàn bộ trường đều là ULONG_PTR).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct SystemMemoryListInformation {
+    zero_page_count: usize,
+    free_page_count: usize,
+    modified_page_count: usize,
+    modified_no_write_page_count: usize,
+    bad_page_count: usize,
+    page_count_by_priority: [usize; 8],
+    repurposed_pages_by_priority: [usize; 8],
+    modified_page_count_page_file: usize,
+}
+
+/// SystemMemoryListInformation
+const SYSTEM_MEMORY_LIST_INFORMATION: u32 = 80;
+/// MemoryPurgeStandbyList (tham số của NtSetSystemInformation class 80).
+const MEMORY_PURGE_STANDBY_LIST: u32 = 4;
+const PAGE_BYTES: u64 = 4096;
+/// ERROR_NOT_ALL_ASSIGNED: token không được cấp quyền vừa yêu cầu.
+const ERROR_NOT_ALL_ASSIGNED: u32 = 1300;
+
+type NtQuerySystemInformationFn =
+    unsafe extern "system" fn(u32, *mut c_void, u32, *mut u32) -> i32;
+type NtSetSystemInformationFn = unsafe extern "system" fn(u32, *mut c_void, u32) -> i32;
+
+/// Lấy hàm trong ntdll.dll theo tên (đều là hàm không export qua import lib).
+unsafe fn ntdll_proc(name: *const u8) -> Option<unsafe extern "system" fn() -> isize> {
+    let ntdll = GetModuleHandleW(to_wide("ntdll.dll").as_ptr());
+    if ntdll.is_null() {
+        return None;
     }
+    GetProcAddress(ntdll, name)
+}
+
+/// Đọc số byte free / standby của hệ thống. `None` nếu không gọi được API.
+pub fn memory_lists() -> Option<MemLists> {
+    unsafe {
+        let p = ntdll_proc(c"NtQuerySystemInformation".as_ptr() as *const u8)?;
+        let query: NtQuerySystemInformationFn = transmute(p);
+
+        // Windows trả STATUS_INFO_LENGTH_MISMATCH cho class này dù buffer đã đủ;
+        // cấp dư 16 byte và chấp nhận cả hai mã trả về.
+        let mut buf = vec![0u8; size_of::<SystemMemoryListInformation>() + 16];
+        let mut ret_len: u32 = 0;
+        let status = query(
+            SYSTEM_MEMORY_LIST_INFORMATION,
+            buf.as_mut_ptr() as *mut c_void,
+            buf.len() as u32,
+            &mut ret_len,
+        );
+        if status != STATUS_SUCCESS && status != STATUS_INFO_LENGTH_MISMATCH {
+            return None;
+        }
+        let info = &*(buf.as_ptr() as *const SystemMemoryListInformation);
+
+        let free_pages = info.zero_page_count.saturating_add(info.free_page_count);
+        let standby_pages: usize = info.page_count_by_priority.iter().sum();
+        Some(MemLists {
+            free_bytes: free_pages as u64 * PAGE_BYTES,
+            standby_bytes: standby_pages as u64 * PAGE_BYTES,
+        })
+    }
+}
+
+/// Bật một quyền của token hiện tại (cần cho purge standby: SeProfileSingleProcessPrivilege).
+unsafe fn enable_privilege(name: &str) -> Result<(), String> {
+    let mut token: HANDLE = std::ptr::null_mut();
+    if OpenProcessToken(
+        GetCurrentProcess(),
+        TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+        &mut token,
+    ) == 0
+    {
+        return Err(format!("OpenProcessToken lỗi {}", GetLastError()));
+    }
+
+    let mut luid: LUID = zeroed();
+    let wide = to_wide(name);
+    if LookupPrivilegeValueW(std::ptr::null(), wide.as_ptr(), &mut luid) == 0 {
+        let err = GetLastError();
+        CloseHandle(token);
+        return Err(format!("LookupPrivilegeValueW({}) lỗi {}", name, err));
+    }
+
+    let mut tp: TOKEN_PRIVILEGES = zeroed();
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Luid = luid;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    let ok = AdjustTokenPrivileges(
+        token,
+        0,
+        &mut tp,
+        0,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+    );
+    let err = GetLastError();
+    CloseHandle(token);
+    if ok == 0 {
+        return Err(format!("AdjustTokenPrivileges lỗi {}", err));
+    }
+    if err == ERROR_NOT_ALL_ASSIGNED {
+        return Err(format!("token không được cấp quyền {}", name));
+    }
+    Ok(())
+}
+
+/// Xả standby list: giải phóng các trang RAM đang chờ (cache) — nhẹ nhàng hơn
+/// EmptyWorkingSet vì không đẩy working set của app đang chạy ra pagefile.
+pub fn purge_standby() -> Result<(), String> {
+    unsafe {
+        let p = ntdll_proc(c"NtSetSystemInformation".as_ptr() as *const u8)
+            .ok_or_else(|| "không tìm thấy NtSetSystemInformation".to_string())?;
+        let set: NtSetSystemInformationFn = transmute(p);
+
+        // Quyền chỉ có ý nghĩa khi tool chạy elevated; thiếu thì báo rõ thay vì lỗi khó hiểu.
+        enable_privilege("SeProfileSingleProcessPrivilege")?;
+
+        let mut command: u32 = MEMORY_PURGE_STANDBY_LIST;
+        let status = set(
+            SYSTEM_MEMORY_LIST_INFORMATION,
+            &mut command as *mut u32 as *mut c_void,
+            size_of::<u32>() as u32,
+        );
+        if status == STATUS_SUCCESS {
+            Ok(())
+        } else {
+            Err(format!(
+                "NtSetSystemInformation lỗi 0x{:08X}",
+                status as u32
+            ))
+        }
+    }
+}
+
+/// Một interface Wi-Fi kèm trạng thái quét nền (autoconf).
+#[derive(Clone)]
+pub struct WlanIface {
+    pub guid: String,
+    pub description: String,
+    pub state: u32,
+    pub connected: bool,
+    /// Trạng thái "tự động cấu hình" (quét nền) nếu interface đang kết nối.
+    pub autoconf: Option<bool>,
+}
+
+unsafe fn wlan_open() -> Result<HANDLE, String> {
+    let mut negotiated: u32 = 0;
+    let mut handle: HANDLE = std::ptr::null_mut();
+    // Phiên bản client 2 = Windows Vista trở lên.
+    let rc = WlanOpenHandle(2, std::ptr::null(), &mut negotiated, &mut handle);
+    if rc != 0 {
+        return Err(format!("WlanOpenHandle lỗi {}", rc));
+    }
+    Ok(handle)
+}
+
+fn guid_to_string(g: &windows_sys::core::GUID) -> String {
+    format!(
+        "{{{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}}}",
+        g.data1,
+        g.data2,
+        g.data3,
+        g.data4[0],
+        g.data4[1],
+        g.data4[2],
+        g.data4[3],
+        g.data4[4],
+        g.data4[5],
+        g.data4[6],
+        g.data4[7]
+    )
+}
+
+fn guid_from_string(s: &str) -> Option<windows_sys::core::GUID> {
+    let hex: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    if hex.len() != 32 {
+        return None;
+    }
+    let n = |from: usize, to: usize| u32::from_str_radix(&hex[from..to], 16).ok();
+    let mut data4 = [0u8; 8];
+    for (i, item) in data4.iter_mut().enumerate() {
+        *item = u8::from_str_radix(&hex[16 + i * 2..18 + i * 2], 16).ok()?;
+    }
+    Some(windows_sys::core::GUID {
+        data1: n(0, 8)?,
+        data2: n(8, 12)? as u16,
+        data3: n(12, 16)? as u16,
+        data4,
+    })
+}
+
+fn utf16_trim(buf: &[u16]) -> String {
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    String::from_utf16_lossy(&buf[..len])
+}
+
+/// Liệt kê interface Wi-Fi qua WLAN API (không phụ thuộc ngôn ngữ như netsh).
+pub fn wlan_interfaces() -> Result<Vec<WlanIface>, String> {
+    unsafe {
+        let handle = wlan_open()?;
+        let mut list: *mut WLAN_INTERFACE_INFO_LIST = std::ptr::null_mut();
+        let rc = WlanEnumInterfaces(handle, std::ptr::null(), &mut list);
+        if rc != 0 || list.is_null() {
+            WlanCloseHandle(handle, std::ptr::null_mut());
+            return Err(format!("WlanEnumInterfaces lỗi {}", rc));
+        }
+
+        let count = (*list).dwNumberOfItems as usize;
+        let base = (*list).InterfaceInfo.as_ptr();
+        let mut out: Vec<WlanIface> = Vec::with_capacity(count);
+        for i in 0..count {
+            let item = &*base.add(i);
+            let connected = item.isState == wlan_interface_state_connected;
+            let mut autoconf = None;
+            if connected {
+                let mut size: u32 = 0;
+                let mut data: *mut c_void = std::ptr::null_mut();
+                let mut value_type = 0;
+                let rc = WlanQueryInterface(
+                    handle,
+                    &item.InterfaceGuid,
+                    wlan_intf_opcode_autoconf_enabled,
+                    std::ptr::null(),
+                    &mut size,
+                    &mut data,
+                    &mut value_type,
+                );
+                if rc == 0 && !data.is_null() {
+                    autoconf = Some(*(data as *const i32) != 0);
+                    WlanFreeMemory(data as *const c_void);
+                }
+            }
+            out.push(WlanIface {
+                guid: guid_to_string(&item.InterfaceGuid),
+                description: utf16_trim(&item.strInterfaceDescription),
+                state: item.isState as u32,
+                connected,
+                autoconf,
+            });
+        }
+
+        WlanFreeMemory(list as *const c_void);
+        WlanCloseHandle(handle, std::ptr::null_mut());
+        Ok(out)
+    }
+}
+
+/// Bật/tắt quét nền Wi-Fi (autoconf) cho một interface theo GUID.
+pub fn set_wlan_autoconf(guid: &str, enabled: bool) -> Result<(), String> {
+    let g = guid_from_string(guid).ok_or_else(|| format!("GUID interface không hợp lệ: {}", guid))?;
+    unsafe {
+        let handle = wlan_open()?;
+        let value: i32 = if enabled { 1 } else { 0 };
+        let rc = WlanSetInterface(
+            handle,
+            &g,
+            wlan_intf_opcode_autoconf_enabled,
+            size_of::<i32>() as u32,
+            &value as *const i32 as *const c_void,
+            std::ptr::null(),
+        );
+        WlanCloseHandle(handle, std::ptr::null_mut());
+        if rc != 0 {
+            Err(format!("WlanSetInterface lỗi {}", rc))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+const GAMEDVR_KEY: &str = r"System\GameConfigStore";
+const APPCAPTURE_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\GameDVR";
+const GPU_PREFS_KEY: &str = r"Software\Microsoft\DirectX\UserGpuPreferences";
+
+fn read_dword(path: &str, name: &str) -> Option<u32> {
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
+    use winreg::RegKey;
+
+    RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey_with_flags(path, KEY_READ)
+        .ok()?
+        .get_value(name)
+        .ok()
+}
+
+/// Ghi DWORD; `None` = xoá value (dùng khi trước đó value không tồn tại).
+fn write_dword(path: &str, name: &str, value: Option<u32>) -> Result<(), String> {
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
+    use winreg::RegKey;
+
+    let key = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey_with_flags(path, KEY_READ | KEY_WRITE)
+        .map_err(|e| format!("mở khoá {} lỗi: {}", path, e))?;
+    match value {
+        Some(v) => key
+            .set_value(name, &v)
+            .map_err(|e| format!("ghi {} lỗi: {}", name, e)),
+        // Value không tồn tại sẵn thì delete_value trả lỗi NotFound — coi như xong.
+        None => {
+            let _ = key.delete_value(name);
+            Ok(())
+        }
+    }
+}
+
+pub fn gamedvr_enabled() -> Option<u32> {
+    read_dword(GAMEDVR_KEY, "GameDVR_Enabled")
+}
+
+pub fn set_gamedvr_enabled(value: Option<u32>) -> Result<(), String> {
+    write_dword(GAMEDVR_KEY, "GameDVR_Enabled", value)
+}
+
+pub fn appcapture_enabled() -> Option<u32> {
+    read_dword(APPCAPTURE_KEY, "AppCaptureEnabled")
+}
+
+pub fn set_appcapture_enabled(value: Option<u32>) -> Result<(), String> {
+    write_dword(APPCAPTURE_KEY, "AppCaptureEnabled", value)
+}
+
+/// Một value trong UserGpuPreferences (tên = đường dẫn exe).
+pub struct GpuPref {
+    pub path: String,
+    pub value: String,
+}
+
+/// Toàn bộ value hiện có của HKCU\Software\Microsoft\DirectX\UserGpuPreferences.
+pub fn gpu_prefs() -> Vec<GpuPref> {
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
+    use winreg::RegKey;
+
+    let mut out: Vec<GpuPref> = Vec::new();
+    let Ok(key) = RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(GPU_PREFS_KEY, KEY_READ)
+    else {
+        return out;
+    };
+    for (name, _) in key.enum_values().flatten() {
+        if let Ok(value) = key.get_value::<String, _>(&name) {
+            out.push(GpuPref { path: name, value });
+        }
+    }
+    out
+}
+
+/// Đặt GPU hiệu năng cao (GPU rời) cho exe: `GpuPreference=2;` trong UserGpuPreferences.
+/// Trả `Ok(true)` nếu vừa ghi mới, `Ok(false)` nếu giá trị đã đúng từ trước.
+pub fn ensure_gpu_high_perf(exe_path: &str) -> Result<bool, String> {
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+
+    // Khoá có thể chưa tồn tại trên máy chưa từng chỉnh GPU theo app -> tạo mới.
+    let (key, _) = RegKey::predef(HKEY_CURRENT_USER)
+        .create_subkey(GPU_PREFS_KEY)
+        .map_err(|e| format!("mở khoá UserGpuPreferences lỗi: {}", e))?;
+    // Giá trị dạng "AppStatus=0;GpuPreference=1;": chỉ đổi GpuPreference, giữ các mục khác.
+    let current = key.get_value::<String, _>(exe_path).unwrap_or_default();
+    let mut parts: Vec<String> = current
+        .split(';')
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty() && !p.to_lowercase().starts_with("gpupreference="))
+        .map(|p| p.to_string())
+        .collect();
+    parts.push("GpuPreference=2".to_string());
+    let wanted = format!("{};", parts.join(";"));
+    if current.trim() == wanted {
+        return Ok(false);
+    }
+    key.set_value(exe_path, &wanted)
+        .map_err(|e| format!("ghi UserGpuPreferences lỗi: {}", e))?;
+    Ok(true)
+}
+
+const TASK_NAME: &str = "GameMode";
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Chạy chương trình ẩn cửa sổ console, gom stdout+stderr để báo lỗi cho người dùng.
+fn run_hidden(program: &str, args: &[&str]) -> Result<String, String> {
+    use std::os::windows::process::CommandExt;
+
+    let out = std::process::Command::new(program)
+        .args(args)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| format!("chạy {} lỗi: {}", program, e))?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if out.status.success() {
+        Ok(text)
+    } else {
+        let msg = text.trim().to_string();
+        Err(if msg.is_empty() {
+            format!("{} trả mã {}", program, out.status)
+        } else {
+            msg
+        })
+    }
+}
+
+/// Task "GameMode" trong Task Scheduler đã tồn tại chưa (kiểm tra bằng exit code).
+pub fn task_exists() -> bool {
+    run_hidden("schtasks", &["/Query", "/TN", TASK_NAME]).is_ok()
+}
+
+/// Tạo task chạy cùng Windows với quyền cao nhất (không bật UAC mỗi lần đăng nhập).
+pub fn task_create() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| format!("không lấy được đường dẫn exe: {}", e))?;
+    let tr = format!("\"{}\" --minimized", exe.display());
+    run_hidden(
+        "schtasks",
+        &[
+            "/Create",
+            "/TN",
+            TASK_NAME,
+            "/TR",
+            &tr,
+            "/SC",
+            "ONLOGON",
+            "/RL",
+            "HIGHEST",
+            "/F",
+        ],
+    )
+    .map(|_| ())
+}
+
+/// Xoá task "GameMode".
+pub fn task_delete() -> Result<(), String> {
+    run_hidden("schtasks", &["/Delete", "/TN", TASK_NAME, "/F"]).map(|_| ())
 }
 
 #[derive(Clone, Copy, Default)]
