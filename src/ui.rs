@@ -1,6 +1,9 @@
 //! Theme bảng màu và widget giao diện Tactical HUD cho GameMode (egui 0.29).
 
-use eframe::egui::{self, pos2, vec2, Align2, Color32, CursorIcon, FontId, Margin, Rect, Rounding, Stroke};
+use eframe::egui::{
+    self, pos2, vec2, viewport::ResizeDirection, Align2, Color32, CursorIcon, FontId, Margin, Rect,
+    Rounding, Stroke, ViewportCommand,
+};
 
 // ==========================================
 // BẢNG MÀU TACTICAL HUD
@@ -33,6 +36,38 @@ pub const SUCCESS: Color32 = Color32::from_rgb(61, 255, 138);
 pub const WARNING: Color32 = Color32::from_rgb(255, 138, 31);
 /// Đỏ nguy hiểm / tắt / lỗi (#FF3B3B)
 pub const DANGER: Color32 = Color32::from_rgb(255, 59, 59);
+
+// ==========================================
+// KHOẢNG CÁCH GIAO DIỆN (SPACING TOKENS)
+// ==========================================
+/// Padding của panel trái/phải: 14 -> 22
+pub const SPACE_PANEL_PAD: f32 = 22.0;
+/// Khoảng cách giữa các card: 10 -> 18
+pub const SPACE_CARD_GAP: f32 = 18.0;
+/// Padding trong card: 12 -> 18
+pub const SPACE_CARD_PAD: f32 = 18.0;
+/// Khoảng giữa header khối và nội dung: 12
+pub const SPACE_HEADER_GAP: f32 = 12.0;
+/// Item spacing mặc định: khoảng (10, 10)
+pub const SPACE_ITEM_SPACING: egui::Vec2 = egui::vec2(10.0, 10.0);
+/// Hàng app trong lưới: cao 56
+pub const ROW_APP_HEIGHT: f32 = 56.0;
+/// Hàng service trong lưới: cao 56
+pub const ROW_SERVICE_HEIGHT: f32 = 56.0;
+/// Khoảng cách giữa các ô trong lưới: 12 theo cả hai chiều
+pub const SPACE_GRID_GAP: f32 = 12.0;
+/// Nút Game Boost: cao 56
+pub const BTN_BOOST_HEIGHT: f32 = 56.0;
+/// Các nút phụ: cao 38
+pub const BTN_SUB_HEIGHT: f32 = 38.0;
+/// Khoảng cách giữa các nút trong toolbar của tab: 8
+pub const SPACE_TOOLBAR_GAP: f32 = 8.0;
+/// Toolbar cách danh sách: 14
+pub const SPACE_TOOLBAR_MARGIN_BOTTOM: f32 = 14.0;
+/// Line-height log thoáng hơn: thêm khoảng ~4px giữa các dòng
+pub const SPACE_LOG_LINE_GAP: f32 = 4.0;
+/// Chiều cao title bar tuỳ biến (~40px)
+pub const TITLE_BAR_HEIGHT: f32 = 40.0;
 
 // ==========================================
 // CẤU HÌNH THEME VISUALS
@@ -86,6 +121,7 @@ pub fn setup_visuals(ctx: &egui::Context) {
 
     ctx.set_visuals(visuals);
     ctx.style_mut(|s| {
+        s.spacing.item_spacing = SPACE_ITEM_SPACING;
         s.spacing.scroll = egui::style::ScrollStyle::solid();
         s.spacing.scroll.bar_width = 6.0;
         s.spacing.scroll.bar_inner_margin = 2.0;
@@ -206,11 +242,11 @@ pub fn hud_card_shape(rect: Rect, bg: Color32, border_color: Color32, accent_col
     egui::Shape::Vec(brackets)
 }
 
-/// Khung thẻ kiểu HUD: góc vát chéo, viền 1px, 4 khung góc corner brackets, padding 12.
+/// Khung thẻ kiểu HUD: góc vát chéo, viền 1px, 4 khung góc corner brackets, padding 18.
 pub fn card<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> egui::InnerResponse<R> {
     let bg_idx = ui.painter().add(egui::Shape::Noop);
     let resp = egui::Frame::none()
-        .inner_margin(Margin::same(12.0))
+        .inner_margin(Margin::same(SPACE_CARD_PAD))
         .show(ui, add_contents);
 
     let rect = resp.response.rect;
@@ -472,7 +508,6 @@ pub fn service_row(
     let switch_w = 36.0_f32;
     let switch_h = 20.0_f32;
     let pad_x = 8.0_f32;
-    let pad_y = 6.0_f32;
     let spacing = 10.0_f32;
 
     let avail_w = ui.available_width();
@@ -495,7 +530,7 @@ pub fn service_row(
     let title_h = title_galley.size().y;
     let desc_h = desc_galley.size().y + 2.0_f32;
     let content_h = title_h + desc_h;
-    let total_h = (content_h + pad_y * 2.0_f32).max(42.0_f32);
+    let total_h = ROW_SERVICE_HEIGHT;
 
     let (rect, resp) = ui.allocate_exact_size(vec2(avail_w, total_h), egui::Sense::click());
     let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
@@ -510,7 +545,7 @@ pub fn service_row(
     if hovered {
         painter.rect_filled(rect, Rounding::ZERO, CARD_HOVER);
     } else if *on {
-        let bar = Rect::from_min_size(rect.min + vec2(0.0, 4.0), vec2(3.0, total_h - 8.0));
+        let bar = Rect::from_min_size(rect.min + vec2(0.0, 6.0), vec2(3.0, total_h - 12.0));
         painter.rect_filled(bar, Rounding::same(1.0), ACCENT);
     }
 
@@ -665,7 +700,7 @@ impl PrimaryButton {
 
 impl egui::Widget for PrimaryButton {
     fn ui(self, ui: &mut egui::Ui) -> egui::Response {
-        let desired_size = vec2(ui.available_width(), 44.0);
+        let desired_size = vec2(ui.available_width(), BTN_BOOST_HEIGHT);
         let (rect, resp) = ui.allocate_at_least(desired_size, egui::Sense::click());
         let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
 
@@ -949,4 +984,276 @@ pub fn status_badge(ui: &mut egui::Ui, busy: bool) {
         rect.center().y - galley.size().y / 2.0,
     );
     painter.galley(text_pos, galley, color);
+}
+
+// ==========================================
+// TITLE BAR TUỲ BIẾN VÀ ĐIỀU KHIỂN CỬA SỔ
+// ==========================================
+/// Vẽ title bar tuỳ biến cao 40px phủ hết chiều rộng cửa sổ:
+/// - Bên trái: icon tia sét amber, "DELTA FORCE" amber + "RAM PURGE" trắng, tag nhỏ
+/// - Badge SYSTEM READY / PURGING di chuyển lên title bar
+/// - Bên phải: 3 nút thu nhỏ / phóng to-khôi phục / đóng (vẽ bằng painter)
+/// - Kéo cửa sổ (StartDrag) khi giữ vùng trống; double-click để phóng to/khôi phục
+/// - Viền dưới mảnh + vạch accent amber phong cách Tactical HUD
+pub fn render_title_bar(ctx: &egui::Context, busy: bool) {
+    let is_maximized = ctx.input(|i| i.viewport().maximized).unwrap_or(false);
+
+    egui::TopBottomPanel::top("custom_title_bar")
+        .exact_height(TITLE_BAR_HEIGHT)
+        .frame(
+            egui::Frame::none()
+                .fill(CARD_BG)
+                .inner_margin(Margin::ZERO),
+        )
+        .show(ctx, |ui| {
+            let panel_rect = ui.max_rect();
+            let btn_w = 46.0_f32;
+            let btn_h = TITLE_BAR_HEIGHT;
+
+            // 1. Vùng kéo cửa sổ (StartDrag và Double-Click Maximize)
+            let drag_rect = Rect::from_min_max(
+                panel_rect.left_top(),
+                pos2(panel_rect.right() - btn_w * 3.0, panel_rect.bottom()),
+            );
+
+            let drag_resp = ui.interact(
+                drag_rect,
+                ui.id().with("title_bar_drag_area"),
+                egui::Sense::click_and_drag(),
+            );
+
+            if drag_resp.drag_started_by(egui::PointerButton::Primary) {
+                ctx.send_viewport_cmd(ViewportCommand::StartDrag);
+            }
+            if drag_resp.double_clicked() {
+                ctx.send_viewport_cmd(ViewportCommand::Maximized(!is_maximized));
+            }
+
+            // 2. Tương tác 3 nút điều khiển bên phải (Close, Maximize/Restore, Minimize)
+            let close_rect = Rect::from_min_size(
+                pos2(panel_rect.right() - btn_w, panel_rect.top()),
+                vec2(btn_w, btn_h),
+            );
+            let max_rect = Rect::from_min_size(
+                pos2(panel_rect.right() - btn_w * 2.0, panel_rect.top()),
+                vec2(btn_w, btn_h),
+            );
+            let min_rect = Rect::from_min_size(
+                pos2(panel_rect.right() - btn_w * 3.0, panel_rect.top()),
+                vec2(btn_w, btn_h),
+            );
+
+            let close_resp = ui
+                .interact(close_rect, ui.id().with("tb_close"), egui::Sense::click())
+                .on_hover_cursor(CursorIcon::PointingHand);
+            let max_resp = ui
+                .interact(max_rect, ui.id().with("tb_max"), egui::Sense::click())
+                .on_hover_cursor(CursorIcon::PointingHand);
+            let min_resp = ui
+                .interact(min_rect, ui.id().with("tb_min"), egui::Sense::click())
+                .on_hover_cursor(CursorIcon::PointingHand);
+
+            if close_resp.clicked() {
+                ctx.send_viewport_cmd(ViewportCommand::Close);
+            }
+            if max_resp.clicked() {
+                ctx.send_viewport_cmd(ViewportCommand::Maximized(!is_maximized));
+            }
+            if min_resp.clicked() {
+                ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
+            }
+
+            // 3. Nội dung bên trái title bar
+            let left_rect = Rect::from_min_max(
+                panel_rect.left_top(),
+                pos2(panel_rect.right() - btn_w * 3.0, panel_rect.bottom()),
+            );
+            let mut left_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(left_rect)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            );
+            left_ui.add_space(14.0);
+
+            // Icon app: tia sét amber
+            left_ui.label(
+                egui::RichText::new("⚡")
+                    .size(16.0)
+                    .color(ACCENT),
+            );
+            left_ui.add_space(6.0);
+
+            // Tên app
+            left_ui.label(
+                egui::RichText::new("DELTA FORCE")
+                    .size(13.0)
+                    .strong()
+                    .extra_letter_spacing(1.0)
+                    .color(ACCENT),
+            );
+            left_ui.add_space(3.0);
+            left_ui.label(
+                egui::RichText::new("RAM PURGE")
+                    .size(13.0)
+                    .strong()
+                    .extra_letter_spacing(1.0)
+                    .color(TEXT_MAIN),
+            );
+            left_ui.add_space(8.0);
+
+            // Tag nhỏ
+            left_ui.label(
+                egui::RichText::new("TACTICAL MEMORY BOOSTER")
+                    .monospace()
+                    .size(9.5)
+                    .color(TEXT_DIM),
+            );
+
+            left_ui.add_space(14.0);
+
+            // Badge trạng thái di chuyển từ header cũ lên đây
+            status_badge(&mut left_ui, busy);
+
+            // 4. Painter vẽ các nút và đường viền
+            let painter = ui.painter();
+
+            // Nút Đóng (hover đỏ #E81123, icon trắng; thường: icon TEXT_MUTED)
+            let close_hover = close_resp.hovered();
+            if close_hover {
+                painter.rect_filled(close_rect, Rounding::ZERO, Color32::from_rgb(232, 17, 35));
+            }
+            let close_color = if close_hover { Color32::WHITE } else { TEXT_MUTED };
+            let cc = close_rect.center();
+            let cd = 4.5_f32;
+            let c_stroke = Stroke::new(1.1_f32, close_color);
+            painter.line_segment([pos2(cc.x - cd, cc.y - cd), pos2(cc.x + cd, cc.y + cd)], c_stroke);
+            painter.line_segment([pos2(cc.x + cd, cc.y - cd), pos2(cc.x - cd, cc.y + cd)], c_stroke);
+
+            // Nút Phóng to / Khôi phục
+            let max_hover = max_resp.hovered();
+            if max_hover {
+                painter.rect_filled(max_rect, Rounding::ZERO, CARD_HOVER);
+            }
+            let max_color = if max_hover { TEXT_MAIN } else { TEXT_MUTED };
+            let mc = max_rect.center();
+            let m_stroke = Stroke::new(1.0_f32, max_color);
+            if is_maximized {
+                // Restore icon: 2 ô vuông lồng nhau
+                let back = Rect::from_min_size(pos2(mc.x - 2.0, mc.y - 5.0), vec2(7.5, 7.5));
+                painter.rect_stroke(back, Rounding::ZERO, m_stroke);
+                let front = Rect::from_min_size(pos2(mc.x - 5.0, mc.y - 2.0), vec2(7.5, 7.5));
+                painter.rect_filled(
+                    front,
+                    Rounding::ZERO,
+                    if max_hover { CARD_HOVER } else { CARD_BG },
+                );
+                painter.rect_stroke(front, Rounding::ZERO, m_stroke);
+            } else {
+                // Maximize icon: 1 ô vuông 9.5x9.5
+                let sq = Rect::from_center_size(mc, vec2(9.5, 9.5));
+                painter.rect_stroke(sq, Rounding::ZERO, m_stroke);
+            }
+
+            // Nút Thu nhỏ: gạch ngang
+            let min_hover = min_resp.hovered();
+            if min_hover {
+                painter.rect_filled(min_rect, Rounding::ZERO, CARD_HOVER);
+            }
+            let min_color = if min_hover { TEXT_MAIN } else { TEXT_MUTED };
+            let mnc = min_rect.center();
+            painter.line_segment(
+                [pos2(mnc.x - 5.0, mnc.y + 4.0), pos2(mnc.x + 5.0, mnc.y + 4.0)],
+                Stroke::new(1.1_f32, min_color),
+            );
+
+            // 5. Viền phân cách dưới title bar + vạch accent amber phong cách HUD
+            let y_bot = panel_rect.bottom() - 1.0;
+            painter.line_segment(
+                [pos2(panel_rect.left(), y_bot), pos2(panel_rect.right(), y_bot)],
+                Stroke::new(1.0_f32, BORDER),
+            );
+            painter.line_segment(
+                [pos2(panel_rect.left(), y_bot), pos2(panel_rect.left() + 90.0, y_bot)],
+                Stroke::new(2.0_f32, ACCENT),
+            );
+        });
+}
+
+// ==========================================
+// VIỀN CỬA SỔ & RESIZE BẰNG TỰ BẮT CHUỘT
+// ==========================================
+/// Khi không có viền Windows (decorations = false):
+/// - Vẽ viền 1px màu BORDER quanh toàn bộ cửa sổ (khi không maximized) để không lẫn vào desktop
+/// - Vùng bắt chuột ~6px quanh mép và 4 góc: đổi con trỏ resize và gửi BeginResize(direction) khi nhấn
+pub fn handle_window_resize_and_border(ctx: &egui::Context) {
+    let is_maximized = ctx.input(|i| i.viewport().maximized).unwrap_or(false);
+    if is_maximized {
+        return;
+    }
+
+    let screen_rect = ctx.screen_rect();
+    if !screen_rect.is_positive() {
+        return;
+    }
+
+    // 1. Viền 1px màu BORDER quanh cửa sổ
+    let border_painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("window_outer_border"),
+    ));
+    border_painter.rect_stroke(
+        screen_rect.shrink(0.5),
+        Rounding::ZERO,
+        Stroke::new(1.0_f32, BORDER),
+    );
+
+    // 2. Vùng bắt chuột resize ~6px mép và 12px ở góc
+    let edge = 6.0_f32;
+    let corner = 12.0_f32;
+
+    if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
+        if screen_rect.contains(pos) {
+            let dist_left = pos.x - screen_rect.left();
+            let dist_right = screen_rect.right() - pos.x;
+            let dist_top = pos.y - screen_rect.top();
+            let dist_bottom = screen_rect.bottom() - pos.y;
+
+            let on_edge_top = dist_top <= edge;
+            let on_edge_bottom = dist_bottom <= edge;
+            let on_edge_left = dist_left <= edge;
+            let on_edge_right = dist_right <= edge;
+
+            let near_corner_top = dist_top <= corner;
+            let near_corner_bottom = dist_bottom <= corner;
+            let near_corner_left = dist_left <= corner;
+            let near_corner_right = dist_right <= corner;
+
+            let resize_action = if near_corner_top && near_corner_left && (on_edge_top || on_edge_left) {
+                Some((CursorIcon::ResizeNwSe, ResizeDirection::NorthWest))
+            } else if near_corner_top && near_corner_right && (on_edge_top || on_edge_right) {
+                Some((CursorIcon::ResizeNeSw, ResizeDirection::NorthEast))
+            } else if near_corner_bottom && near_corner_left && (on_edge_bottom || on_edge_left) {
+                Some((CursorIcon::ResizeNeSw, ResizeDirection::SouthWest))
+            } else if near_corner_bottom && near_corner_right && (on_edge_bottom || on_edge_right) {
+                Some((CursorIcon::ResizeNwSe, ResizeDirection::SouthEast))
+            } else if on_edge_top {
+                Some((CursorIcon::ResizeVertical, ResizeDirection::North))
+            } else if on_edge_bottom {
+                Some((CursorIcon::ResizeVertical, ResizeDirection::South))
+            } else if on_edge_left {
+                Some((CursorIcon::ResizeHorizontal, ResizeDirection::West))
+            } else if on_edge_right {
+                Some((CursorIcon::ResizeHorizontal, ResizeDirection::East))
+            } else {
+                None
+            };
+
+            if let Some((cursor, dir)) = resize_action {
+                ctx.set_cursor_icon(cursor);
+                if ctx.input(|i| i.pointer.primary_pressed()) {
+                    ctx.send_viewport_cmd(ViewportCommand::BeginResize(dir));
+                }
+            }
+        }
+    }
 }

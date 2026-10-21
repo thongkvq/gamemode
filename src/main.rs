@@ -2001,7 +2001,7 @@ fn render_auto_card(
             "Tự động khi chơi game",
             Some("Watcher quét tên process mỗi 3 giây (không mở handle vào game / ACE)"),
         );
-        ui.add_space(8.0);
+        ui.add_space(ui::SPACE_HEADER_GAP);
 
         if ui::toggle_row(
             ui,
@@ -2219,7 +2219,7 @@ fn render_optimize_card(
             "Tối ưu khi chơi",
             None,
         );
-        ui.add_space(8.0);
+        ui.add_space(ui::SPACE_HEADER_GAP);
 
         if ui::toggle_row(
             ui,
@@ -2297,7 +2297,7 @@ fn running_app_row(
 ) -> RowAction {
     use egui::{pos2, vec2, Align2, CursorIcon, FontId, Rect, Sense};
 
-    let row_h = 44.0_f32;
+    let row_h = ui::ROW_APP_HEIGHT;
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click());
     let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
     let mut action = if resp.clicked() {
@@ -2319,7 +2319,7 @@ fn running_app_row(
 
     // Thanh màu dọc bên trái theo trạng thái (xanh lá = giữ, đỏ = sẽ tắt)
     let bar_color = if *keep { ui::SUCCESS } else { ui::DANGER };
-    let bar = Rect::from_min_size(rect.min + vec2(0.0, 4.0), vec2(3.0, row_h - 8.0));
+    let bar = Rect::from_min_size(rect.min + vec2(0.0, 6.0), vec2(3.0, row_h - 12.0));
     painter.rect_filled(bar, Rounding::same(1.0), bar_color);
 
     let switch_rect = Rect::from_center_size(
@@ -2336,8 +2336,8 @@ fn running_app_row(
     };
 
     let x0 = rect.left() + 40.0;
-    let y_top = rect.top() + 13.0;
-    let y_sub = rect.top() + 31.0;
+    let y_top = rect.top() + 16.0;
+    let y_sub = rect.top() + 38.0;
 
     // Cột bên phải cố định rộng 76px (từ rect.right() - 76.0 đến rect.right() - 8.0)
     // Chừa khoảng đệm 8px: text chỉ được chiếm đến rect.right() - 84.0
@@ -2453,9 +2453,9 @@ fn running_app_row(
     resp.on_hover_text(hover_text);
 
     // Cột bên phải: Nút nhỏ "Là game" (hoặc nhãn ✔ nếu exe đã nằm trong danh sách game).
-    let btn_rect = Rect::from_min_max(
-        pos2(rect.right() - 76.0, rect.top() + 23.0),
-        pos2(rect.right() - 8.0, rect.top() + 39.0),
+    let btn_rect = Rect::from_center_size(
+        pos2(rect.right() - 42.0, y_sub),
+        vec2(68.0, 20.0),
     );
     if is_game {
         painter.text(
@@ -2537,56 +2537,21 @@ impl eframe::App for App {
         };
         let svc_sel = sh.svc.lock().unwrap().iter().filter(|&&x| x).count();
 
+        // 0. Title bar tuỳ biến ở trên cùng (phủ hết chiều rộng 2 cột)
+        ui::render_title_bar(ctx, busy);
+
         // =========================================================
-        // CỘT TRÁI: SidePanel (rộng 400, khoảng 360-460, resizable)
+        // CỘT TRÁI: SidePanel (rộng 420, khoảng 380-480, resizable)
         // =========================================================
         egui::SidePanel::left("left_side_panel")
-            .default_width(400.0)
-            .width_range(360.0..=460.0)
+            .default_width(420.0)
+            .width_range(380.0..=480.0)
             .resizable(true)
-            .frame(egui::Frame::none().fill(ui::BG).inner_margin(Margin::same(14.0)))
+            .frame(egui::Frame::none().fill(ui::BG).inner_margin(Margin::same(ui::SPACE_PANEL_PAD)))
             .show(ctx, |ui| {
                 ui::paint_background_grid(ui);
 
-                // 1. Header (tên tool + badge trạng thái READY/PURGING)
-                ui::card(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("⚡").size(20.0).color(ui::ACCENT));
-                        ui.vertical(|ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new("DELTA FORCE")
-                                        .size(15.0)
-                                        .strong()
-                                        .extra_letter_spacing(1.0)
-                                        .color(ui::ACCENT),
-                                );
-                                ui.label(
-                                    RichText::new("RAM PURGE")
-                                        .size(15.0)
-                                        .strong()
-                                        .extra_letter_spacing(1.0)
-                                        .color(ui::TEXT_MAIN),
-                                );
-                            });
-                            ui.label(
-                                RichText::new("TACTICAL MEMORY BOOSTER // PRO")
-                                    .size(9.0)
-                                    .strong()
-                                    .extra_letter_spacing(0.5)
-                                    .color(ui::TEXT_MUTED),
-                            );
-                        });
-
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui::status_badge(ui, busy);
-                        });
-                    });
-                });
-
-                ui.add_space(10.0);
-
-                // 2. Hai thẻ RAM vật lý và Pagefile nằm cạnh nhau
+                // 1. Hai thẻ RAM vật lý và Pagefile nằm cạnh nhau
                 let m = self.mem;
                 let ram_used = m.total - m.avail;
                 let ram_ratio = if m.total > 0 { ram_used as f32 / m.total as f32 } else { 0.0 };
@@ -2634,9 +2599,9 @@ impl eframe::App for App {
                     );
                 });
 
-                ui.add_space(10.0);
+                ui.add_space(ui::SPACE_CARD_GAP);
 
-                // 3. Nút chính BẬT GAME BOOST rộng hết cột + hàng Khôi phục / Xoá nhật ký
+                // 2. Nút chính BẬT GAME BOOST rộng hết cột + hàng Khôi phục / Xoá nhật ký
                 let boost_btn_text = if busy {
                     "ĐANG THANH LỌC…"
                 } else {
@@ -2644,27 +2609,27 @@ impl eframe::App for App {
                 };
 
                 let boost_btn = ui::primary_button(boost_btn_text, busy);
-                if ui.add_sized([ui.available_width(), 44.0], boost_btn).clicked() && !busy {
+                if ui.add_sized([ui.available_width(), ui::BTN_BOOST_HEIGHT], boost_btn).clicked() && !busy {
                     optimize(sh.clone(), false);
                 }
 
-                ui.add_space(6.0);
+                ui.add_space(8.0);
 
                 ui.columns(2, |cols| {
                     let restore_btn = ui::ghost_button("↩  Khôi phục");
-                    if cols[0].add_sized([cols[0].available_width(), 32.0], restore_btn).clicked() && !busy {
+                    if cols[0].add_sized([cols[0].available_width(), ui::BTN_SUB_HEIGHT], restore_btn).clicked() && !busy {
                         restore(sh.clone());
                     }
 
                     let clear_btn = ui::ghost_button("Xoá nhật ký");
-                    if cols[1].add_sized([cols[1].available_width(), 32.0], clear_btn).clicked() {
+                    if cols[1].add_sized([cols[1].available_width(), ui::BTN_SUB_HEIGHT], clear_btn).clicked() {
                         sh.log.lock().unwrap().clear();
                     }
                 });
 
-                ui.add_space(10.0);
+                ui.add_space(ui::SPACE_CARD_GAP);
 
-                // 4. Card session: trạng thái session đã lưu, danh sách app gói trong CollapsingHeader, mặc định đóng
+                // 3. Card session: trạng thái session đã lưu, danh sách app gói trong CollapsingHeader, mặc định đóng
                 ui::card(ui, |ui| {
                     match session_view.as_ref() {
                         Some(s) => {
@@ -2733,12 +2698,12 @@ impl eframe::App for App {
                     }
                 });
 
-                ui.add_space(10.0);
+                ui.add_space(ui::SPACE_CARD_GAP);
 
-                // 5. Terminal log chiếm toàn bộ chiều cao còn lại của cột, scroll riêng, auto-scroll xuống cuối
+                // 4. Terminal log chiếm toàn bộ chiều cao còn lại của cột, scroll riêng, auto-scroll xuống cuối
                 ui::card(ui, |ui| {
                     ui::section_header(ui, "AUTO-SCROLL", "Terminal Log", None);
-                    ui.add_space(6.0);
+                    ui.add_space(ui::SPACE_HEADER_GAP);
 
                     let log_height = ui.available_height().max(80.0);
                     let log_frame = egui::Frame::none()
@@ -2790,6 +2755,7 @@ impl eframe::App for App {
                                             .size(10.5)
                                             .color(text_color),
                                     );
+                                    ui.add_space(ui::SPACE_LOG_LINE_GAP);
                                 }
                             });
                     });
@@ -2800,7 +2766,7 @@ impl eframe::App for App {
         // CỘT PHẢI: CentralPanel (Tabs trên cùng, ScrollArea riêng)
         // =========================================================
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(ui::BG).inner_margin(Margin::same(14.0)))
+            .frame(egui::Frame::none().fill(ui::BG).inner_margin(Margin::same(ui::SPACE_PANEL_PAD)))
             .show(ctx, |ui| {
                 ui::paint_background_grid(ui);
 
@@ -2837,13 +2803,14 @@ impl eframe::App for App {
                     }
                 });
 
-                ui.add_space(10.0);
+                ui.add_space(ui::SPACE_CARD_GAP);
 
                 // Nội dung tab bên dưới chiếm hết chiều cao, mỗi tab một ScrollArea riêng
                 match self.tab {
                     ConfigTab::Apps => {
                         // Thanh công cụ: đếm số app + các nút, dùng horizontal_wrapped không bao giờ chồng chữ
                         ui::card(ui, |ui| {
+                            ui.spacing_mut().item_spacing.x = ui::SPACE_TOOLBAR_GAP;
                             ui.horizontal_wrapped(|ui| {
                                 let (status, color) = match self.saved_at {
                                     Some((t, true)) if t.elapsed() < Duration::from_millis(2500) => {
@@ -2855,7 +2822,7 @@ impl eframe::App for App {
                                     _ => ("💾 Tự động ghi nhớ", ui::TEXT_MUTED),
                                 };
                                 ui.label(RichText::new(status).size(11.0).color(color));
-                                ui.add_space(8.0);
+                                ui.add_space(ui::SPACE_TOOLBAR_GAP);
 
                                 if ui.add(ui::ghost_button_sized("Mặc định", 11.0)).clicked() {
                                     let mut keep = sh.keep.lock().unwrap();
@@ -2890,7 +2857,7 @@ impl eframe::App for App {
                             });
                         });
 
-                        ui.add_space(10.0);
+                        ui.add_space(ui::SPACE_TOOLBAR_MARGIN_BOTTOM);
 
                         egui::ScrollArea::vertical()
                             .id_salt("apps_scroll_area")
@@ -2902,7 +2869,7 @@ impl eframe::App for App {
                                         ui.label(
                                             RichText::new(if scanning {
                                                 "Đang quét các app đang chạy..."
-                                            } else {
+                                             } else {
                                                 "Không thấy app nào đang chạy ngoài các process hệ thống được loại trừ."
                                             })
                                             .size(11.5)
@@ -2915,6 +2882,7 @@ impl eframe::App for App {
                                         let mut changed = false;
 
                                         if is_grid {
+                                            ui.spacing_mut().item_spacing.x = ui::SPACE_GRID_GAP;
                                             let half = (apps_snapshot.len() + 1) / 2;
                                             ui.columns(2, |cols| {
                                                 for a in &apps_snapshot[..half] {
@@ -2928,7 +2896,7 @@ impl eframe::App for App {
                                                         RowAction::MarkGame => mark_as_game(&sh, a),
                                                         RowAction::None => {}
                                                     }
-                                                    cols[0].add_space(2.0);
+                                                    cols[0].add_space(ui::SPACE_GRID_GAP);
                                                 }
                                                 for a in &apps_snapshot[half..] {
                                                     let mut k = keep_decision(&keep_view, &a.exe_lower);
@@ -2941,7 +2909,7 @@ impl eframe::App for App {
                                                         RowAction::MarkGame => mark_as_game(&sh, a),
                                                         RowAction::None => {}
                                                     }
-                                                    cols[1].add_space(2.0);
+                                                    cols[1].add_space(ui::SPACE_GRID_GAP);
                                                 }
                                             });
                                         } else {
@@ -2956,7 +2924,7 @@ impl eframe::App for App {
                                                     RowAction::MarkGame => mark_as_game(&sh, a),
                                                     RowAction::None => {}
                                                 }
-                                                ui.add_space(2.0);
+                                                ui.add_space(ui::SPACE_GRID_GAP);
                                             }
                                         }
 
@@ -2970,13 +2938,14 @@ impl eframe::App for App {
                     ConfigTab::Services => {
                         // Thanh công cụ dịch vụ
                         ui::card(ui, |ui| {
+                            ui.spacing_mut().item_spacing.x = ui::SPACE_TOOLBAR_GAP;
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(
                                     RichText::new(format!("Đã chọn tắt: {}/{} service", svc_sel, SERVICE_TARGETS.len()))
                                         .size(11.5)
                                         .color(ui::TEXT_MUTED),
                                 );
-                                ui.add_space(8.0);
+                                ui.add_space(ui::SPACE_TOOLBAR_GAP);
 
                                 if ui.add(ui::ghost_button_sized("Mặc định", 11.0)).clicked() {
                                     let mut svc = sh.svc.lock().unwrap();
@@ -2992,7 +2961,7 @@ impl eframe::App for App {
                                     }
                                     self.save();
                                 }
-                                ui.add_space(8.0);
+                                ui.add_space(ui::SPACE_TOOLBAR_GAP);
 
                                 if self.is_admin {
                                     ui.label(RichText::new("✔ QUYỀN ADMIN").size(10.5).strong().color(ui::SUCCESS));
@@ -3010,7 +2979,7 @@ impl eframe::App for App {
                             });
                         });
 
-                        ui.add_space(10.0);
+                        ui.add_space(ui::SPACE_TOOLBAR_MARGIN_BOTTOM);
 
                         egui::ScrollArea::vertical()
                             .id_salt("services_scroll_area")
@@ -3022,6 +2991,7 @@ impl eframe::App for App {
                                     let mut svc = sh.svc.lock().unwrap();
 
                                     if is_grid {
+                                        ui.spacing_mut().item_spacing.x = ui::SPACE_GRID_GAP;
                                         let half = (SERVICE_TARGETS.len() + 1) / 2;
                                         ui.columns(2, |cols| {
                                             for (i, (svc_name, display_name, desc, _)) in SERVICE_TARGETS[..half].iter().enumerate() {
@@ -3029,7 +2999,7 @@ impl eframe::App for App {
                                                 if ui::service_row(&mut cols[0], &mut svc[i], svc_name, display_name, desc, is_running) {
                                                     changed = true;
                                                 }
-                                                cols[0].add_space(4.0);
+                                                cols[0].add_space(ui::SPACE_GRID_GAP);
                                             }
                                             for (j, (svc_name, display_name, desc, _)) in SERVICE_TARGETS[half..].iter().enumerate() {
                                                 let i = half + j;
@@ -3037,7 +3007,7 @@ impl eframe::App for App {
                                                 if ui::service_row(&mut cols[1], &mut svc[i], svc_name, display_name, desc, is_running) {
                                                     changed = true;
                                                 }
-                                                cols[1].add_space(4.0);
+                                                cols[1].add_space(ui::SPACE_GRID_GAP);
                                             }
                                         });
                                     } else {
@@ -3046,7 +3016,7 @@ impl eframe::App for App {
                                             if ui::service_row(ui, &mut svc[i], svc_name, display_name, desc, is_running) {
                                                 changed = true;
                                             }
-                                            ui.add_space(4.0);
+                                            ui.add_space(ui::SPACE_GRID_GAP);
                                         }
                                     }
 
@@ -3064,6 +3034,7 @@ impl eframe::App for App {
                             .show(ui, |ui| {
                                 let mut save_needed = false;
                                 if is_wide {
+                                    ui.spacing_mut().item_spacing.x = ui::SPACE_GRID_GAP;
                                     ui.columns(2, |cols| {
                                         render_auto_card(
                                             &mut cols[0],
@@ -3092,7 +3063,7 @@ impl eframe::App for App {
                                         &mut self.game_input,
                                         &mut save_needed,
                                     );
-                                    ui.add_space(10.0);
+                                    ui.add_space(ui::SPACE_CARD_GAP);
                                     render_optimize_card(
                                         ui,
                                         &mut opts_view,
@@ -3108,6 +3079,8 @@ impl eframe::App for App {
                     }
                 }
             });
+
+        ui::handle_window_resize_and_border(ctx);
     }
 }
 
@@ -3299,9 +3272,10 @@ delete={:?}
     }
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("DELTA FORCE - TACTICAL RAM PURGE")
-        .with_inner_size([1120.0, 760.0])
-        .with_min_inner_size([900.0, 600.0])
-        .with_resizable(true);
+        .with_inner_size([1240.0, 820.0])
+        .with_min_inner_size([980.0, 640.0])
+        .with_resizable(true)
+        .with_decorations(false);
 
     if let Some(icon) = load_app_icon() {
         viewport = viewport.with_icon(icon);
