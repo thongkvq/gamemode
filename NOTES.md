@@ -69,6 +69,6 @@ App đòi quyền admin nên shell thường không chụp được cửa sổ. 
 ## Bộ cài (Inno Setup)
 - Cài Inno Setup 6: `winget install JRSoftware.InnoSetup --scope user`.
 - Build: `cargo build --release`, rồi `"%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" installer\gamemode.iss`, ra file `dist\GameMode-Setup-<version>.exe` (thư mục `dist/` không đưa lên git).
-- Version phải sửa ở 2 chỗ: `Cargo.toml` và `#define AppVersion` trong `installer/gamemode.iss`.
+- Version (hiện 1.2.0) phải sửa ở 2 chỗ: `Cargo.toml` và `#define AppVersion` trong `installer/gamemode.iss`.
 - Bộ cài cài theo từng user vào `%LOCALAPPDATA%\Programs\GameMode`, không cần admin khi cài. Gỡ cài đặt sẽ xoá config/session và task "chạy cùng Windows".
 - Exe chưa ký số nên lần đầu chạy sẽ bị SmartScreen cảnh báo.

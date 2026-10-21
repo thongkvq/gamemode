@@ -4,7 +4,7 @@
 ; Kết quả: dist\GameMode-Setup-<version>.exe
 
 #define AppName "GameMode"
-#define AppVersion "1.1.0"
+#define AppVersion "1.2.0"
 #define AppPublisher "thongkvq"
 #define AppExe "GameMode.exe"
 
@@ -33,6 +33,9 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0
 CloseApplications=force
+; Mutex mà GameMode tạo khi chạy (chống mở 2 bản): bộ cài/gỡ cài nhận ra app đang chạy dưới khay
+; và nhắc người dùng thoát (app chạy admin nên bộ cài không tự đóng được).
+AppMutex=Local\GameModeTacticalRamPurge
 VersionInfoVersion={#AppVersion}
 VersionInfoDescription={#AppName} Setup
 
