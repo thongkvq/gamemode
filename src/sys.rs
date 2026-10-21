@@ -76,6 +76,43 @@ pub struct ProcInfo {
     pub ws: u64,
 }
 
+/// Một dòng cây process chỉ lấy từ Toolhelp32 (pid, ppid, tên exe viết thường):
+/// KHÔNG mở handle process nào, nên dùng được để tính tập PID cần bảo vệ
+/// TRƯỚC khi quét sâu.
+pub struct ProcNode {
+    pub pid: u32,
+    pub ppid: u32,
+    pub name: String,
+}
+
+/// Cây process nhẹ (Toolhelp32), không mở quyền gì trên process.
+pub fn process_nodes() -> Vec<ProcNode> {
+    let mut out = Vec::new();
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return out;
+        }
+        let mut e: PROCESSENTRY32W = zeroed();
+        e.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+        if Process32FirstW(snap, &mut e) != 0 {
+            loop {
+                let len = e.szExeFile.iter().position(|&c| c == 0).unwrap_or(e.szExeFile.len());
+                out.push(ProcNode {
+                    pid: e.th32ProcessID,
+                    ppid: e.th32ParentProcessID,
+                    name: String::from_utf16_lossy(&e.szExeFile[..len]).to_lowercase(),
+                });
+                if Process32NextW(snap, &mut e) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snap);
+    }
+    out
+}
+
 pub fn list_processes() -> Vec<Proc> {
     let mut out = Vec::new();
     unsafe {
@@ -108,8 +145,10 @@ pub fn list_processes() -> Vec<Proc> {
 /// PROCESS_QUERY_LIMITED_INFORMATION để lấy đường dẫn exe — KHÔNG yêu cầu quyền đọc bộ nhớ,
 /// không đọc command line / thư mục làm việc / working set. `skip` là tên exe viết thường
 /// (khớp đúng hoặc khớp tiền tố, ví dụ "ace-").
-pub fn snapshot_skip(skip: &[String]) -> Vec<ProcInfo> {
-    snapshot_inner(skip)
+/// `protect` = PID thuộc "họ" process của game (launcher / tổ tiên / con cháu): dù tên exe
+/// không nằm trong `skip` thì cũng chỉ được mở bằng PROCESS_QUERY_LIMITED_INFORMATION.
+pub fn snapshot_skip(skip: &[String], protect: &HashSet<u32>) -> Vec<ProcInfo> {
+    snapshot_inner(skip, protect)
 }
 
 fn is_skipped(name_lower: &str, skip: &[String]) -> bool {
@@ -119,7 +158,7 @@ fn is_skipped(name_lower: &str, skip: &[String]) -> bool {
             .any(|s| name_lower == s.as_str() || name_lower.starts_with(s.as_str()))
 }
 
-fn snapshot_inner(skip: &[String]) -> Vec<ProcInfo> {
+fn snapshot_inner(skip: &[String], protect: &HashSet<u32>) -> Vec<ProcInfo> {
     let mut out: Vec<ProcInfo> = Vec::new();
     let mut desc_cache: HashMap<String, Option<String>> = HashMap::new();
     unsafe {
@@ -147,8 +186,9 @@ fn snapshot_inner(skip: &[String]) -> Vec<ProcInfo> {
                 };
 
                 if pid > 4 {
-                    if is_skipped(&info.name.to_lowercase(), skip) {
-                        // Game / anti-cheat: chỉ đọc đường dẫn exe, không đụng tới bộ nhớ.
+                    if protect.contains(&pid) || is_skipped(&info.name.to_lowercase(), skip) {
+                        // Game / anti-cheat / họ process game: chỉ đọc đường dẫn exe,
+                        // không đụng tới bộ nhớ.
                         if let Some(h) = open_limited(pid) {
                             info.exe_path = exe_path_of(h);
                             CloseHandle(h);

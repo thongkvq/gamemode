@@ -204,6 +204,122 @@ fn is_ace_or_game(name_lower: &str, skip: &[String]) -> bool {
         .any(|s| name_lower == s.as_str() || name_lower.starts_with(s.as_str()))
 }
 
+/// Launcher đã biết của game. Khi game KHÔNG chạy, chính launcher (và con cháu của nó) cũng
+/// thuộc "họ" process game nên không được tắt.
+const GAME_LAUNCHERS: &[&str] = &["df_garena_launcher.exe"];
+
+/// Process DỪNG khi đi ngược ppid từ process game: shell của người dùng và các process
+/// Windows luôn chạy. Bản thân những process này KHÔNG được bảo vệ.
+const FAMILY_STOP_EXE: &[&str] = &["explorer.exe", "svchost.exe", "services.exe", "wininit.exe"];
+
+/// Vì sao một PID thuộc "họ" process của game (thứ tự này cũng là thứ tự liệt kê).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum FamilyReason {
+    Game,
+    Ancestor,
+    Descendant,
+    Launcher,
+}
+
+impl FamilyReason {
+    fn label(self) -> &'static str {
+        match self {
+            FamilyReason::Game => "game",
+            FamilyReason::Ancestor => "tổ tiên",
+            FamilyReason::Descendant => "con cháu",
+            FamilyReason::Launcher => "launcher",
+        }
+    }
+}
+
+/// Tập PID được bảo vệ của "họ" process game: mọi process có tên exe trong danh sách game,
+/// tổ tiên của chúng, rồi TOÀN BỘ con cháu của những PID đã bảo vệ. Khi game không chạy:
+/// process có exe trong `GAME_LAUNCHERS` cùng con cháu của nó.
+fn game_family(snapshot: &[sys::ProcInfo], games: &[String]) -> HashSet<u32> {
+    game_family_reasons(snapshot, games).into_keys().collect()
+}
+
+/// Như `game_family` nhưng kèm lý do bảo vệ của từng PID (dùng cho log và --selftest).
+fn game_family_reasons(snapshot: &[sys::ProcInfo], games: &[String]) -> HashMap<u32, FamilyReason> {
+    let nodes: Vec<sys::ProcNode> = snapshot
+        .iter()
+        .map(|p| sys::ProcNode {
+            pid: p.pid,
+            ppid: p.ppid,
+            name: p.name.to_lowercase(),
+        })
+        .collect();
+    game_family_from_nodes(&nodes, games)
+}
+
+/// Lõi tính "họ" process game trên cây process nhẹ (Toolhelp32) — xem `game_family`.
+fn game_family_from_nodes(nodes: &[sys::ProcNode], games: &[String]) -> HashMap<u32, FamilyReason> {
+    let by_pid: HashMap<u32, &sys::ProcNode> = nodes.iter().map(|n| (n.pid, n)).collect();
+    let game_names: HashSet<String> = games.iter().map(|g| g.to_lowercase()).collect();
+    let launcher_names: HashSet<&str> = GAME_LAUNCHERS.iter().copied().collect();
+
+    let mut fam: HashMap<u32, FamilyReason> = HashMap::new();
+
+    // 1. Chính process game (khớp đúng tên exe trong danh sách game).
+    for n in nodes.iter() {
+        if game_names.contains(&n.name) {
+            fam.entry(n.pid).or_insert(FamilyReason::Game);
+        }
+    }
+
+    // 2. Tổ tiên của process game: đi ngược ppid tới khi gặp process dừng, pid <= 4, hoặc
+    //    process đã chết / không còn trong snapshot. Chính process dừng không được bảo vệ.
+    if !fam.is_empty() {
+        let mut seen: HashSet<u32> = fam.keys().copied().collect();
+        let mut queue: Vec<u32> = seen.iter().copied().collect();
+        while let Some(pid) = queue.pop() {
+            let Some(node) = by_pid.get(&pid) else { continue };
+            let ppid = node.ppid;
+            // `seen.insert` cũng chặn vòng lặp khi PID bị tái sử dụng (A là cha của B và ngược lại).
+            if ppid <= 4 || ppid == pid || !seen.insert(ppid) {
+                continue;
+            }
+            let Some(parent) = by_pid.get(&ppid) else { continue };
+            if FAMILY_STOP_EXE.contains(&parent.name.as_str()) {
+                continue;
+            }
+            fam.entry(ppid).or_insert(FamilyReason::Ancestor);
+            queue.push(ppid);
+        }
+    }
+
+    // 3. Game không chạy: launcher đã biết cũng thuộc họ game.
+    if fam.is_empty() {
+        for n in nodes.iter() {
+            if launcher_names.contains(n.name.as_str()) {
+                fam.entry(n.pid).or_insert(FamilyReason::Launcher);
+            }
+        }
+    }
+
+    // 4. Toàn bộ con cháu của mọi PID đã bảo vệ (duyệt theo ppid). Mỗi PID chỉ được thêm một
+    //    lần nên vòng lặp do PID tái sử dụng cũng không thể chạy mãi.
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for n in nodes.iter() {
+        if n.ppid != n.pid {
+            children.entry(n.ppid).or_default().push(n.pid);
+        }
+    }
+    let mut queue: Vec<u32> = fam.keys().copied().collect();
+    while let Some(pid) = queue.pop() {
+        let Some(kids) = children.get(&pid) else { continue };
+        for &kid in kids.iter() {
+            if fam.contains_key(&kid) {
+                continue;
+            }
+            fam.insert(kid, FamilyReason::Descendant);
+            queue.push(kid);
+        }
+    }
+
+    fam
+}
+
 /// Chuỗi (viết thường) trong command line chứng tỏ process là process PHỤ do app khác mở:
 /// COM server, renderer/GPU helper của Chrome, helper do Chrome/extension mở, hay helper
 /// do launcher game mở. Loại khi lưu session và bỏ qua khi Restore.
@@ -596,12 +712,25 @@ fn fmt_ram(bytes: u64) -> String {
 
 /// Quét app đang chạy thuộc session của user hiện tại, gom theo tên exe, sắp xếp RAM giảm dần.
 /// `skip` = exe game + anti-cheat: không mở quyền đọc bộ nhớ và không hiện trong danh sách
-/// (game luôn được giữ lại nên không có gì để chọn).
-fn scan_running_apps(skip: &[String]) -> Vec<RunningApp> {
+/// (game luôn được giữ lại nên không có gì để chọn). `games` = danh sách game trong config:
+/// nhóm exe có PID thuộc "họ" process game cũng không hiện.
+fn scan_running_apps(skip: &[String], games: &[String]) -> Vec<RunningApp> {
     let me = std::process::id();
     let my_session = sys::current_session();
-    let all = sys::snapshot_skip(skip);
+    // Họ process game tính trước khi quét sâu: con cháu game (helper của launcher, CEF...)
+    // cũng chỉ được mở bằng quyền hạn chế, không đọc bộ nhớ.
+    let protect: HashSet<u32> = game_family_from_nodes(&sys::process_nodes(), games)
+        .into_keys()
+        .collect();
+    let all = sys::snapshot_skip(skip, &protect);
+    let family = game_family(&all, games);
     let parent = all.iter().find(|p| p.pid == me).map(|p| p.ppid).unwrap_or(0);
+    // Nhóm exe chỉ cần có MỘT pid thuộc họ game là ẩn cả nhóm.
+    let family_exes: HashSet<String> = all
+        .iter()
+        .filter(|p| family.contains(&p.pid))
+        .map(|p| p.name.to_lowercase())
+        .collect();
 
     let mut map: HashMap<String, RunningApp> = HashMap::new();
     for p in all.iter() {
@@ -612,8 +741,11 @@ fn scan_running_apps(skip: &[String]) -> Vec<RunningApp> {
         if exe_lower.is_empty() || is_never_kill(&exe_lower, p.exe_path.as_deref()) {
             continue;
         }
-        // Game + anti-cheat: luôn được giữ, không hiện trong danh sách để chọn.
-        if is_ace_or_game(&exe_lower, skip) {
+        // Game + anti-cheat + họ process game: luôn được giữ, không hiện trong danh sách để chọn.
+        if is_ace_or_game(&exe_lower, skip)
+            || family.contains(&p.pid)
+            || family_exes.contains(&exe_lower)
+        {
             continue;
         }
         let entry = map.entry(exe_lower.clone()).or_insert_with(|| RunningApp {
@@ -809,7 +941,12 @@ fn do_optimize(sh: &Shared) {
     let my_session = sys::current_session();
     // Exe game + anti-cheat: chỉ lấy tên/đường dẫn, không mở quyền đọc bộ nhớ.
     let skip = skip_list(&games);
-    let snap = sys::snapshot_skip(&skip);
+    // "Họ" process game (launcher / tổ tiên / con cháu) tính TRƯỚC khi quét sâu để con cháu
+    // của game cũng chỉ được mở bằng quyền hạn chế, không đọc bộ nhớ.
+    let family: HashSet<u32> = game_family_from_nodes(&sys::process_nodes(), &games)
+        .into_keys()
+        .collect();
+    let snap = sys::snapshot_skip(&skip, &family);
     let parent = snap.iter().find(|p| p.pid == me).map(|p| p.ppid).unwrap_or(0);
 
     // 0. Ghi nhớ đường dẫn exe của game đang chạy (để ép GPU rời cả khi game đã tắt).
@@ -841,8 +978,9 @@ fn do_optimize(sh: &Shared) {
         if exe.is_empty() || is_never_kill(&exe, p.exe_path.as_deref()) {
             continue;
         }
-        // Game + anti-cheat (ACE): tuyệt đối không tắt, không mở quyền đọc bộ nhớ.
-        if keep_decision(&keep, &exe) || is_ace_or_game(&exe, &skip) {
+        // Game + anti-cheat (ACE) + họ process game: tuyệt đối không tắt, không lưu session,
+        // không mở quyền đọc bộ nhớ.
+        if keep_decision(&keep, &exe) || is_ace_or_game(&exe, &skip) || family.contains(&p.pid) {
             kept_exes.insert(exe);
             continue;
         }
@@ -850,6 +988,28 @@ fn do_optimize(sh: &Shared) {
         labels
             .entry(exe)
             .or_insert_with(|| p.display_name.clone().unwrap_or_else(|| p.name.clone()));
+    }
+    // 1b. Exe được bảo vệ nhờ QUAN HỆ cha/con (tên exe không nằm trong danh sách game/ACE):
+    //     báo một dòng để biết vì sao launcher / helper của game không bị tắt.
+    {
+        let mut names: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for p in snap.iter() {
+            if !family.contains(&p.pid) {
+                continue;
+            }
+            let exe = p.name.to_lowercase();
+            if is_ace_or_game(&exe, &skip) || !seen.insert(exe) {
+                continue;
+            }
+            names.push(p.name.clone());
+        }
+        if !names.is_empty() {
+            push(
+                format!("  • [GAME] Bảo vệ process của game: {}", names.join(", ")),
+                Color32::from_rgb(0, 255, 163),
+            );
+        }
     }
     push(
         format!(
@@ -1200,13 +1360,14 @@ fn do_optimize(sh: &Shared) {
     // 9b. Nén RAM: đẩy working set của các app ĐƯỢC GIỮ LẠI ra standby list.
     //     Làm sau bước 9 để trang cũ đã bị xả trước, còn trang vừa nén nằm lại trong standby
     //     làm cache (app cần thì lấy lại ngay) -> KHÔNG xả standby lần nữa sau bước này.
-    //     Bỏ qua: chính tool, game + anti-cheat (không mở handle), process hệ thống nhạy cảm, pid <= 4.
+    //     Bỏ qua: chính tool, game + anti-cheat + họ process game (không mở handle),
+    //     process hệ thống nhạy cảm, pid <= 4.
     if opts.trim {
         let mut targets = 0usize;
         let mut total = 0u64;
         let mut hits: Vec<(u64, String)> = Vec::new();
         for p in sys::list_processes() {
-            if p.pid <= 4 || p.pid == me {
+            if p.pid <= 4 || p.pid == me || family.contains(&p.pid) {
                 continue;
             }
             let exe = p.name.to_lowercase();
@@ -1245,10 +1406,11 @@ fn do_optimize(sh: &Shared) {
             );
         }
 
-        // 9c. Còn gì đang giữ RAM: gom working set SAU khi nén theo tên exe, bỏ game + anti-cheat.
+        // 9c. Còn gì đang giữ RAM: gom working set SAU khi nén theo tên exe, bỏ game + anti-cheat
+        //     + họ process game.
         let mut left: HashMap<String, u64> = HashMap::new();
         for p in sys::list_processes() {
-            if p.pid <= 4 || p.pid == me {
+            if p.pid <= 4 || p.pid == me || family.contains(&p.pid) {
                 continue;
             }
             let exe = p.name.to_lowercase();
@@ -1301,7 +1463,7 @@ fn do_optimize(sh: &Shared) {
         Color32::from_rgb(0, 255, 163),
     );
 
-    *sh.running.lock().unwrap() = scan_running_apps(&skip);
+    *sh.running.lock().unwrap() = scan_running_apps(&skip, &games);
 }
 
 /// Thân của Restore: mở lại app, bật lại service, Wi-Fi autoconf, Game DVR.
@@ -1633,14 +1795,37 @@ impl App {
 
     fn new(cc: &eframe::CreationContext) -> Self {
         let mut fonts = egui::FontDefinitions::default();
-        if let Ok(bytes) = std::fs::read(r"C:\Windows\Fonts\segoeui.ttf") {
-            fonts.font_data.insert("segoe".into(), egui::FontData::from_owned(bytes));
-            fonts.families.entry(egui::FontFamily::Proportional).or_default().insert(0, "segoe".into());
-        }
-        if let Ok(bytes) = std::fs::read(r"C:\Windows\Fonts\consola.ttf") {
-            fonts.font_data.insert("consolas".into(), egui::FontData::from_owned(bytes));
-            fonts.families.entry(egui::FontFamily::Monospace).or_default().insert(0, "consolas".into());
-        }
+        fonts.font_data.insert(
+            "chakra_regular".into(),
+            egui::FontData::from_static(include_bytes!("../assets/fonts/ChakraPetch-Regular.ttf")),
+        );
+        fonts.font_data.insert(
+            "chakra_semibold".into(),
+            egui::FontData::from_static(include_bytes!("../assets/fonts/ChakraPetch-SemiBold.ttf")),
+        );
+        fonts.font_data.insert(
+            "chakra_bold".into(),
+            egui::FontData::from_static(include_bytes!("../assets/fonts/ChakraPetch-Bold.ttf")),
+        );
+        fonts.font_data.insert(
+            "jetbrains_mono".into(),
+            egui::FontData::from_static(include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf")),
+        );
+
+        // Chakra Petch làm font chính tỉ lệ (giữ font mặc định của egui làm fallback)
+        fonts
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default()
+            .insert(0, "chakra_regular".into());
+
+        // JetBrains Mono cho log và tên exe / monospace (giữ fallback)
+        fonts
+            .families
+            .entry(egui::FontFamily::Monospace)
+            .or_default()
+            .insert(0, "jetbrains_mono".into());
+
         cc.egui_ctx.set_fonts(fonts);
         ui::setup_visuals(&cc.egui_ctx);
 
@@ -1712,9 +1897,10 @@ impl App {
         }
         let running = self.sh.running.clone();
         let scanning = self.scanning.clone();
-        let skip = skip_list(&self.sh.games.lock().unwrap().clone());
+        let games = self.sh.games.lock().unwrap().clone();
+        let skip = skip_list(&games);
         std::thread::spawn(move || {
-            let list = scan_running_apps(&skip);
+            let list = scan_running_apps(&skip, &games);
             *running.lock().unwrap() = list;
             scanning.store(false, Ordering::SeqCst);
         });
@@ -1728,34 +1914,67 @@ fn render_stat_card(
     used_gb: f64,
     total_gb: f64,
     ratio: f32,
-    color: Color32,
+    _color: Color32,
     extra: Option<&str>,
 ) {
     ui::card(ui, |ui| {
         ui.horizontal(|ui| {
-            ui.label(RichText::new(title).size(11.0).strong().color(ui::ACCENT));
+            ui.label(
+                RichText::new(title)
+                    .size(11.0)
+                    .strong()
+                    .extra_letter_spacing(1.0)
+                    .color(ui::ACCENT),
+            );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(RichText::new(sub_text).size(10.0).color(ui::TEXT_MUTED));
+                ui.label(
+                    RichText::new(sub_text)
+                        .size(10.0)
+                        .color(if ratio > 0.80 { ui::DANGER } else { ui::TEXT_MUTED }),
+                );
             });
         });
         ui.add_space(4.0);
 
         ui.horizontal(|ui| {
-            ui.label(RichText::new(format!("{:.1} GB", used_gb)).size(17.0).strong().color(ui::TEXT_MAIN));
-            ui.label(RichText::new(format!("/ {:.1} GB", total_gb)).size(11.0).color(ui::TEXT_MUTED));
+            // Số liệu lớn dùng font đậm
+            ui.label(
+                RichText::new(format!("{:.1} GB", used_gb))
+                    .size(18.0)
+                    .strong()
+                    .color(ui::DATA_CYAN),
+            );
+            ui.label(
+                RichText::new(format!("/ {:.1} GB", total_gb))
+                    .size(11.0)
+                    .color(ui::TEXT_MUTED),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    RichText::new(format!("{:.0}%", ratio * 100.0))
+                        .size(11.5)
+                        .strong()
+                        .monospace()
+                        .color(if ratio > 0.80 {
+                            ui::DANGER
+                        } else if ratio >= 0.60 {
+                            ui::ACCENT
+                        } else {
+                            ui::DATA_CYAN
+                        }),
+                );
+            });
         });
         ui.add_space(6.0);
 
-        let progress = egui::ProgressBar::new(ratio)
-            .fill(color)
-            .show_percentage()
-            .animate(false);
-        ui.add(progress);
+        // Thanh RAM và Pagefile chia đoạn (~20 ô nhỏ, cách nhau 2px)
+        ui::segmented_bar(ui, ratio);
 
         if let Some(text) = extra {
-            ui.add_space(4.0);
+            ui.add_space(5.0);
             ui.label(
                 RichText::new(text)
+                    .monospace()
                     .size(9.5)
                     .color(ui::TEXT_MUTED),
             );
@@ -2096,11 +2315,12 @@ fn running_app_row(
     } else {
         Color32::TRANSPARENT
     };
-    painter.rect_filled(rect, Rounding::same(6.0), bg);
-    if *keep {
-        let bar = Rect::from_min_size(rect.min + vec2(0.0, 6.0), vec2(3.0, row_h - 12.0));
-        painter.rect_filled(bar, Rounding::same(1.5), ui::SUCCESS);
-    }
+    painter.rect_filled(rect, Rounding::ZERO, bg);
+
+    // Thanh màu dọc bên trái theo trạng thái (xanh lá = giữ, đỏ = sẽ tắt)
+    let bar_color = if *keep { ui::SUCCESS } else { ui::DANGER };
+    let bar = Rect::from_min_size(rect.min + vec2(0.0, 4.0), vec2(3.0, row_h - 8.0));
+    painter.rect_filled(bar, Rounding::same(1.0), bar_color);
 
     let switch_rect = Rect::from_center_size(
         pos2(rect.left() + 20.0, rect.center().y),
@@ -2144,16 +2364,18 @@ fn running_app_row(
         name_color,
     );
 
-    // Dòng 2: Tên exe nhỏ (cắt bằng "…") chung dòng với "N process — X MB"
-    let full_info_str = format!(" · {} process — {}", app.count, fmt_ram(app.total_ws));
+    // Dòng 2: Tên exe nhỏ (cắt bằng "…") + mini bar RAM + "N proc — X MB"
+    let full_info_str = format!(" · {} proc — {}", app.count, fmt_ram(app.total_ws));
     let info_needed_w = text_painter.layout_no_wrap(
         full_info_str.clone(),
         FontId::proportional(10.5),
         ui::TEXT_MUTED,
     ).size().x;
 
-    // Dành không gian ưu tiên cho thông tin process/RAM, phần còn lại cho tên exe nhỏ
-    let exe_max_w = (max_text_w - info_needed_w).max(30.0);
+    let mini_bar_w = 28.0_f32;
+    let mini_bar_spacing = 6.0_f32;
+
+    let exe_max_w = (max_text_w - info_needed_w - mini_bar_w - mini_bar_spacing).max(24.0);
     let mut exe_job = egui::text::LayoutJob::simple(
         app.exe_name.clone(),
         FontId::monospace(10.0),
@@ -2171,7 +2393,21 @@ fn running_app_row(
         ui::TEXT_DIM,
     );
 
-    let info_rem_w = (max_text_w - exe_w).max(10.0);
+    // Mini bar RAM
+    let mb_x = x0 + exe_w + 4.0;
+    let mb_rect = Rect::from_min_size(pos2(mb_x, y_sub - 2.0), vec2(mini_bar_w, 4.0));
+    let ram_ratio = (app.total_ws as f32 / (1024.0 * 1024.0 * 1024.0)).clamp(0.08, 1.0);
+    text_painter.rect_filled(mb_rect, Rounding::ZERO, Color32::from_rgb(20, 27, 36));
+    let filled_w = (mini_bar_w * ram_ratio).max(2.0);
+    let mb_fill_color = if *keep { ui::DATA_CYAN } else { ui::DANGER };
+    text_painter.rect_filled(
+        Rect::from_min_size(mb_rect.min, vec2(filled_w, 4.0)),
+        Rounding::ZERO,
+        mb_fill_color,
+    );
+
+    let info_x = mb_x + mini_bar_w + 4.0;
+    let info_rem_w = (text_right - info_x).max(10.0);
     let mut info_job = egui::text::LayoutJob::simple(
         full_info_str,
         FontId::proportional(10.5),
@@ -2182,16 +2418,16 @@ fn running_app_row(
     info_job.wrap.break_anywhere = true;
     let info_galley = text_painter.layout_job(info_job);
     text_painter.galley(
-        pos2(x0 + exe_w, y_sub - info_galley.size().y / 2.0),
+        pos2(info_x, y_sub - info_galley.size().y / 2.0),
         info_galley,
         ui::TEXT_MUTED,
     );
 
-    // Cột bên phải: nhãn GIỮ LẠI / SẼ TẮT
+    // Cột bên phải: nhãn GIỮ LẠI (xanh lá) / SẼ TẮT (đỏ)
     let (badge, badge_color) = if *keep {
         ("GIỮ LẠI", ui::SUCCESS)
     } else {
-        ("SẼ TẮT", ui::WARNING)
+        ("SẼ TẮT", ui::DANGER)
     };
     painter.text(
         pos2(rect.right() - 8.0, y_top),
@@ -2237,7 +2473,7 @@ fn running_app_row(
         )
         .fill(ui::CARD_BG)
         .stroke(Stroke::new(1.0_f32, ui::BORDER))
-        .rounding(Rounding::same(4.0));
+        .rounding(Rounding::ZERO);
         if ui.put(btn_rect, btn).on_hover_text("Thêm exe này vào danh sách game để tự tối ưu khi mở game").clicked() {
             action = RowAction::MarkGame;
         }
@@ -2302,60 +2538,48 @@ impl eframe::App for App {
         let svc_sel = sh.svc.lock().unwrap().iter().filter(|&&x| x).count();
 
         // =========================================================
-        // CỘT TRÁI: SidePanel (rộng 400, khoảng 360-480, resizable)
+        // CỘT TRÁI: SidePanel (rộng 400, khoảng 360-460, resizable)
         // =========================================================
         egui::SidePanel::left("left_side_panel")
             .default_width(400.0)
-            .width_range(360.0..=480.0)
+            .width_range(360.0..=460.0)
             .resizable(true)
             .frame(egui::Frame::none().fill(ui::BG).inner_margin(Margin::same(14.0)))
             .show(ctx, |ui| {
+                ui::paint_background_grid(ui);
+
                 // 1. Header (tên tool + badge trạng thái READY/PURGING)
                 ui::card(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("⚡").size(22.0).color(ui::ACCENT));
+                        ui.label(RichText::new("⚡").size(20.0).color(ui::ACCENT));
                         ui.vertical(|ui| {
                             ui.horizontal(|ui| {
                                 ui.label(
                                     RichText::new("DELTA FORCE")
                                         .size(15.0)
                                         .strong()
-                                        .color(ui::SUCCESS),
+                                        .extra_letter_spacing(1.0)
+                                        .color(ui::ACCENT),
                                 );
                                 ui.label(
                                     RichText::new("RAM PURGE")
                                         .size(15.0)
                                         .strong()
-                                        .color(ui::ACCENT),
+                                        .extra_letter_spacing(1.0)
+                                        .color(ui::TEXT_MAIN),
                                 );
                             });
                             ui.label(
                                 RichText::new("TACTICAL MEMORY BOOSTER // PRO")
                                     .size(9.0)
                                     .strong()
+                                    .extra_letter_spacing(0.5)
                                     .color(ui::TEXT_MUTED),
                             );
                         });
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let (badge_txt, badge_color) = if busy {
-                                ("● PURGING...", ui::WARNING)
-                            } else {
-                                ("● SYSTEM READY", ui::SUCCESS)
-                            };
-                            egui::Frame::none()
-                                .fill(ui::CARD_HOVER)
-                                .stroke(Stroke::new(1.0_f32, badge_color))
-                                .rounding(Rounding::same(6.0))
-                                .inner_margin(Margin::symmetric(8.0, 4.0))
-                                .show(ui, |ui| {
-                                    ui.label(
-                                        RichText::new(badge_txt)
-                                            .size(10.5)
-                                            .strong()
-                                            .color(badge_color),
-                                    );
-                                });
+                            ui::status_badge(ui, busy);
                         });
                     });
                 });
@@ -2414,7 +2638,7 @@ impl eframe::App for App {
 
                 // 3. Nút chính BẬT GAME BOOST rộng hết cột + hàng Khôi phục / Xoá nhật ký
                 let boost_btn_text = if busy {
-                    "⏳  ĐANG THANH LỌC BỘ NHỚ & DỊCH VỤ..."
+                    "ĐANG THANH LỌC…"
                 } else {
                     "🚀  BẬT GAME BOOST"
                 };
@@ -2513,29 +2737,62 @@ impl eframe::App for App {
 
                 // 5. Terminal log chiếm toàn bộ chiều cao còn lại của cột, scroll riêng, auto-scroll xuống cuối
                 ui::card(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui::section_header(ui, "", "Terminal Log", None);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(
-                                RichText::new("AUTO-SCROLL")
-                                    .size(9.5)
-                                    .color(ui::TEXT_DIM),
-                            );
-                        });
-                    });
+                    ui::section_header(ui, "AUTO-SCROLL", "Terminal Log", None);
                     ui.add_space(6.0);
 
                     let log_height = ui.available_height().max(80.0);
-                    egui::ScrollArea::vertical()
-                        .id_salt("terminal_log_scroll")
-                        .stick_to_bottom(true)
-                        .auto_shrink([false, false])
-                        .max_height(log_height)
-                        .show(ui, |ui| {
-                            for (line, color) in sh.log.lock().unwrap().iter() {
-                                ui.label(RichText::new(line).monospace().size(10.5).color(*color));
+                    let log_frame = egui::Frame::none()
+                        .fill(Color32::from_rgb(5, 7, 9))
+                        .stroke(Stroke::new(1.0_f32, ui::BORDER))
+                        .inner_margin(Margin::same(8.0));
+
+                    log_frame.show(ui, |ui| {
+                        // Hiệu ứng scanline rất nhẹ (các đường ngang alpha thấp cách nhau 3px)
+                        let log_rect = ui.max_rect();
+                        if log_rect.is_positive() {
+                            let scan_painter = ui.painter().with_clip_rect(log_rect);
+                            let scan_stroke = Stroke::new(
+                                1.0_f32,
+                                Color32::from_rgba_premultiplied(0, 0, 0, 45),
+                            );
+                            let mut y = log_rect.top();
+                            while y <= log_rect.bottom() {
+                                scan_painter.line_segment(
+                                    [pos2(log_rect.left(), y), pos2(log_rect.right(), y)],
+                                    scan_stroke,
+                                );
+                                y += 3.0;
                             }
-                        });
+                        }
+
+                        egui::ScrollArea::vertical()
+                            .id_salt("terminal_log_scroll")
+                            .stick_to_bottom(true)
+                            .auto_shrink([false, false])
+                            .max_height((log_height - 16.0).max(60.0))
+                            .show(ui, |ui| {
+                                for (line, color) in sh.log.lock().unwrap().iter() {
+                                    let text_color = if line.contains('✔') {
+                                        ui::SUCCESS
+                                    } else if line.contains('⚠') {
+                                        ui::ACCENT
+                                    } else if line.contains("[ERR]")
+                                        || line.to_lowercase().contains("lỗi")
+                                        || line.to_lowercase().contains("error")
+                                    {
+                                        ui::DANGER
+                                    } else {
+                                        *color
+                                    };
+                                    ui.label(
+                                        RichText::new(line)
+                                            .monospace()
+                                            .size(10.5)
+                                            .color(text_color),
+                                    );
+                                }
+                            });
+                    });
                 });
             });
 
@@ -2545,13 +2802,15 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(ui::BG).inner_margin(Margin::same(14.0)))
             .show(ctx, |ui| {
+                ui::paint_background_grid(ui);
+
                 // Thanh tab ở trên cùng
                 ui.horizontal(|ui| {
                     let is_app = self.tab == ConfigTab::Apps;
                     let app_tab_btn = ui::tab_button(
                         format!("💻 Ứng dụng đang chạy ({}/{})", kept, apps_snapshot.len()),
                         is_app,
-                        ui::SUCCESS,
+                        ui::ACCENT,
                     );
                     if ui.add(app_tab_btn).clicked() {
                         self.tab = ConfigTab::Apps;
@@ -2571,7 +2830,7 @@ impl eframe::App for App {
                     let auto_tab_btn = ui::tab_button(
                         "⚙ Tự động & Tối ưu",
                         is_auto,
-                        ui::WARNING,
+                        ui::ACCENT,
                     );
                     if ui.add(auto_tab_btn).clicked() {
                         self.tab = ConfigTab::AutoOpt;
@@ -2652,7 +2911,7 @@ impl eframe::App for App {
                                         ui.add_space(16.0);
                                     } else {
                                         let keep_view = sh.keep.lock().unwrap().clone();
-                                        let is_grid = ui.available_width() >= 640.0;
+                                        let is_grid = ui.available_width() >= 560.0;
                                         let mut changed = false;
 
                                         if is_grid {
@@ -2758,7 +3017,7 @@ impl eframe::App for App {
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 ui::card(ui, |ui| {
-                                    let is_grid = ui.available_width() >= 640.0;
+                                    let is_grid = ui.available_width() >= 560.0;
                                     let mut changed = false;
                                     let mut svc = sh.svc.lock().unwrap();
 
@@ -2798,7 +3057,7 @@ impl eframe::App for App {
                             });
                     }
                     ConfigTab::AutoOpt => {
-                        let is_wide = ui.available_width() >= 640.0;
+                        let is_wide = ui.available_width() >= 560.0;
                         egui::ScrollArea::vertical()
                             .id_salt("auto_opt_scroll_area")
                             .auto_shrink([false, false])
@@ -2881,12 +3140,15 @@ fn main() -> eframe::Result<()> {
     if std::env::args().any(|a| a == "--selftest") {
         let cfg = load_config();
         let skip = skip_list(&cfg.games);
-        let snap = sys::snapshot_skip(&skip);
+        let protect: HashSet<u32> = game_family_from_nodes(&sys::process_nodes(), &cfg.games)
+            .into_keys()
+            .collect();
+        let snap = sys::snapshot_skip(&skip, &protect);
         let mut lines = Vec::new();
         let mut cwd_ok = 0;
         for p in snap.iter() {
-            // Không đọc bộ nhớ của game / anti-cheat kể cả khi chạy selftest.
-            if is_ace_or_game(&p.name.to_lowercase(), &skip) {
+            // Không đọc bộ nhớ của game / anti-cheat / họ process game kể cả khi chạy selftest.
+            if is_ace_or_game(&p.name.to_lowercase(), &skip) || protect.contains(&p.pid) {
                 lines.push(format!("{}\t{}\tskip(cmdline/cwd)\t{:?}", p.pid, p.name, p.exe_path));
                 continue;
             }
@@ -2894,11 +3156,27 @@ fn main() -> eframe::Result<()> {
             cwd_ok += cwd.is_some() as usize;
             lines.push(format!("{}	{}	{}	{:?}", p.pid, p.name, p.cmdline.is_some(), cwd));
         }
-        let apps = scan_running_apps(&skip);
+        let apps = scan_running_apps(&skip, &cfg.games);
         lines.insert(0, format!("processes={} cwd_ok={} apps_listed={}", snap.len(), cwd_ok, apps.len()));
         for a in apps.iter() {
             lines.push(format!("APP	{}	{}	{}", a.exe_name, a.count, fmt_ram(a.total_ws)));
         }
+
+        lines.push(String::new());
+        lines.push("=== GAME FAMILY ===".into());
+        let reasons = game_family_reasons(&snap, &cfg.games);
+        let mut fam: Vec<(FamilyReason, u32, String)> = snap
+            .iter()
+            .filter_map(|p| reasons.get(&p.pid).map(|r| (*r, p.pid, p.name.clone())))
+            .collect();
+        fam.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        if fam.is_empty() {
+            lines.push("(không có process nào thuộc họ game)".into());
+        }
+        for (reason, pid, name) in fam.iter() {
+            lines.push(format!("{}	{}	{}", pid, name, reason.label()));
+        }
+        lines.push(format!("protected_pids={}", fam.len()));
 
         lines.push(String::new());
         lines.push("=== MEMORY LISTS (standby) ===".into());
