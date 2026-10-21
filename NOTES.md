@@ -37,14 +37,19 @@ cargo build --release
 - Chạy cùng Windows qua Task Scheduler (`/RL HIGHEST`, không hiện UAC).
 - Giao diện mới (Gemini 3.8 Flash làm).
 
-## Việc còn lại: 4 lỗi giao diện
-Thấy trong ảnh chụp sau lần làm lại giao diện:
-1. **Ô nhập tên exe game vẫn nền trắng**, chưa theo bảng màu tối. Xem `TextEdit::singleline(&mut self.game_input)` trong `main.rs` và `setup_visuals` trong `ui.rs`. Có thể cần `.background_color(...)` trên TextEdit, hoặc set `visuals.text_edit_bg_color`.
-2. **Nút xoá game hiện ra ô vuông** thay vì "✕": font mặc định của egui không có glyph này. Đổi sang "×"/"x", hoặc tự vẽ dấu X bằng painter.
-3. **Hàng tab/nút ở khối "ỨNG DỤNG ĐANG CHẠY" bị chồng chữ** ở chiều rộng ~500px (tab bị cắt, các nút "Mặc định / Bỏ giữ tất cả / Giữ tất cả / Làm mới" đè lên nhau). Cần xuống dòng (`horizontal_wrapped`) hoặc tách thành 2 hàng.
-4. **Danh sách app bị cắt**: ScrollArea bên trong quá thấp nên dòng app bị che nửa. Nên bỏ scroll lồng (cả trang đã có ScrollArea), hoặc đặt chiều cao tối thiểu hợp lý.
+## Đã làm thêm (2026-10-21)
+- Nén RAM (trim working set) có chọn lọc, chạy sau bước xả standby. Không nén game, anti-cheat, audiodg, dwm, csrss. Log ghi 5 app còn giữ nhiều RAM nhất. Tuỳ chọn `opt:trim`.
+- Giao diện 2 cột (1120×760, tối thiểu 900×600):
+  - Cột trái: RAM, Boost, session, log.
+  - Cột phải: 3 tab, danh sách app và service dạng lưới 2 cột.
+- Đã sửa 4 lỗi UI cũ, cùng lỗi tên app dài bị đè chữ.
+- Không bao giờ tắt bản `gamemode.exe` khác đang mở.
 
-Sau khi sửa: build, mở app, chụp màn hình ở chiều rộng mặc định (500px) và tối thiểu (460px) để kiểm tra.
+## Phân công model trên harness
+Logic giao DeepSeek, giao diện giao Gemini 3.8 Flash.
+
+## Mẹo chụp màn hình UI để kiểm tra
+App đòi quyền admin nên shell thường không chụp được cửa sổ. Mở bằng `__COMPAT_LAYER=RunAsInvoker` rồi chụp bằng `PrintWindow(hwnd, hdc, 2)`. Chế độ này không có quyền admin nên một số số liệu (Free RAM, service) có thể khác bản thật.
 
 ## Lưu ý vận hành
 - Service Office `ClickToRunSvc` phản hồi lệnh dừng rất chậm (từng kẹt ở `StopPending`). Nên bỏ tick nếu không cần.
