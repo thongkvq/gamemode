@@ -8,8 +8,8 @@ use std::mem::{size_of, transmute, zeroed};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, HANDLE, HWND, INVALID_HANDLE_VALUE, LPARAM, LUID, STILL_ACTIVE,
-    SYSTEMTIME, WPARAM,
+    CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, INVALID_HANDLE_VALUE, LPARAM,
+    LUID, STILL_ACTIVE, SYSTEMTIME, WPARAM,
 };
 use windows_sys::Win32::NetworkManagement::WiFi::{
     WlanCloseHandle, WlanEnumInterfaces, WlanFreeMemory, WlanOpenHandle, WlanQueryInterface,
@@ -37,14 +37,15 @@ use windows_sys::Win32::System::SystemInformation::{
     GetLocalTime, GlobalMemoryStatusEx, MEMORYSTATUSEX,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateProcessWithTokenW, GetCurrentProcess, GetExitCodeProcess, OpenProcess, OpenProcessToken,
-    QueryFullProcessImageNameW, TerminateProcess, PROCESS_INFORMATION,
+    CreateMutexW, CreateProcessWithTokenW, GetCurrentProcess, GetExitCodeProcess, OpenProcess,
+    OpenProcessToken, QueryFullProcessImageNameW, TerminateProcess, PROCESS_INFORMATION,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA, PROCESS_TERMINATE, PROCESS_VM_READ,
     STARTUPINFOW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindow, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
-    IsWindowVisible, PostMessageW, GW_OWNER, WM_CLOSE,
+    EnumWindows, FindWindowW, GetWindow, GetWindowTextLengthW, GetWindowTextW,
+    GetWindowThreadProcessId, IsIconic, IsWindowVisible, PostMessageW, SetForegroundWindow,
+    ShowWindow, GW_OWNER, SW_HIDE, SW_RESTORE, SW_SHOW, WM_CLOSE,
 };
 
 /// ACCESS bị windows-sys đặt ở module khác -> dùng hằng số gốc của Win32.
@@ -1371,4 +1372,72 @@ pub fn stop_service(name: &str) -> Result<(), u32> {
 
 pub fn start_service(name: &str) -> Result<(), u32> {
     with_timeout(name, start_service_blocking)
+}
+
+// ==========================================================================
+// Cửa sổ chính GameMode: ẩn xuống khay / hiện lại / chặn mở nhiều bản
+// ==========================================================================
+//
+// HWND được truyền dạng `isize` (không phải `HWND` = con trỏ) để gửi được sang
+// thread xử lý sự kiện khay: con trỏ thô không `Send`, còn `isize` thì có.
+
+/// Tìm cửa sổ theo đúng tiêu đề (dùng cho bản chạy thứ hai).
+pub fn find_window(title: &str) -> isize {
+    let t = to_wide(title);
+    unsafe { FindWindowW(std::ptr::null(), t.as_ptr()) as isize }
+}
+
+/// Ẩn cửa sổ chính (nút X / đóng cửa sổ -> thu xuống khay).
+pub fn hide_main_window(hwnd: isize) {
+    if hwnd == 0 {
+        return;
+    }
+    unsafe {
+        ShowWindow(hwnd as HWND, SW_HIDE);
+    }
+}
+
+/// Hiện lại cửa sổ chính và đưa lên trước (click trái icon khay, hoặc bản chạy thứ hai).
+pub fn show_main_window(hwnd: isize) {
+    if hwnd == 0 {
+        return;
+    }
+    unsafe {
+        let h = hwnd as HWND;
+        if IsIconic(h) != 0 {
+            ShowWindow(h, SW_RESTORE);
+        } else {
+            ShowWindow(h, SW_SHOW);
+        }
+        SetForegroundWindow(h);
+    }
+}
+
+/// Gửi WM_CLOSE vào cửa sổ chính (đánh thức main thread kể cả khi cửa sổ đang ẩn).
+pub fn post_close(hwnd: isize) {
+    if hwnd == 0 {
+        return;
+    }
+    unsafe {
+        PostMessageW(hwnd as HWND, WM_CLOSE, 0, 0);
+    }
+}
+
+/// Giữ named mutex cho tới khi tiến trình thoát.
+/// `Some(handle)` = bản đầu tiên (handle phải còn sống); `None` = đã có bản khác đang chạy.
+pub fn acquire_single_instance(name: &str) -> Option<HANDLE> {
+    let w = to_wide(name);
+    unsafe {
+        let h = CreateMutexW(std::ptr::null(), 0, w.as_ptr());
+        if h.is_null() {
+            // Không tạo được mutex (hiếm): coi như chưa có bản nào để app vẫn mở được.
+            return Some(std::ptr::null_mut());
+        }
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            CloseHandle(h);
+            None
+        } else {
+            Some(h)
+        }
+    }
 }

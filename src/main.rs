@@ -1,9 +1,11 @@
 #![windows_subsystem = "windows"]
 
 mod sys;
+mod tray;
 mod ui;
 
 use eframe::egui::{self, Color32, FontId, Margin, Rect, RichText, Rounding, Stroke, pos2, vec2};
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -347,6 +349,10 @@ const CHILD_CMDLINE_MARKERS: &[&str] = &[
 const GB: f64 = 1024.0 * 1024.0 * 1024.0;
 const MB: f64 = 1024.0 * 1024.0;
 
+/// Tiêu đề cửa sổ chính: dùng cho `ViewportBuilder` và cho `FindWindowW` khi bản chạy
+/// thứ hai cần tìm lại cửa sổ của bản đang chạy.
+const WINDOW_TITLE: &str = "DELTA FORCE - TACTICAL RAM PURGE";
+
 fn config_path() -> PathBuf {
     std::env::current_exe()
         .map(|p| p.with_file_name("gamemode.cfg"))
@@ -404,6 +410,8 @@ struct Opts {
     auto_enabled: bool,
     /// Tự Restore khi game đã tắt.
     auto_restore: bool,
+    /// `ui:close_to_tray`: bấm X thì ẩn xuống khay thay vì thoát.
+    close_to_tray: bool,
 }
 
 impl Default for Opts {
@@ -416,6 +424,7 @@ impl Default for Opts {
             gamedvr: true,
             auto_enabled: false,
             auto_restore: true,
+            close_to_tray: true,
         }
     }
 }
@@ -436,7 +445,8 @@ fn is_on(v: &str) -> bool {
 }
 
 /// Đọc cấu hình: `keep:<exe>=1/0`, `svc:<tên>=1/0`, `game:<exe>=1`, `gamepath:<exe>=<path>`,
-/// `auto:enabled/restore=1/0`, `opt:standby/trim/gpu/wlan/gamedvr=1/0`.
+/// `auto:enabled/restore=1/0`, `opt:standby/trim/gpu/wlan/gamedvr=1/0`,
+/// `ui:close_to_tray=1/0`.
 /// Các dòng `app:...` của bản cũ được bỏ qua (không còn danh sách app cố định).
 fn load_config() -> Config {
     let text = std::fs::read_to_string(config_path()).unwrap_or_default();
@@ -490,6 +500,12 @@ fn load_config() -> Config {
                     _ => {}
                 }
             }
+        } else if let Some(rest) = line.strip_prefix("ui:") {
+            if let Some((k, v)) = rest.rsplit_once('=') {
+                if k.trim() == "close_to_tray" {
+                    opts.close_to_tray = is_on(v);
+                }
+            }
         }
         // dòng "app:..." / dòng rác của bản cũ: bỏ qua
     }
@@ -540,6 +556,7 @@ fn write_config(cfg: &Config) -> bool {
     lines.push(format!("opt:gpu={}", if o.gpu { 1 } else { 0 }));
     lines.push(format!("opt:wlan={}", if o.wlan { 1 } else { 0 }));
     lines.push(format!("opt:gamedvr={}", if o.gamedvr { 1 } else { 0 }));
+    lines.push(format!("ui:close_to_tray={}", if o.close_to_tray { 1 } else { 0 }));
     std::fs::write(config_path(), lines.join("\n")).is_ok()
 }
 
@@ -686,6 +703,15 @@ fn load_app_icon() -> Option<egui::IconData> {
         width,
         height,
     })
+}
+
+/// HWND của cửa sổ chính, lấy từ `CreationContext` (eframe 0.29 dùng raw-window-handle 0.6).
+/// Trả 0 nếu không lấy được; khi đó các lệnh ẩn/hiện cửa sổ chỉ đơn giản là không làm gì.
+fn window_hwnd(cc: &eframe::CreationContext<'_>) -> isize {
+    match cc.window_handle().map(|h| h.as_raw()) {
+        Ok(RawWindowHandle::Win32(w)) => w.hwnd.get(),
+        _ => 0,
+    }
 }
 
 fn extract_exe_path(raw_cmd: &str) -> Option<String> {
@@ -1763,9 +1789,8 @@ fn start_watcher(sh: Shared) {
     });
 }
 
-/// Cờ `--minimized`: egui 0.29 không có `ViewportBuilder::with_minimized`, phải gửi
-/// `ViewportCommand::Minimized(true)` sau khi cửa sổ đã tạo (xem `App::update`).
-static START_MINIMIZED: AtomicBool = AtomicBool::new(false);
+/// Cờ `--minimized`: vào thẳng khay hệ thống (cửa sổ ẩn) thay vì thu xuống taskbar.
+static START_HIDDEN: AtomicBool = AtomicBool::new(false);
 
 struct App {
     sh: Shared,
@@ -1783,8 +1808,12 @@ struct App {
     /// Task "GameMode" trong Task Scheduler (cache, hỏi lại định kỳ).
     task_on: bool,
     last_task_check: Instant,
-    /// Còn phải thu nhỏ cửa sổ lần đầu (cờ --minimized).
-    minimize_pending: bool,
+    /// Còn phải ẩn cửa sổ ở frame đầu (cờ --minimized).
+    start_hidden: bool,
+    /// Icon khay hệ thống + menu; `None` nếu tạo lỗi (app vẫn dùng được như cũ).
+    tray: Option<tray::Tray>,
+    /// HWND của cửa sổ chính, lấy từ `CreationContext`; 0 nếu không lấy được.
+    hwnd: isize,
 }
 
 impl App {
@@ -1881,12 +1910,28 @@ impl App {
             game_input: String::new(),
             task_on: sys::task_exists(),
             last_task_check: Instant::now(),
-            minimize_pending: START_MINIMIZED.load(Ordering::SeqCst),
+            start_hidden: START_HIDDEN.load(Ordering::SeqCst),
+            tray: None,
+            // HWND lấy ngay từ CreationContext: thread khay cần nó để ẩn/hiện cửa sổ
+            // kể cả khi eframe không gọi update() nữa.
+            hwnd: window_hwnd(cc),
         };
         app.save();
         app.start_scan();
-        // Watcher sống độc lập với UI: vẫn tự tối ưu khi cửa sổ bị thu nhỏ.
-        start_watcher(sh);
+        // Watcher sống độc lập với UI: vẫn tự tối ưu khi cửa sổ bị thu nhỏ hoặc ẩn xuống khay.
+        start_watcher(sh.clone());
+        // Icon khay phải tạo trên main thread (Windows cần message loop của thread này);
+        // `Tray` được giữ trong `App` để icon không bị bỏ khi hàm này kết thúc.
+        match tray::Tray::new(&sh) {
+            Ok(t) => {
+                app.tray = Some(t);
+                tray::start_event_thread(sh, cc.egui_ctx.clone(), app.hwnd);
+            }
+            Err(e) => sh.log(
+                format!("  ⚠ [TRAY] Không tạo được icon khay: {}", e),
+                ui::DANGER,
+            ),
+        }
         app
     }
 
@@ -2017,6 +2062,15 @@ fn render_auto_card(
             &mut opts_view.auto_restore,
             "Tự Restore khi game tắt",
             "Game tắt liên tục 15 giây thì khôi phục (phiên do auto tối ưu)",
+        ) {
+            *save_needed = true;
+        }
+        ui.add_space(2.0);
+        if ui::toggle_row(
+            ui,
+            &mut opts_view.close_to_tray,
+            "Đóng cửa sổ = thu xuống khay",
+            "Bấm X sẽ ẩn app xuống khay hệ thống; thoát hẳn bằng menu khay",
         ) {
             *save_needed = true;
         }
@@ -2493,10 +2547,18 @@ fn time_part(saved_at: &str) -> String {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if self.minimize_pending {
-            self.minimize_pending = false;
-            // Khởi động cùng Windows: thu nhỏ ngay, watcher vẫn chạy bình thường.
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        if self.start_hidden {
+            self.start_hidden = false;
+            // --minimized: vào thẳng khay (cửa sổ ẩn) chứ không thu xuống taskbar.
+            // eframe tự hiện cửa sổ sau frame đầu, nên ẩn lại thêm vài lần trong giây đầu.
+            let hwnd = self.hwnd;
+            sys::hide_main_window(hwnd);
+            std::thread::spawn(move || {
+                for ms in [150u64, 400, 900] {
+                    std::thread::sleep(Duration::from_millis(ms));
+                    sys::hide_main_window(hwnd);
+                }
+            });
         }
         if self.last_mem.elapsed() > Duration::from_millis(800) {
             self.mem = sys::memory();
@@ -2514,6 +2576,28 @@ impl eframe::App for App {
         }
         ctx.request_repaint_after(Duration::from_millis(400));
         let sh = self.sh.clone();
+
+        // Đóng cửa sổ (nút X trên title bar, Alt+F4, ...): mặc định thu xuống khay hệ thống,
+        // chỉ thoát hẳn khi chọn "Thoát" ở menu khay hoặc khi tắt ui:close_to_tray.
+        if ctx.input(|i| i.viewport().close_requested()) {
+            // Không có icon khay hoặc không lấy được HWND thì ẩn đi sẽ không hiện lại được
+            // -> cứ đóng như cũ.
+            let can_tray = self.tray.is_some() && self.hwnd != 0;
+            if !tray::QUIT.load(Ordering::SeqCst) && sh.opts().close_to_tray && can_tray {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                sys::hide_main_window(self.hwnd);
+            } else {
+                // Bỏ icon khay trước khi đóng app.
+                if let Some(mut t) = self.tray.take() {
+                    t.remove();
+                }
+            }
+        }
+        // Tooltip / trạng thái disable / dấu tick của menu khay bám theo trạng thái thật.
+        if let Some(t) = self.tray.as_mut() {
+            t.sync(&sh);
+        }
+
         let busy = sh.busy.load(Ordering::SeqCst);
         let scanning = self.scanning.load(Ordering::SeqCst);
         let apps_snapshot: Vec<RunningApp> = sh.running.lock().unwrap().clone();
@@ -3266,12 +3350,35 @@ delete={:?}
         return Ok(());
     }
 
-    let minimized = std::env::args().any(|a| a == "--minimized");
-    if minimized {
-        START_MINIMIZED.store(true, Ordering::SeqCst);
+    // --traytest: tạo icon khay + menu trong 5 giây rồi thoát, ghi kết quả ra traytest.txt.
+    if std::env::args().any(|a| a == "--traytest") {
+        let text = format!(
+            "admin={}\n{}\n",
+            sys::is_admin(),
+            tray::test_tray(5000)
+        );
+        let _ = std::fs::write(config_path().with_file_name("traytest.txt"), text);
+        return Ok(());
+    }
+
+    // Một bản duy nhất: bản chạy thứ hai chỉ hiện cửa sổ của bản cũ rồi thoát ngay
+    // (không chặn các cờ kiểm tra ở trên). Giữ handle mutex tới hết hàm main.
+    let _instance = match sys::acquire_single_instance("Local\\GameModeTacticalRamPurge") {
+        Some(handle) => handle,
+        None => {
+            let old = sys::find_window(WINDOW_TITLE);
+            if old != 0 {
+                sys::show_main_window(old);
+            }
+            return Ok(());
+        }
+    };
+
+    if std::env::args().any(|a| a == "--minimized") {
+        START_HIDDEN.store(true, Ordering::SeqCst);
     }
     let mut viewport = egui::ViewportBuilder::default()
-        .with_title("DELTA FORCE - TACTICAL RAM PURGE")
+        .with_title(WINDOW_TITLE)
         .with_inner_size([1240.0, 820.0])
         .with_min_inner_size([980.0, 640.0])
         .with_resizable(true)

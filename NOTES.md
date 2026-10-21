@@ -17,14 +17,23 @@ cargo build --release
 | `--purgetest` | Xả standby list một lần | `purgetest.txt` |
 | `--launchtest` | Mở notepad bằng quyền user thường (token explorer) | `launchtest.txt` |
 | `--tasktest` | Tạo task "GameMode", đọc XML, rồi xoá | `tasktest.txt` |
-| `--minimized` | Khởi động thu nhỏ (task chạy cùng Windows dùng cờ này) | |
+| `--traytest` | Tạo icon khay + menu trong 5 giây rồi thoát | `traytest.txt` |
+| `--minimized` | Khởi động **ẩn xuống khay hệ thống** (task chạy cùng Windows dùng cờ này) | |
+
+## Khay hệ thống (2026-10-22)
+- Nút X trên title bar và Alt+F4 **không thoát** nữa: cửa sổ ẩn xuống khay (icon cạnh đồng hồ). Thoát hẳn bằng menu chuột phải ở icon khay → `Thoát`.
+- Menu khay: `Mở GameMode` (click trái icon cũng hiện cửa sổ), `Bật Game Boost`, `Khôi phục`, `Tự động khi mở game` (tick, đồng bộ với `auto:enabled`), `Thoát`.
+- Tuỳ chọn `ui:close_to_tray=1/0` (mặc định 1), có công tắc trong card "Tự động khi chơi game". Đặt 0 thì nút X thoát hẳn như trước.
+- Chỉ chạy một bản: mở bản thứ hai chỉ hiện cửa sổ bản cũ rồi thoát (named mutex `Local\GameModeTacticalRamPurge`).
+- Sự kiện khay xử lý ở thread riêng (`src/tray.rs`) vì eframe không gọi `update()` khi cửa sổ đã ẩn.
 
 ## Cấu trúc
 - `src/main.rs`
   - Logic: `do_optimize`, `do_restore`, `start_watcher`, config, session.
   - UI: `App::new`, `update`, `running_app_row`.
   - `Shared` (các `Arc<Mutex>`) là cầu nối giữa UI và thread watcher.
-- `src/sys.rs`: WinAPI (snapshot process, cmdline, kill, WM_CLOSE, service có timeout 5 giây, standby purge, WLAN, Game DVR, GPU pref, schtasks, mở app bằng token explorer).
+- `src/sys.rs`: WinAPI (snapshot process, cmdline, kill, WM_CLOSE, service có timeout 5 giây, standby purge, WLAN, Game DVR, GPU pref, schtasks, mở app bằng token explorer, ẩn/hiện cửa sổ chính + named mutex một bản).
+- `src/tray.rs`: icon khay + menu chuột phải, thread nhận sự kiện menu/click (chạy được khi cửa sổ đã ẩn).
 - `src/ui.rs`: bảng màu và widget dùng chung (`card`, `section_header`, `toggle_row` có switch, `ghost_button`, `primary_button`, `callout_warning`).
 
 ## Đã xong
