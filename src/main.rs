@@ -185,6 +185,10 @@ const ACE_SKIP: &[&str] = &[
     "anticheatexpert.exe",
 ];
 
+/// Process hệ thống KHÔNG nén working set: nén audiodg (âm thanh) / dwm (compositor, vẽ hình)
+/// / csrss sẽ gây giật âm thanh và hình ngay khi đang chơi.
+const TRIM_SKIP_EXE: &[&str] = &["audiodg.exe", "dwm.exe", "csrss.exe"];
+
 /// Danh sách exe không được mở quyền đọc bộ nhớ: exe game + process anti-cheat.
 fn skip_list(games: &[String]) -> Vec<String> {
     let mut v: Vec<String> = games.iter().map(|g| g.to_lowercase()).collect();
@@ -270,6 +274,8 @@ fn is_never_kill(exe_lower: &str, exe_path: Option<&str>) -> bool {
 struct Opts {
     /// Xả standby list khi tối ưu và khi RAM trống thấp lúc đang chơi.
     standby: bool,
+    /// Nén working set của các app được giữ lại (một lần, lúc tối ưu).
+    trim: bool,
     /// Ép game dùng GPU rời (GpuPreference=2).
     gpu: bool,
     /// Tắt quét nền Wi-Fi khi chơi.
@@ -286,6 +292,7 @@ impl Default for Opts {
     fn default() -> Self {
         Self {
             standby: true,
+            trim: true,
             gpu: true,
             wlan: true,
             gamedvr: true,
@@ -311,7 +318,7 @@ fn is_on(v: &str) -> bool {
 }
 
 /// Đọc cấu hình: `keep:<exe>=1/0`, `svc:<tên>=1/0`, `game:<exe>=1`, `gamepath:<exe>=<path>`,
-/// `auto:enabled/restore=1/0`, `opt:standby/gpu/wlan/gamedvr=1/0`.
+/// `auto:enabled/restore=1/0`, `opt:standby/trim/gpu/wlan/gamedvr=1/0`.
 /// Các dòng `app:...` của bản cũ được bỏ qua (không còn danh sách app cố định).
 fn load_config() -> Config {
     let text = std::fs::read_to_string(config_path()).unwrap_or_default();
@@ -350,6 +357,7 @@ fn load_config() -> Config {
             if let Some((k, v)) = rest.rsplit_once('=') {
                 match k.trim() {
                     "standby" => opts.standby = is_on(v),
+                    "trim" => opts.trim = is_on(v),
                     "gpu" => opts.gpu = is_on(v),
                     "wlan" => opts.wlan = is_on(v),
                     "gamedvr" => opts.gamedvr = is_on(v),
@@ -410,6 +418,7 @@ fn write_config(cfg: &Config) -> bool {
     lines.push(format!("auto:enabled={}", if o.auto_enabled { 1 } else { 0 }));
     lines.push(format!("auto:restore={}", if o.auto_restore { 1 } else { 0 }));
     lines.push(format!("opt:standby={}", if o.standby { 1 } else { 0 }));
+    lines.push(format!("opt:trim={}", if o.trim { 1 } else { 0 }));
     lines.push(format!("opt:gpu={}", if o.gpu { 1 } else { 0 }));
     lines.push(format!("opt:wlan={}", if o.wlan { 1 } else { 0 }));
     lines.push(format!("opt:gamedvr={}", if o.gamedvr { 1 } else { 0 }));
@@ -1155,7 +1164,7 @@ fn do_optimize(sh: &Shared) {
         );
     }
 
-    // 9. Xả standby list một lần sau khi đã tắt app (thay cho trim working-set cũ).
+    // 9. Xả standby list một lần trước khi nén RAM (bỏ cache cũ, nhường chỗ cho trang vừa nén).
     if opts.standby {
         match sys::memory_lists() {
             Some(before_lists) => match sys::purge_standby() {
@@ -1182,6 +1191,84 @@ fn do_optimize(sh: &Shared) {
                 "  ⚠ [STANDBY] Không đọc được danh sách trang bộ nhớ của Windows.".into(),
                 Color32::from_rgb(255, 120, 120),
             ),
+        }
+    }
+
+    // 9b. Nén RAM: đẩy working set của các app ĐƯỢC GIỮ LẠI ra standby list.
+    //     Làm sau bước 9 để trang cũ đã bị xả trước, còn trang vừa nén nằm lại trong standby
+    //     làm cache (app cần thì lấy lại ngay) -> KHÔNG xả standby lần nữa sau bước này.
+    //     Bỏ qua: chính tool, game + anti-cheat (không mở handle), process hệ thống nhạy cảm, pid <= 4.
+    if opts.trim {
+        let mut targets = 0usize;
+        let mut total = 0u64;
+        let mut hits: Vec<(u64, String)> = Vec::new();
+        for p in sys::list_processes() {
+            if p.pid <= 4 || p.pid == me {
+                continue;
+            }
+            let exe = p.name.to_lowercase();
+            if exe.is_empty()
+                || is_ace_or_game(&exe, &skip)
+                || TRIM_SKIP_EXE.contains(&exe.as_str())
+            {
+                continue;
+            }
+            targets += 1;
+            let freed = sys::trim(p.pid);
+            if freed > 0 {
+                total += freed;
+                hits.push((freed, p.name.clone()));
+            }
+        }
+        hits.sort_by(|a, b| b.0.cmp(&a.0));
+        push(
+            format!(
+                "  ✔ [TRIM] Nén working set {} process -> thu hồi {} ({} process giảm)",
+                targets,
+                fmt_ram(total),
+                hits.len()
+            ),
+            Color32::from_rgb(50, 215, 255),
+        );
+        let top: Vec<String> = hits
+            .iter()
+            .take(5)
+            .map(|(bytes, name)| format!("{} {}", name, fmt_ram(*bytes)))
+            .collect();
+        if !top.is_empty() {
+            push(
+                format!("     • Giảm nhiều nhất: {}", top.join(", ")),
+                Color32::from_rgb(130, 150, 170),
+            );
+        }
+
+        // 9c. Còn gì đang giữ RAM: gom working set SAU khi nén theo tên exe, bỏ game + anti-cheat.
+        let mut left: HashMap<String, u64> = HashMap::new();
+        for p in sys::list_processes() {
+            if p.pid <= 4 || p.pid == me {
+                continue;
+            }
+            let exe = p.name.to_lowercase();
+            if exe.is_empty() || is_ace_or_game(&exe, &skip) {
+                continue;
+            }
+            let ws = sys::working_set_of(p.pid);
+            if ws > 0 {
+                *left.entry(p.name.clone()).or_insert(0) += ws;
+            }
+        }
+        let mut left_sorted: Vec<(&String, &u64)> = left.iter().collect();
+        left_sorted.sort_by(|a, b| b.1.cmp(a.1));
+        let remained: Vec<String> = left_sorted
+            .iter()
+            .take(5)
+            .map(|(name, bytes)| format!("{} {}", name, fmt_ram(**bytes)))
+            .collect();
+        if !remained.is_empty() {
+            push(
+                format!("  • [CÒN LẠI] {}", remained.join(", ")),
+                Color32::from_rgb(255, 200, 90),
+            );
         }
     }
 
@@ -2265,7 +2352,7 @@ impl eframe::App for App {
 
                         ui.add_space(10.0);
 
-                        // 3d. TỐI ƯU KHI CHƠI (4 tuỳ chọn)
+                        // 3d. TỐI ƯU KHI CHƠI (5 tuỳ chọn)
                         ui::card(ui, |ui| {
                             ui::section_header(
                                 ui,
@@ -2280,6 +2367,16 @@ impl eframe::App for App {
                                 &mut opts_view.standby,
                                 "Xả standby list (RAM chờ) khi tối ưu",
                                 "Không đẩy app ra pagefile; lúc chơi tự xả nếu Free < 1 GB & Standby > 1 GB",
+                            ) {
+                                opts_changed = true;
+                            }
+                            ui.add_space(2.0);
+
+                            if ui::toggle_row(
+                                ui,
+                                &mut opts_view.trim,
+                                "Nén RAM các app được giữ lại",
+                                "Đẩy RAM của app nền (Discord, Steam, Claude...) ra cache; không đụng game và anti-cheat",
                             ) {
                                 opts_changed = true;
                             }
@@ -2640,10 +2737,11 @@ fn main() -> eframe::Result<()> {
         lines.push(String::new());
         lines.push("=== CONFIG ĐANG ĐỌC ===".into());
         lines.push(format!(
-            "auto:enabled={} auto:restore={} opt:standby={} opt:gpu={} opt:wlan={} opt:gamedvr={}",
+            "auto:enabled={} auto:restore={} opt:standby={} opt:trim={} opt:gpu={} opt:wlan={} opt:gamedvr={}",
             cfg.opts.auto_enabled as u8,
             cfg.opts.auto_restore as u8,
             cfg.opts.standby as u8,
+            cfg.opts.trim as u8,
             cfg.opts.gpu as u8,
             cfg.opts.wlan as u8,
             cfg.opts.gamedvr as u8

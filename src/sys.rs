@@ -29,7 +29,9 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
-use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+use windows_sys::Win32::System::ProcessStatus::{
+    K32EmptyWorkingSet, K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+};
 use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows_sys::Win32::System::SystemInformation::{
     GetLocalTime, GlobalMemoryStatusEx, MEMORYSTATUSEX,
@@ -37,7 +39,7 @@ use windows_sys::Win32::System::SystemInformation::{
 use windows_sys::Win32::System::Threading::{
     CreateProcessWithTokenW, GetCurrentProcess, GetExitCodeProcess, OpenProcess, OpenProcessToken,
     QueryFullProcessImageNameW, TerminateProcess, PROCESS_INFORMATION,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, PROCESS_VM_READ,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA, PROCESS_TERMINATE, PROCESS_VM_READ,
     STARTUPINFOW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -448,6 +450,37 @@ pub fn kill(pid: u32) -> Option<u64> {
         let ok = TerminateProcess(h, 1) != 0;
         CloseHandle(h);
         ok.then_some(ws)
+    }
+}
+
+/// Nén working set của một process: đẩy các trang ít dùng ra standby list.
+/// Trang bị nén KHÔNG mất — nằm lại trong standby làm cache nên Windows vẫn tính vào
+/// "RAM khả dụng", và process cần lại thì lấy về ngay (không phải đọc pagefile).
+/// Trả về số byte working set giảm được (0 nếu không mở được process).
+pub fn trim(pid: u32) -> u64 {
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SET_QUOTA, 0, pid);
+        if h.is_null() {
+            return 0;
+        }
+        let before = working_set(h);
+        K32EmptyWorkingSet(h);
+        let after = working_set(h);
+        CloseHandle(h);
+        before.saturating_sub(after)
+    }
+}
+
+/// Working set hiện tại của một process (0 nếu không đọc được).
+pub fn working_set_of(pid: u32) -> u64 {
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return 0;
+        }
+        let ws = working_set(h);
+        CloseHandle(h);
+        ws
     }
 }
 
