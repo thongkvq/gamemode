@@ -6,6 +6,7 @@ mod tray;
 mod ui;
 
 use eframe::egui::{self, Color32, FontId, Margin, Rect, RichText, Rounding, Stroke, pos2, vec2};
+use egui_plot::{HLine, Line, LineStyle, MarkerShape, Plot, PlotPoints, Points, VLine};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -839,6 +840,7 @@ enum ConfigTab {
     Apps,
     Services,
     AutoOpt,
+    Reports,
 }
 
 /// Trạng thái dùng chung giữa UI và watcher. Watcher chạy ở thread riêng nên KHÔNG đọc
@@ -2032,6 +2034,17 @@ struct App {
     tray: Option<tray::Tray>,
     /// HWND của cửa sổ chính, lấy từ `CreationContext`; 0 nếu không lấy được.
     hwnd: isize,
+    /// Cache danh sách báo cáo trên đĩa, không đọc đĩa mỗi frame.
+    reports_cache: Option<Vec<report::ReportMeta>>,
+    /// ID báo cáo đang chọn: Some("live") hoặc Some("YYYYMMDD-HHMMSS").
+    selected_report_id: Option<String>,
+    /// Chi tiết báo cáo đã nạp (cache tránh load_report mỗi frame).
+    cached_report: Option<report::GameReport>,
+    /// Xác nhận 2 bước khi xoá: (id_báo_cáo, thời_điểm_bấm_lần_1).
+    delete_confirm: Option<(String, Instant)>,
+    /// Chu kỳ đọc sys::commit() cho thẻ Pagefile (tối đa mỗi 2 giây).
+    last_commit_sys: Instant,
+    commit_sys: (u64, u64),
 }
 
 impl App {
@@ -2137,6 +2150,12 @@ impl App {
             // HWND lấy ngay từ CreationContext: thread khay cần nó để ẩn/hiện cửa sổ
             // kể cả khi eframe không gọi update() nữa.
             hwnd: window_hwnd(cc),
+            reports_cache: None,
+            selected_report_id: None,
+            cached_report: None,
+            delete_confirm: None,
+            last_commit_sys: Instant::now(),
+            commit_sys: sys::commit(),
         };
         app.save();
         app.start_scan();
@@ -2171,6 +2190,41 @@ impl App {
             *running.lock().unwrap() = list;
             scanning.store(false, Ordering::SeqCst);
         });
+    }
+
+    /// Nạp lại danh sách báo cáo từ đĩa và cập nhật lựa chọn mặc định.
+    fn refresh_reports(&mut self) {
+        let list = report::list_reports();
+        let live_exists = self.sh.live_report.lock().unwrap().is_some();
+        if live_exists {
+            if self.selected_report_id.is_none() || self.selected_report_id.as_deref() == Some("live") {
+                self.selected_report_id = Some("live".into());
+                self.cached_report = None;
+            }
+        } else if self.selected_report_id.as_deref() == Some("live") || self.selected_report_id.is_none() {
+            self.selected_report_id = list.first().map(|m| m.id.clone());
+            self.cached_report = self.selected_report_id.as_deref().and_then(report::load_report);
+        } else if let Some(ref id) = self.selected_report_id {
+            if !list.iter().any(|m| &m.id == id) {
+                self.selected_report_id = list.first().map(|m| m.id.clone());
+                self.cached_report = self.selected_report_id.as_deref().and_then(report::load_report);
+            }
+        }
+        self.reports_cache = Some(list);
+    }
+
+    /// Chọn một báo cáo để xem chi tiết: "live" hoặc ID của file.
+    fn select_report(&mut self, id: &str) {
+        if id == "live" {
+            self.selected_report_id = Some("live".into());
+            self.cached_report = None;
+        } else {
+            if self.selected_report_id.as_deref() != Some(id) {
+                self.cached_report = report::load_report(id);
+                self.selected_report_id = Some(id.to_string());
+            }
+        }
+        self.delete_confirm = None;
     }
 }
 
@@ -2777,6 +2831,801 @@ fn time_part(saved_at: &str) -> String {
     }
 }
 
+/// Rút gọn tên exe game cho gọn gàng trên HUD.
+fn clean_game_name(raw: &str) -> String {
+    let lower = raw.trim();
+    let no_ext = if let Some(stripped) = lower.strip_suffix(".exe") {
+        stripped
+    } else if let Some(stripped) = lower.strip_suffix(".EXE") {
+        stripped
+    } else {
+        lower
+    };
+    if no_ext.chars().count() > 16 {
+        format!("{}…", no_ext.chars().take(15).collect::<String>())
+    } else {
+        no_ext.to_string()
+    }
+}
+
+/// "2026-10-22 01:12:29" -> "10-22 01:12"
+fn format_short_date(s: &str) -> String {
+    if s.len() >= 16 {
+        s[5..16].to_string()
+    } else if !s.is_empty() {
+        s.to_string()
+    } else {
+        "—".to_string()
+    }
+}
+
+/// Định dạng thời lượng theo giây -> chuỗi hiển thị gọn.
+fn format_duration(sec: u64) -> String {
+    if sec < 60 {
+        format!("{}s", sec)
+    } else if sec < 3600 {
+        format!("{}m {:02}s", sec / 60, sec % 60)
+    } else {
+        format!("{}h {:02}m", sec / 3600, (sec % 3600) / 60)
+    }
+}
+
+/// Tính nhanh summary khi trận đang diễn ra (chưa kết thúc để có summary đầy đủ từ watcher).
+fn synthesize_live_summary(rep: &mut report::GameReport) {
+    if rep.samples.is_empty() {
+        if rep.summary.verdict.is_empty() {
+            rep.summary.verdict = vec!["Đang thu thập mẫu số liệu trận đấu...".to_string()];
+        }
+        return;
+    }
+    let last_t = rep.samples.last().map(|s| s.t).unwrap_or(0.0);
+    rep.summary.duration_sec = last_t as u64;
+
+    let mut min_avail = f32::MAX;
+    let mut sum_avail = 0.0_f32;
+    let mut max_commit_pct = 0.0_f32;
+    let mut max_commit_gb = 0.0_f32;
+    let mut sum_cpu = 0.0_f32;
+    let mut max_cpu = 0.0_f32;
+    let mut net_pings = Vec::new();
+    let mut sum_gw = 0.0_f32;
+    let mut count_gw = 0;
+    let mut sum_loss_net = 0.0_f32;
+    let mut sum_loss_gw = 0.0_f32;
+
+    for s in &rep.samples {
+        if s.avail_gb < min_avail { min_avail = s.avail_gb; }
+        sum_avail += s.avail_gb;
+        if s.commit_pct > max_commit_pct { max_commit_pct = s.commit_pct; }
+        if s.commit_gb > max_commit_gb { max_commit_gb = s.commit_gb; }
+        sum_cpu += s.cpu_pct;
+        if s.cpu_pct > max_cpu { max_cpu = s.cpu_pct; }
+        if let Some(p) = s.ping_net_ms {
+            net_pings.push(p);
+        }
+        if let Some(p) = s.ping_gw_ms {
+            sum_gw += p;
+            count_gw += 1;
+        }
+        sum_loss_net += s.loss_net_pct;
+        sum_loss_gw += s.loss_gw_pct;
+    }
+
+    let n = rep.samples.len() as f32;
+    rep.summary.ram_avail_min_gb = if min_avail == f32::MAX { 0.0 } else { min_avail };
+    rep.summary.ram_avail_avg_gb = sum_avail / n;
+    rep.summary.commit_peak_pct = max_commit_pct;
+    rep.summary.commit_peak_gb = max_commit_gb;
+    rep.summary.cpu_avg_pct = sum_cpu / n;
+    rep.summary.cpu_peak_pct = max_cpu;
+    rep.summary.loss_net_pct = sum_loss_net / n;
+    rep.summary.loss_gw_pct = sum_loss_gw / n;
+    if count_gw > 0 {
+        rep.summary.ping_gw_avg_ms = Some(sum_gw / count_gw as f32);
+    }
+    if !net_pings.is_empty() {
+        let sum_p: f32 = net_pings.iter().sum();
+        rep.summary.ping_net_avg_ms = Some(sum_p / net_pings.len() as f32);
+        net_pings.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let p95_idx = ((net_pings.len() as f32 * 0.95).round() as usize).min(net_pings.len() - 1);
+        rep.summary.ping_net_p95_ms = Some(net_pings[p95_idx]);
+        rep.summary.ping_net_max_ms = net_pings.last().copied();
+
+        let mut sum_diff = 0.0_f32;
+        let mut diff_count = 0;
+        for i in 1..net_pings.len() {
+            sum_diff += (net_pings[i] - net_pings[i - 1]).abs();
+            diff_count += 1;
+        }
+        if diff_count > 0 {
+            rep.summary.jitter_net_ms = Some(sum_diff / diff_count as f32);
+        }
+    }
+    rep.summary.standby_purges = rep.events.iter().filter(|e| e.kind == "purge").count() as u32;
+    if rep.summary.verdict.is_empty() {
+        rep.summary.verdict = vec!["Trận đang diễn ra — số liệu được cập nhật theo thời gian thực mỗi 5 giây.".to_string()];
+    }
+}
+
+/// Một ô hiển thị chỉ số nhỏ trong tổng kết trận đấu.
+fn render_metric_box(
+    ui: &mut egui::Ui,
+    title: &str,
+    primary_value: &str,
+    secondary_value: Option<&str>,
+    value_color: Color32,
+) {
+    ui::card(ui, |ui| {
+        ui.label(
+            RichText::new(title.to_uppercase())
+                .size(9.5)
+                .extra_letter_spacing(0.8)
+                .color(ui::TEXT_MUTED),
+        );
+        ui.add_space(2.0);
+        ui.label(
+            RichText::new(primary_value)
+                .size(15.0)
+                .strong()
+                .color(value_color),
+        );
+        if let Some(sub) = secondary_value {
+            ui.label(
+                RichText::new(sub)
+                    .size(9.5)
+                    .color(ui::TEXT_DIM),
+            );
+        } else {
+            ui.add_space(12.0);
+        }
+    });
+}
+
+/// Vẽ các vạch dọc mờ thể hiện sự kiện trên các biểu đồ.
+fn render_plot_events(plot_ui: &mut egui_plot::PlotUi, events: &[report::Event]) {
+    for ev in events {
+        let x = (ev.t / 60.0) as f64;
+        let color = match ev.kind.as_str() {
+            "optimize" => ui::ACCENT,
+            "purge" => ui::DATA_CYAN,
+            "commit_warn" => ui::DANGER,
+            "ping_spike" => ui::WARNING,
+            "restore" => ui::SUCCESS,
+            _ => ui::TEXT_MUTED,
+        };
+        let stroke = Stroke::new(
+            1.0_f32,
+            Color32::from_rgba_premultiplied(color.r(), color.g(), color.b(), 110),
+        );
+        let vline = VLine::new(x)
+            .name(format!("{}: {}", ev.kind, ev.text))
+            .stroke(stroke)
+            .style(LineStyle::Dashed { length: 4.0 });
+        plot_ui.vline(vline);
+    }
+}
+
+/// Biểu đồ (a): RAM Khả dụng và Standby (GB).
+fn render_plot_ram(ui: &mut egui::Ui, report: &report::GameReport) {
+    ui::card(ui, |ui| {
+        ui::section_header(ui, "// RAM", "RAM Khả dụng & Standby", Some("GB theo thời gian (phút)"));
+        ui.add_space(6.0);
+
+        let avail_pts: Vec<[f64; 2]> = report.samples.iter()
+            .map(|s| [(s.t / 60.0) as f64, s.avail_gb as f64])
+            .collect();
+        let standby_pts: Vec<[f64; 2]> = report.samples.iter()
+            .map(|s| [(s.t / 60.0) as f64, s.standby_gb.unwrap_or(0.0) as f64])
+            .collect();
+
+        let l_avail = Line::new(PlotPoints::new(avail_pts))
+            .name("Khả dụng (GB)")
+            .color(ui::DATA_CYAN)
+            .width(1.5_f32);
+        let l_standby = Line::new(PlotPoints::new(standby_pts))
+            .name("Standby (GB)")
+            .color(ui::ACCENT)
+            .width(1.5_f32);
+
+        let plot = Plot::new("plot_ram")
+            .height(175.0)
+            .show_background(false)
+            .show_axes([true, true])
+            .show_grid([true, true])
+            .allow_scroll(false)
+            .allow_drag(false)
+            .allow_zoom(false)
+            .include_y(0.0)
+            .legend(egui_plot::Legend::default().position(egui_plot::Corner::RightTop))
+            .x_axis_formatter(|mark, _| format!("{:.1}m", mark.value))
+            .y_axis_formatter(|mark, _| format!("{:.1} GB", mark.value))
+            .label_formatter(|name, val| {
+                if !name.is_empty() {
+                    format!("{}: {:.2} GB · {:.1}m", name, val.y, val.x)
+                } else {
+                    format!("{:.2} GB · {:.1}m", val.y, val.x)
+                }
+            });
+
+        plot.show(ui, |plot_ui| {
+            plot_ui.line(l_avail);
+            plot_ui.line(l_standby);
+            render_plot_events(plot_ui, &report.events);
+        });
+    });
+}
+
+/// Biểu đồ (b): Bộ nhớ ảo Commit % kèm vạch ngang 90% màu đỏ.
+fn render_plot_commit(ui: &mut egui::Ui, report: &report::GameReport) {
+    ui::card(ui, |ui| {
+        ui::section_header(ui, "// COMMIT", "Bộ nhớ ảo (Commit %)", Some("Vạch đỏ nguy hiểm 90%"));
+        ui.add_space(6.0);
+
+        let commit_pts: Vec<[f64; 2]> = report.samples.iter()
+            .map(|s| [(s.t / 60.0) as f64, s.commit_pct as f64])
+            .collect();
+
+        let l_commit = Line::new(PlotPoints::new(commit_pts))
+            .name("Commit (%)")
+            .color(ui::ACCENT)
+            .width(1.5_f32);
+
+        let h_warn = HLine::new(90.0)
+            .name("Cảnh báo 90%")
+            .color(ui::DANGER)
+            .stroke(Stroke::new(1.2_f32, ui::DANGER))
+            .style(LineStyle::Dashed { length: 5.0 });
+
+        let plot = Plot::new("plot_commit")
+            .height(175.0)
+            .show_background(false)
+            .show_axes([true, true])
+            .show_grid([true, true])
+            .allow_scroll(false)
+            .allow_drag(false)
+            .allow_zoom(false)
+            .include_y(0.0)
+            .include_y(100.0)
+            .legend(egui_plot::Legend::default().position(egui_plot::Corner::RightTop))
+            .x_axis_formatter(|mark, _| format!("{:.1}m", mark.value))
+            .y_axis_formatter(|mark, _| format!("{:.0}%", mark.value))
+            .label_formatter(|name, val| {
+                if !name.is_empty() {
+                    format!("{}: {:.1}% · {:.1}m", name, val.y, val.x)
+                } else {
+                    format!("{:.1}% · {:.1}m", val.y, val.x)
+                }
+            });
+
+        plot.show(ui, |plot_ui| {
+            plot_ui.line(l_commit);
+            plot_ui.hline(h_warn);
+            render_plot_events(plot_ui, &report.events);
+        });
+    });
+}
+
+/// Biểu đồ (c): CPU % toàn hệ thống.
+fn render_plot_cpu(ui: &mut egui::Ui, report: &report::GameReport) {
+    ui::card(ui, |ui| {
+        ui::section_header(ui, "// CPU", "Tải CPU (%)", Some("Toàn hệ thống theo thời gian (phút)"));
+        ui.add_space(6.0);
+
+        let cpu_pts: Vec<[f64; 2]> = report.samples.iter()
+            .map(|s| [(s.t / 60.0) as f64, s.cpu_pct as f64])
+            .collect();
+
+        let l_cpu = Line::new(PlotPoints::new(cpu_pts))
+            .name("CPU (%)")
+            .color(Color32::from_rgb(130, 180, 255))
+            .width(1.5_f32);
+
+        let plot = Plot::new("plot_cpu")
+            .height(175.0)
+            .show_background(false)
+            .show_axes([true, true])
+            .show_grid([true, true])
+            .allow_scroll(false)
+            .allow_drag(false)
+            .allow_zoom(false)
+            .include_y(0.0)
+            .include_y(100.0)
+            .legend(egui_plot::Legend::default().position(egui_plot::Corner::RightTop))
+            .x_axis_formatter(|mark, _| format!("{:.1}m", mark.value))
+            .y_axis_formatter(|mark, _| format!("{:.0}%", mark.value))
+            .label_formatter(|name, val| {
+                if !name.is_empty() {
+                    format!("{}: {:.1}% · {:.1}m", name, val.y, val.x)
+                } else {
+                    format!("{:.1}% · {:.1}m", val.y, val.x)
+                }
+            });
+
+        plot.show(ui, |plot_ui| {
+            plot_ui.line(l_cpu);
+            render_plot_events(plot_ui, &report.events);
+        });
+    });
+}
+
+/// Biểu đồ (d): Ping Internet và Router (ms), các điểm mất gói đánh dấu đỏ.
+fn render_plot_ping(ui: &mut egui::Ui, report: &report::GameReport) {
+    ui::card(ui, |ui| {
+        ui::section_header(ui, "// NET", "Độ trễ Ping & Mất gói", Some("Internet & Router (ms)"));
+        ui.add_space(6.0);
+
+        let mut net_pts = Vec::new();
+        let mut gw_pts = Vec::new();
+        let mut loss_pts = Vec::new();
+
+        for s in &report.samples {
+            let t_min = (s.t / 60.0) as f64;
+            if let Some(p) = s.ping_net_ms {
+                net_pts.push([t_min, p as f64]);
+            }
+            if let Some(p) = s.ping_gw_ms {
+                gw_pts.push([t_min, p as f64]);
+            }
+            if s.loss_net_pct > 0.0 || s.loss_gw_pct > 0.0 || s.ping_net_ms.is_none() {
+                let y = s.ping_net_ms.or(s.ping_gw_ms).unwrap_or(0.0) as f64;
+                loss_pts.push([t_min, y]);
+            }
+        }
+
+        let l_net = Line::new(PlotPoints::new(net_pts))
+            .name("Internet (ms)")
+            .color(ui::DATA_CYAN)
+            .width(1.5_f32);
+        let l_gw = Line::new(PlotPoints::new(gw_pts))
+            .name("Router (ms)")
+            .color(ui::SUCCESS)
+            .width(1.2_f32);
+
+        let plot = Plot::new("plot_ping")
+            .height(175.0)
+            .show_background(false)
+            .show_axes([true, true])
+            .show_grid([true, true])
+            .allow_scroll(false)
+            .allow_drag(false)
+            .allow_zoom(false)
+            .include_y(0.0)
+            .legend(egui_plot::Legend::default().position(egui_plot::Corner::RightTop))
+            .x_axis_formatter(|mark, _| format!("{:.1}m", mark.value))
+            .y_axis_formatter(|mark, _| format!("{:.0} ms", mark.value))
+            .label_formatter(|name, val| {
+                if !name.is_empty() {
+                    format!("{}: {:.1} ms · {:.1}m", name, val.y, val.x)
+                } else {
+                    format!("{:.1} ms · {:.1}m", val.y, val.x)
+                }
+            });
+
+        plot.show(ui, |plot_ui| {
+            plot_ui.line(l_net);
+            plot_ui.line(l_gw);
+            if !loss_pts.is_empty() {
+                let p_loss = Points::new(PlotPoints::new(loss_pts))
+                    .name("Mất gói")
+                    .color(ui::DANGER)
+                    .radius(4.0_f32)
+                    .shape(MarkerShape::Cross);
+                plot_ui.points(p_loss);
+            }
+            render_plot_events(plot_ui, &report.events);
+        });
+    });
+}
+
+fn render_report_detail(
+    ui: &mut egui::Ui,
+    report: &report::GameReport,
+    is_live: bool,
+    delete_confirm: &Option<(String, Instant)>,
+    delete_req: &mut Option<String>,
+    confirm_req: &mut Option<String>,
+) {
+    // 1. Header chi tiết: Tên game, ngày bắt đầu, nút xoá
+    ui::card(ui, |ui| {
+        ui.horizontal(|ui| {
+            let game_title = clean_game_name(&report.game);
+            ui.label(
+                RichText::new(game_title.to_uppercase())
+                    .size(15.0)
+                    .strong()
+                    .extra_letter_spacing(1.0)
+                    .color(ui::TEXT_MAIN),
+            );
+            ui.add_space(8.0);
+
+            if is_live {
+                ui.label(
+                    RichText::new("● ĐANG GHI SỐ LIỆU")
+                        .size(11.0)
+                        .strong()
+                        .color(ui::DANGER),
+                );
+            } else {
+                ui.label(
+                    RichText::new(format!("{}  ·  ID: {}", report.started_at, report.id))
+                        .size(10.5)
+                        .monospace()
+                        .color(ui::TEXT_DIM),
+                );
+            }
+
+            if !is_live {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let is_confirming = match delete_confirm {
+                        Some((ref id, inst)) if id == &report.id && inst.elapsed() < Duration::from_secs(3) => {
+                            let rem = (3.0 - inst.elapsed().as_secs_f32()).max(0.1);
+                            Some(rem)
+                        }
+                        _ => None,
+                    };
+
+                    if let Some(rem_sec) = is_confirming {
+                        let btn_text = format!("⚠ Bấm lại để xoá ({:.0}s)", rem_sec.ceil());
+                        if ui.add(ui::danger_button_sized(btn_text, 11.0)).clicked() {
+                            *delete_req = Some(report.id.clone());
+                        }
+                    } else if ui.add(ui::ghost_button_sized("🗑 Xoá báo cáo", 11.0)).clicked() {
+                        *confirm_req = Some(report.id.clone());
+                    }
+                });
+            }
+        });
+    });
+
+    ui.add_space(ui::SPACE_CARD_GAP);
+
+    // 2. Hàng thẻ chỉ số (9 chỉ số)
+    ui::card(ui, |ui| {
+        ui::section_header(ui, "// STATS", "Chỉ số tổng kết trận", None);
+        ui.add_space(8.0);
+
+        let sum = &report.summary;
+        let dur_text = format_duration(sum.duration_sec);
+        let ram_min_text = format!("{:.2} GB", sum.ram_avail_min_gb);
+        let ram_color = if sum.ram_avail_min_gb < 1.0 {
+            ui::DANGER
+        } else if sum.ram_avail_min_gb < 2.0 {
+            ui::WARNING
+        } else {
+            ui::SUCCESS
+        };
+
+        let commit_color = if sum.commit_peak_pct >= 90.0 {
+            ui::DANGER
+        } else if sum.commit_peak_pct >= 80.0 {
+            ui::ACCENT
+        } else {
+            ui::SUCCESS
+        };
+        let commit_text = format!("{:.1}%", sum.commit_peak_pct);
+        let commit_sub = format!("{:.1} GB đỉnh", sum.commit_peak_gb);
+
+        let cpu_text = format!("{:.0}% / {:.0}%", sum.cpu_avg_pct, sum.cpu_peak_pct);
+
+        let ping_text = match (sum.ping_net_avg_ms, sum.ping_net_p95_ms, sum.ping_net_max_ms) {
+            (Some(a), Some(p), Some(m)) => format!("{:.0}/{:.0}/{:.0} ms", a, p, m),
+            (Some(a), _, _) => format!("{:.0} ms", a),
+            _ => "—".to_string(),
+        };
+
+        let jitter_text = sum.jitter_net_ms.map(|j| format!("{:.1} ms", j)).unwrap_or_else(|| "—".to_string());
+
+        let loss_text = format!("{:.1}%", sum.loss_net_pct);
+        let loss_color = if sum.loss_net_pct > 0.0 { ui::DANGER } else { ui::SUCCESS };
+
+        let gw_text = sum.ping_gw_avg_ms.map(|g| format!("{:.1} ms", g)).unwrap_or_else(|| "—".to_string());
+        let gw_sub = format!("Loss: {:.1}%", sum.loss_gw_pct);
+
+        let purge_text = format!("{} lần", sum.standby_purges);
+
+        let is_wide = ui.available_width() >= 540.0;
+        if is_wide {
+            ui.columns(3, |cols| {
+                render_metric_box(&mut cols[0], "Thời lượng", &dur_text, Some(&format!("Bắt đầu: {}", format_short_date(&report.started_at))), ui::TEXT_MAIN);
+                cols[0].add_space(8.0);
+                render_metric_box(&mut cols[0], "RAM trống thấp nhất", &ram_min_text, Some(&format!("TB: {:.2} GB", sum.ram_avail_avg_gb)), ram_color);
+                cols[0].add_space(8.0);
+                render_metric_box(&mut cols[0], "Commit đỉnh", &commit_text, Some(&commit_sub), commit_color);
+
+                render_metric_box(&mut cols[1], "CPU TB / Đỉnh", &cpu_text, Some("Toàn hệ thống"), ui::DATA_CYAN);
+                cols[1].add_space(8.0);
+                render_metric_box(&mut cols[1], "Ping Net TB/P95/Max", &ping_text, Some("Internet"), ui::DATA_CYAN);
+                cols[1].add_space(8.0);
+                render_metric_box(&mut cols[1], "Jitter độ trễ", &jitter_text, Some("Biên độ dao động"), ui::TEXT_MAIN);
+
+                render_metric_box(&mut cols[2], "Mất gói Net", &loss_text, Some("Tỉ lệ rớt gói"), loss_color);
+                cols[2].add_space(8.0);
+                render_metric_box(&mut cols[2], "Ping Router TB", &gw_text, Some(&gw_sub), ui::SUCCESS);
+                cols[2].add_space(8.0);
+                render_metric_box(&mut cols[2], "Xả Standby", &purge_text, Some("Giải phóng RAM"), ui::ACCENT);
+            });
+        } else {
+            ui.columns(2, |cols| {
+                render_metric_box(&mut cols[0], "Thời lượng", &dur_text, None, ui::TEXT_MAIN);
+                cols[0].add_space(8.0);
+                render_metric_box(&mut cols[0], "RAM trống thấp nhất", &ram_min_text, None, ram_color);
+                cols[0].add_space(8.0);
+                render_metric_box(&mut cols[0], "Commit đỉnh", &commit_text, Some(&commit_sub), commit_color);
+                cols[0].add_space(8.0);
+                render_metric_box(&mut cols[0], "CPU TB / Đỉnh", &cpu_text, None, ui::DATA_CYAN);
+                cols[0].add_space(8.0);
+                render_metric_box(&mut cols[0], "Xả Standby", &purge_text, None, ui::ACCENT);
+
+                render_metric_box(&mut cols[1], "Ping Net TB/P95/Max", &ping_text, None, ui::DATA_CYAN);
+                cols[1].add_space(8.0);
+                render_metric_box(&mut cols[1], "Jitter độ trễ", &jitter_text, None, ui::TEXT_MAIN);
+                cols[1].add_space(8.0);
+                render_metric_box(&mut cols[1], "Mất gói Net", &loss_text, None, loss_color);
+                cols[1].add_space(8.0);
+                render_metric_box(&mut cols[1], "Ping Router TB", &gw_text, Some(&gw_sub), ui::SUCCESS);
+            });
+        }
+    });
+
+    ui.add_space(ui::SPACE_CARD_GAP);
+
+    // 3. Khối nhận xét (verdict)
+    ui::card(ui, |ui| {
+        ui::section_header(ui, "// VERDICT", "Đánh giá & Nhận xét", None);
+        ui.add_space(8.0);
+
+        if report.summary.verdict.is_empty() {
+            ui.label(
+                RichText::new("Chưa có nhận xét cho trận này.")
+                    .size(11.0)
+                    .color(ui::TEXT_DIM),
+            );
+        } else {
+            for line in &report.summary.verdict {
+                ui::verdict_callout(ui, line);
+                ui.add_space(4.0);
+            }
+        }
+    });
+
+    ui.add_space(ui::SPACE_CARD_GAP);
+
+    // 4. 4 biểu đồ đường
+    if report.samples.is_empty() {
+        ui::card(ui, |ui| {
+            ui.add_space(20.0);
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    RichText::new("⏳ Đang thu thập mẫu số liệu trận đấu...")
+                        .size(12.0)
+                        .color(ui::TEXT_MUTED),
+                );
+            });
+            ui.add_space(20.0);
+        });
+    } else {
+        let is_wide = ui.available_width() >= 620.0;
+        if is_wide {
+            ui.columns(2, |cols| {
+                render_plot_ram(&mut cols[0], report);
+                render_plot_commit(&mut cols[1], report);
+            });
+            ui.add_space(ui::SPACE_CARD_GAP);
+            ui.columns(2, |cols| {
+                render_plot_cpu(&mut cols[0], report);
+                render_plot_ping(&mut cols[1], report);
+            });
+        } else {
+            render_plot_ram(ui, report);
+            ui.add_space(ui::SPACE_CARD_GAP);
+            render_plot_commit(ui, report);
+            ui.add_space(ui::SPACE_CARD_GAP);
+            render_plot_cpu(ui, report);
+            ui.add_space(ui::SPACE_CARD_GAP);
+            render_plot_ping(ui, report);
+        }
+    }
+}
+
+impl App {
+    fn render_reports_tab(&mut self, ui: &mut egui::Ui) {
+        if self.reports_cache.is_none() {
+            self.refresh_reports();
+        }
+
+        let live_report_arc = self.sh.live_report.lock().unwrap().clone();
+        let reports_list = self.reports_cache.as_ref().cloned().unwrap_or_default();
+
+        // Mặc định chọn nếu chưa có lựa chọn
+        if self.selected_report_id.is_none() {
+            if live_report_arc.is_some() {
+                self.selected_report_id = Some("live".into());
+            } else if let Some(first) = reports_list.first() {
+                self.selected_report_id = Some(first.id.clone());
+                self.cached_report = report::load_report(&first.id);
+            }
+        }
+
+        let total_w = ui.available_width();
+        let list_w = 260.0_f32.min(total_w * 0.45).max(180.0);
+        let detail_w = (total_w - list_w - ui::SPACE_CARD_GAP).max(180.0);
+
+        let mut refresh_requested = false;
+        let mut select_action: Option<String> = None;
+        let mut delete_req: Option<String> = None;
+        let mut confirm_req: Option<String> = None;
+
+        ui.horizontal_top(|ui| {
+            // CỘT TRÁI TAB: DANH SÁCH BÁO CÁO (~260px)
+            ui.allocate_ui_with_layout(
+                vec2(list_w, ui.available_height()),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui::card(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui::section_header(ui, "// LIST", "Danh sách", None);
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.add(ui::ghost_button_sized("🔄 Làm mới", 10.5)).clicked() {
+                                    refresh_requested = true;
+                                }
+                            });
+                        });
+                        ui.add_space(8.0);
+
+                        egui::ScrollArea::vertical()
+                            .id_salt("reports_list_scroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                // 1. Trận đang ghi (nếu có)
+                                if let Some(ref l_arc) = live_report_arc {
+                                    let (game_name, dur_sec) = {
+                                        let l = l_arc.lock().unwrap();
+                                        (clean_game_name(&l.report.game), l.report.samples.last().map(|s| s.t as u64).unwrap_or(0))
+                                    };
+                                    let is_sel = self.selected_report_id.as_deref() == Some("live");
+                                    if ui::report_list_row(
+                                        ui,
+                                        is_sel,
+                                        "● ĐANG GHI",
+                                        &game_name,
+                                        &format_duration(dur_sec),
+                                        ui::DANGER,
+                                        true,
+                                    ).clicked() {
+                                        select_action = Some("live".to_string());
+                                    }
+                                    ui.add_space(4.0);
+                                }
+
+                                // 2. Các file báo cáo trên đĩa
+                                if reports_list.is_empty() && live_report_arc.is_none() {
+                                    ui.add_space(20.0);
+                                    ui.label(
+                                        RichText::new("Chưa có báo cáo nào.")
+                                            .size(11.0)
+                                            .color(ui::TEXT_DIM),
+                                    );
+                                } else {
+                                    for meta in &reports_list {
+                                        let is_sel = self.selected_report_id.as_deref() == Some(&meta.id);
+                                        let status_col = if meta.commit_peak_pct >= 90.0 {
+                                            ui::DANGER
+                                        } else if meta.commit_peak_pct >= 80.0 {
+                                            ui::ACCENT
+                                        } else {
+                                            ui::SUCCESS
+                                        };
+                                        let time_str = format_short_date(&meta.started_at);
+                                        let game_short = clean_game_name(&meta.game);
+                                        let dur_str = format_duration(meta.duration_sec);
+
+                                        if ui::report_list_row(
+                                            ui,
+                                            is_sel,
+                                            &time_str,
+                                            &game_short,
+                                            &dur_str,
+                                            status_col,
+                                            false,
+                                        ).clicked() {
+                                            select_action = Some(meta.id.clone());
+                                        }
+                                        ui.add_space(4.0);
+                                    }
+                                }
+                            });
+                    });
+                },
+            );
+
+            ui.add_space(ui::SPACE_CARD_GAP);
+
+            // CỘT PHẢI TAB: CHI TIẾT BÁO CÁO ĐANG CHỌN
+            ui.allocate_ui_with_layout(
+                vec2(detail_w, ui.available_height()),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    let is_live_sel = self.selected_report_id.as_deref() == Some("live");
+                    let report_opt: Option<report::GameReport> = if is_live_sel {
+                        live_report_arc.as_ref().map(|l| {
+                            let live = l.lock().unwrap();
+                            let mut rep = live.report.clone();
+                            synthesize_live_summary(&mut rep);
+                            rep
+                        })
+                    } else if let Some(ref rep) = self.cached_report {
+                        Some(rep.clone())
+                    } else if let Some(ref id) = self.selected_report_id {
+                        let loaded = report::load_report(id);
+                        self.cached_report = loaded.clone();
+                        loaded
+                    } else {
+                        None
+                    };
+
+                    if let Some(rep) = report_opt {
+                        egui::ScrollArea::vertical()
+                            .id_salt("report_detail_scroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                render_report_detail(
+                                    ui,
+                                    &rep,
+                                    is_live_sel,
+                                    &self.delete_confirm,
+                                    &mut delete_req,
+                                    &mut confirm_req,
+                                );
+                            });
+                    } else {
+                        ui::card(ui, |ui| {
+                            ui.add_space(40.0);
+                            ui.vertical_centered(|ui| {
+                                ui.label(
+                                    RichText::new("📊")
+                                        .size(36.0)
+                                        .color(ui::ACCENT),
+                                );
+                                ui.add_space(10.0);
+                                ui.label(
+                                    RichText::new("CHƯA CÓ BÁO CÁO TRẬN")
+                                        .size(14.0)
+                                        .strong()
+                                        .extra_letter_spacing(1.0)
+                                        .color(ui::TEXT_MAIN),
+                                );
+                                ui.add_space(8.0);
+                                ui.label(
+                                    RichText::new("Mở game trong danh sách, GameMode sẽ tự ghi số liệu và lưu báo cáo khi bạn tắt game.")
+                                        .size(11.5)
+                                        .color(ui::TEXT_MUTED),
+                                );
+                            });
+                            ui.add_space(40.0);
+                        });
+                    }
+                },
+            );
+        });
+
+        // Xử lý các action sau closure layout
+        if refresh_requested {
+            self.refresh_reports();
+        }
+        if let Some(id) = select_action {
+            self.select_report(&id);
+        }
+        if let Some(id) = delete_req {
+            report::delete_report(&id);
+            self.delete_confirm = None;
+            self.cached_report = None;
+            self.refresh_reports();
+        } else if let Some(id) = confirm_req {
+            self.delete_confirm = Some((id, Instant::now()));
+        }
+    }
+}
+
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.start_hidden {
@@ -2806,7 +3655,17 @@ impl eframe::App for App {
             self.task_on = sys::task_exists();
             self.last_task_check = Instant::now();
         }
-        ctx.request_repaint_after(Duration::from_millis(400));
+        // Commit từ sys::commit() cho thẻ Pagefile (tối đa mỗi 2 giây).
+        if self.last_commit_sys.elapsed() > Duration::from_millis(2000) {
+            self.commit_sys = sys::commit();
+            self.last_commit_sys = Instant::now();
+        }
+        // Với trận đang ghi: repaint mỗi ~2 giây khi tab Báo cáo đang mở
+        if self.tab == ConfigTab::Reports && self.sh.live_report.lock().unwrap().is_some() {
+            ctx.request_repaint_after(Duration::from_secs(2));
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(400));
+        }
         let sh = self.sh.clone();
 
         // Đóng cửa sổ (nút X trên title bar, Alt+F4, ...): mặc định thu xuống khay hệ thống,
@@ -2867,6 +3726,12 @@ impl eframe::App for App {
             .show(ctx, |ui| {
                 ui::paint_background_grid(ui);
 
+                // Banner cảnh báo commit ở đầu cột trái khi commit_alert = true
+                if sh.commit_alert.load(Ordering::SeqCst) {
+                    ui::render_commit_alert_banner(ui, sh.commit_pct());
+                    ui.add_space(ui::SPACE_CARD_GAP);
+                }
+
                 // 1. Hai thẻ RAM vật lý và Pagefile nằm cạnh nhau
                 let m = self.mem;
                 let ram_used = m.total - m.avail;
@@ -2892,6 +3757,12 @@ impl eframe::App for App {
                     ui::ACCENT
                 };
 
+                let commit_extra = format!(
+                    "Commit {:.1} / {:.1} GB",
+                    self.commit_sys.0 as f64 / GB,
+                    self.commit_sys.1 as f64 / GB,
+                );
+
                 ui.columns(2, |cols| {
                     render_stat_card(
                         &mut cols[0],
@@ -2911,7 +3782,7 @@ impl eframe::App for App {
                         m.commit_limit as f64 / GB,
                         commit_ratio,
                         commit_color,
-                        None,
+                        Some(&commit_extra),
                     );
                 });
 
@@ -3116,6 +3987,19 @@ impl eframe::App for App {
                     );
                     if ui.add(auto_tab_btn).clicked() {
                         self.tab = ConfigTab::AutoOpt;
+                    }
+
+                    let is_rep = self.tab == ConfigTab::Reports;
+                    let rep_tab_btn = ui::tab_button(
+                        "📊 Báo cáo trận",
+                        is_rep,
+                        ui::ACCENT,
+                    );
+                    if ui.add(rep_tab_btn).clicked() {
+                        self.tab = ConfigTab::Reports;
+                        if self.reports_cache.is_none() {
+                            self.refresh_reports();
+                        }
                     }
                 });
 
@@ -3392,6 +4276,9 @@ impl eframe::App for App {
                                     self.save();
                                 }
                             });
+                    }
+                    ConfigTab::Reports => {
+                        self.render_reports_tab(ui);
                     }
                 }
             });

@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 eframe = { version = "0.29", default-features = false, features = ["glow", "default_fonts"] }
+egui_plot = "0.29"
 winreg = "0.52"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",

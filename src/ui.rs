@@ -1257,3 +1257,318 @@ pub fn handle_window_resize_and_border(ctx: &egui::Context) {
         }
     }
 }
+
+// ==========================================
+// BANNER CẢNH BÁO COMMIT (BỘ NHỚ ẢO SẮP CẠN)
+// ==========================================
+/// Banner cảnh báo ở đầu cột trái khi `commit_alert = true`.
+/// Nền đỏ sẫm, viền đỏ nhấp nháy nhẹ, icon ⚠ painter, chữ cảnh báo.
+pub fn render_commit_alert_banner(ui: &mut egui::Ui, commit_pct: f32) {
+    let avail_w = ui.available_width();
+    let pad_x = 12.0_f32;
+    let pad_y = 10.0_f32;
+
+    let time = ui.input(|i| i.time);
+    ui.ctx().request_repaint();
+    let pulse = ((time * 4.0).sin().abs() as f32).clamp(0.25, 1.0);
+    let border_color = Color32::from_rgba_premultiplied(
+        255,
+        (40.0 * pulse) as u8,
+        (40.0 * pulse) as u8,
+        (130.0 + 125.0 * pulse) as u8,
+    );
+    let bg_color = Color32::from_rgb(38, 10, 14);
+
+    let text_w = (avail_w - pad_x * 2.0 - 28.0).max(60.0);
+    let title_galley = ui.painter().layout(
+        format!("COMMIT {:.0}% — bộ nhớ ảo sắp cạn, nguy cơ văng game", commit_pct),
+        FontId::proportional(11.5),
+        Color32::from_rgb(255, 220, 220),
+        text_w,
+    );
+    let sub_galley = ui.painter().layout(
+        "Tăng pagefile 16–24 GB hoặc thêm RAM".to_string(),
+        FontId::proportional(10.5),
+        Color32::from_rgb(220, 150, 150),
+        text_w,
+    );
+
+    let content_h = title_galley.size().y + sub_galley.size().y + 3.0;
+    let total_h = content_h + pad_y * 2.0;
+
+    let (rect, _) = ui.allocate_exact_size(vec2(avail_w, total_h), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+
+    let c = 6.0_f32;
+    let points = vec![
+        pos2(rect.left() + c, rect.top()),
+        pos2(rect.right(), rect.top()),
+        pos2(rect.right(), rect.bottom() - c),
+        pos2(rect.right() - c, rect.bottom()),
+        pos2(rect.left(), rect.bottom()),
+        pos2(rect.left(), rect.top() + c),
+    ];
+    painter.add(egui::Shape::convex_polygon(
+        points,
+        bg_color,
+        Stroke::new(1.5_f32, border_color),
+    ));
+
+    // Icon tam giác ⚠ vẽ bằng painter
+    let icon_cx = rect.left() + pad_x + 8.0;
+    let icon_cy = rect.top() + total_h / 2.0;
+    let icon_stroke = Stroke::new(1.8_f32, DANGER);
+    let tri_pts = vec![
+        pos2(icon_cx, icon_cy - 8.0),
+        pos2(icon_cx + 8.5, icon_cy + 7.0),
+        pos2(icon_cx - 8.5, icon_cy + 7.0),
+    ];
+    painter.add(egui::Shape::closed_line(tri_pts, icon_stroke));
+    painter.line_segment(
+        [pos2(icon_cx, icon_cy - 3.5), pos2(icon_cx, icon_cy + 1.5)],
+        Stroke::new(1.6_f32, DANGER),
+    );
+    painter.circle_filled(pos2(icon_cx, icon_cy + 4.5), 1.0, DANGER);
+
+    let text_x = rect.left() + pad_x + 24.0;
+    let text_y = rect.top() + pad_y;
+    painter.galley(pos2(text_x, text_y), title_galley, Color32::from_rgb(255, 220, 220));
+    painter.galley(
+        pos2(text_x, text_y + content_h - sub_galley.size().y),
+        sub_galley,
+        Color32::from_rgb(220, 150, 150),
+    );
+}
+
+// ==========================================
+// CALLOUT NHẬN XÉT BÁO CÁO (VERDICT)
+// ==========================================
+/// Mỗi dòng nhận xét trong báo cáo: tô cam/đỏ nếu chứa Commit, văng, Wi-Fi; còn lại xanh.
+pub fn verdict_callout(ui: &mut egui::Ui, text: &str) {
+    let is_danger = text.contains("Commit") || text.contains("văng");
+    let is_warning = !is_danger && (text.contains("Wi-Fi") || text.contains("wifi") || text.contains("Wifi"));
+
+    let (accent_color, bg_color, text_color, icon) = if is_danger {
+        (
+            DANGER,
+            Color32::from_rgb(32, 12, 14),
+            Color32::from_rgb(255, 205, 205),
+            "⚠",
+        )
+    } else if is_warning {
+        (
+            WARNING,
+            Color32::from_rgb(28, 20, 10),
+            Color32::from_rgb(255, 220, 180),
+            "⚡",
+        )
+    } else {
+        (
+            SUCCESS,
+            Color32::from_rgb(10, 24, 16),
+            Color32::from_rgb(200, 255, 220),
+            "✔",
+        )
+    };
+
+    let avail_w = ui.available_width();
+    let pad_x = 10.0_f32;
+    let pad_y = 7.0_f32;
+    let text_w = (avail_w - pad_x * 2.0 - 24.0).max(60.0);
+
+    let galley = ui.painter().layout(
+        format!("{}  {}", icon, text),
+        FontId::proportional(11.5),
+        text_color,
+        text_w,
+    );
+
+    let total_h = galley.size().y + pad_y * 2.0;
+    let (rect, _) = ui.allocate_exact_size(vec2(avail_w, total_h), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+
+    painter.rect_filled(rect, Rounding::ZERO, bg_color);
+    let left_bar = Rect::from_min_size(rect.min, vec2(3.0, total_h));
+    painter.rect_filled(left_bar, Rounding::ZERO, accent_color);
+    painter.rect_stroke(
+        rect,
+        Rounding::ZERO,
+        Stroke::new(
+            1.0_f32,
+            Color32::from_rgba_premultiplied(accent_color.r(), accent_color.g(), accent_color.b(), 40),
+        ),
+    );
+
+    painter.galley(pos2(rect.left() + pad_x + 4.0, rect.top() + pad_y), galley, text_color);
+}
+
+// ==========================================
+// DÒNG DANH SÁCH BÁO CÁO (REPORT LIST ROW)
+// ==========================================
+pub fn report_list_row(
+    ui: &mut egui::Ui,
+    selected: bool,
+    title: &str,
+    game: &str,
+    duration: &str,
+    status_color: Color32,
+    is_live: bool,
+) -> egui::Response {
+    let avail_w = ui.available_width();
+    let h = 48.0_f32;
+    let (rect, resp) = ui.allocate_exact_size(vec2(avail_w, h), egui::Sense::click());
+    let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
+
+    let painter = ui.painter_at(rect);
+    let hovered = resp.hovered();
+
+    let bg_fill = if selected {
+        CARD_HOVER
+    } else if hovered {
+        Color32::from_rgb(16, 21, 28)
+    } else {
+        CARD_BG
+    };
+
+    let border_stroke = if selected {
+        Stroke::new(1.0_f32, ACCENT)
+    } else if hovered {
+        Stroke::new(1.0_f32, BORDER)
+    } else {
+        Stroke::new(1.0_f32, Color32::from_rgb(20, 27, 35))
+    };
+
+    let c = 4.0_f32;
+    let points = vec![
+        pos2(rect.left() + c, rect.top()),
+        pos2(rect.right(), rect.top()),
+        pos2(rect.right(), rect.bottom() - c),
+        pos2(rect.right() - c, rect.bottom()),
+        pos2(rect.left(), rect.bottom()),
+        pos2(rect.left(), rect.top() + c),
+    ];
+    painter.add(egui::Shape::convex_polygon(points, bg_fill, border_stroke));
+
+    if selected {
+        let bar = Rect::from_min_size(pos2(rect.left(), rect.top() + c), vec2(3.0, h - c * 2.0));
+        painter.rect_filled(bar, Rounding::ZERO, ACCENT);
+    }
+
+    let pad_x = 10.0_f32;
+    let text_x = rect.left() + pad_x + if selected { 4.0 } else { 0.0 };
+
+    if is_live {
+        let time = ui.input(|i| i.time);
+        ui.ctx().request_repaint();
+        let blink = ((time * 4.0).sin().abs() as f32).clamp(0.2, 1.0);
+        let live_dot_color = Color32::from_rgba_premultiplied(255, 50, 50, (blink * 255.0) as u8);
+
+        painter.circle_filled(pos2(text_x + 4.0, rect.top() + 15.0), 3.5, live_dot_color);
+
+        let title_galley = painter.layout_no_wrap(
+            "● ĐANG GHI".to_string(),
+            FontId::proportional(11.5),
+            Color32::from_rgb(255, 80, 80),
+        );
+        painter.galley(pos2(text_x + 14.0, rect.top() + 8.0), title_galley, Color32::from_rgb(255, 80, 80));
+
+        let sub_text = format!("{} · {}", game, duration);
+        let sub_galley = painter.layout_no_wrap(
+            sub_text,
+            FontId::proportional(10.5),
+            TEXT_MUTED,
+        );
+        painter.galley(pos2(text_x + 4.0, rect.top() + 27.0), sub_galley, TEXT_MUTED);
+    } else {
+        painter.circle_filled(pos2(text_x + 4.0, rect.top() + 15.0), 3.5, status_color);
+
+        let title_galley = painter.layout_no_wrap(
+            title.to_string(),
+            FontId::proportional(11.5),
+            TEXT_MAIN,
+        );
+        painter.galley(pos2(text_x + 14.0, rect.top() + 8.0), title_galley, TEXT_MAIN);
+
+        let sub_text = format!("{} · {}", game, duration);
+        let sub_galley = painter.layout_no_wrap(
+            sub_text,
+            FontId::proportional(10.5),
+            TEXT_MUTED,
+        );
+        painter.galley(pos2(text_x + 4.0, rect.top() + 27.0), sub_galley, TEXT_MUTED);
+    }
+
+    resp
+}
+
+// ==========================================
+// NÚT NGUY HIỂM (DANGER BUTTON)
+// ==========================================
+pub struct DangerButton {
+    text: String,
+    size: f32,
+}
+
+impl DangerButton {
+    pub fn new(text: impl Into<String>, size: f32) -> Self {
+        Self {
+            text: text.into(),
+            size,
+        }
+    }
+}
+
+impl egui::Widget for DangerButton {
+    fn ui(self, ui: &mut egui::Ui) -> egui::Response {
+        let galley = ui.painter().layout_no_wrap(
+            self.text,
+            FontId::proportional(self.size),
+            Color32::from_rgb(255, 220, 220),
+        );
+        let pad_x = 10.0_f32;
+        let pad_y = 5.0_f32;
+        let text_size = galley.size();
+        let desired_size = vec2(text_size.x + pad_x * 2.0, (text_size.y + pad_y * 2.0).max(28.0));
+
+        let (rect, resp) = ui.allocate_at_least(desired_size, egui::Sense::click());
+        let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
+
+        let hovered = resp.hovered();
+        let painter = ui.painter_at(rect);
+
+        let c = 4.0_f32;
+        let points = vec![
+            pos2(rect.left() + c, rect.top()),
+            pos2(rect.right(), rect.top()),
+            pos2(rect.right(), rect.bottom() - c),
+            pos2(rect.right() - c, rect.bottom()),
+            pos2(rect.left(), rect.bottom()),
+            pos2(rect.left(), rect.top() + c),
+        ];
+
+        let bg_fill = if hovered {
+            Color32::from_rgb(65, 18, 22)
+        } else {
+            Color32::from_rgb(40, 12, 16)
+        };
+        let border_stroke = Stroke::new(1.0_f32, DANGER);
+
+        painter.add(egui::Shape::convex_polygon(points, bg_fill, border_stroke));
+
+        let text_pos = pos2(
+            rect.center().x - text_size.x / 2.0,
+            rect.center().y - text_size.y / 2.0,
+        );
+        painter.galley(
+            text_pos,
+            galley,
+            if hovered { Color32::WHITE } else { Color32::from_rgb(255, 210, 210) },
+        );
+
+        resp
+    }
+}
+
+pub fn danger_button_sized(text: impl Into<String>, size: f32) -> DangerButton {
+    DangerButton::new(text, size)
+}
