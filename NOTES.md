@@ -1,6 +1,17 @@
 # GameMode — ghi chú làm tiếp
 
-Cập nhật: 2026-10-19. Tool Rust + eframe/egui 0.29: tắt app nền trước khi chơi Delta Force, lưu session và khôi phục lại sau.
+Cập nhật: 2026-10-22. Tool Rust + eframe/egui 0.29: tắt app nền trước khi chơi Delta Force, lưu session và khôi phục lại sau.
+
+## Đang dở và làm tiếp (2026-10-22)
+- **Bản đã phát hành**: v1.2.0 trên GitHub Releases (có thu xuống khay). Bản trong `main` mới hơn: đã có phần **ghi báo cáo trận** (`src/report.rs`), đã test `--pingtest` và `--reporttest` trên máy thật, nhưng **chưa có giao diện xem báo cáo**.
+- **Đang dở**: task-14 giao Gemini làm **tab "Báo cáo trận"** (danh sách trận, thẻ chỉ số, nhận xét, 4 biểu đồ RAM/commit/CPU/ping dùng `egui_plot`) và **banner cảnh báo commit**. Task mô tả ở `X:\Test AI\GameMode\.delegate\task-14.md`. Code Gemini sửa nằm trong thư mục delegate `X:\Test AI\GameMode\src` (chưa vào repo này nếu chưa có commit "Report tab").
+  1. Xem `X:\Test AI\GameMode\.delegate\task-14.status.json` / `task-14.result.md` để biết Gemini xong chưa.
+  2. Kiểm tra logic không bị đổi (`do_optimize`, `do_restore`, `start_watcher`, `report.rs`, `sys.rs`).
+  3. Chép `src/*.rs`, `Cargo.toml`, `Cargo.lock` từ thư mục delegate vào repo, `cargo build --release`, chạy `--reporttest` để có dữ liệu mẫu, chụp màn hình tab mới.
+  4. Ổn thì commit, nâng version 1.3.0 (Cargo.toml + installer), build bộ cài, tạo Release.
+- **Tính năng còn trong danh sách đề xuất**: quản lý app khởi động cùng Windows (máy đang có ~13 mục Run + 1 file Startup), hồ sơ theo game, phím tắt toàn cục.
+- **Ngoài phần mềm (đã khuyên chủ máy)**: thêm thanh RAM 16 GB (đang single channel); đặt pagefile cố định 16–24 GB (commit từng chạm 95%); cắm dây LAN thay Wi-Fi; driver NVIDIA hiện tên "GTX 750 Ti" trong khi card thật là RTX 3060 Laptop (DEV_2520), nên cài lại driver chính hãng nếu FPS bất thường.
+- **Lưu ý khi giao việc**: launcher `delegate.sh` hay thoát sớm khi chạy nền lâu, nhưng worker trên harness vẫn chạy tiếp; theo dõi bằng file `task-NN.status.json` (`"terminal": true` là xong).
 
 ## Build và chạy
 ```
@@ -22,7 +33,7 @@ cargo build --release
 | `--reporttest` | Chạy recorder giả lập 20 giây (mẫu mỗi 2 giây, không cần game, cho phép trận < 60 s) và lưu một báo cáo `game = "test"` | `reporttest.txt` |
 | `--minimized` | Khởi động **ẩn xuống khay hệ thống** (task chạy cùng Windows dùng cờ này) | |
 
-## Báo cáo trận đấu (2026-10-23)
+## Báo cáo trận đấu (2026-10-22)
 - Bật/tắt bằng `report:enabled=1/0` (mặc định 1) — công tắc "Ghi báo cáo trận đấu" trong card "Tối ưu khi chơi". Ghi cả khi auto mode tắt.
 - Watcher thấy game trong danh sách chạy: mở báo cáo, chạy thread ping (1 gói/giây tới gateway + host internet) và thread lấy mẫu (mỗi 5 giây: RAM khả dụng, Free/Standby, commit, CPU toàn hệ thống, ping TB/max, % mất gói).
 - Game tắt (đúng mốc 15 giây của watcher): dừng ghi, tính `Summary` + nhận xét tiếng Việt, ghi `reports/<id>.json` cạnh exe (id dạng `20261022-213005`) rồi log một dòng `▣ [BÁO CÁO] ...`. Trận dưới 60 giây không lưu; chỉ giữ 30 báo cáo mới nhất.
