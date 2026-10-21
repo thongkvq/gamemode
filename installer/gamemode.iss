@@ -73,4 +73,7 @@ Type: files; Name: "{app}\session.json"
 Type: files; Name: "{app}\session.last.json"
 Type: files; Name: "{app}\gamemode-crash.log"
 Type: files; Name: "{app}\*.txt"
+; Báo cáo từng trận: xoá hết file .json rồi tới cả thư mục reports.
+Type: files; Name: "{app}\reports\*.json"
+Type: filesandordirs; Name: "{app}\reports"
 Type: dirifempty; Name: "{app}"

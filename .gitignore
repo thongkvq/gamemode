@@ -4,4 +4,7 @@ session*.json
 gamemode-crash.log
 selftest.txt
 launchtest.txt
+pingtest.txt
+reporttest.txt
+reports/
 /dist

@@ -35,8 +35,19 @@ pub struct Tray {
     boost: MenuItem,
     restore_item: MenuItem,
     check_auto: CheckMenuItem,
-    /// Tooltip đang hiển thị có phải bản "đang thanh lọc" hay không.
-    busy_shown: bool,
+    /// Tooltip đang hiển thị, để chỉ gọi `set_tooltip` khi nội dung thật sự đổi.
+    tooltip: String,
+}
+
+/// Tooltip theo trạng thái thật: đang tối ưu, hoặc commit gần chạm trần.
+fn tooltip_text(sh: &Shared) -> String {
+    if sh.busy.load(Ordering::SeqCst) {
+        return TOOLTIP_BUSY.to_string();
+    }
+    if sh.commit_alert.load(Ordering::SeqCst) {
+        return format!("{} · ⚠ Commit {:.0}%", TOOLTIP_READY, sh.commit_pct());
+    }
+    TOOLTIP_READY.to_string()
 }
 
 impl Tray {
@@ -70,9 +81,9 @@ impl Tray {
         .map_err(|e| format!("không thêm được mục menu: {e}"))?;
 
         let icon = tray_icon_from_png().ok_or_else(|| "không đọc/resize được icon.png".to_string())?;
-        let busy = sh.busy.load(Ordering::SeqCst);
+        let tooltip = tooltip_text(sh);
         let icon = TrayIconBuilder::new()
-            .with_tooltip(if busy { TOOLTIP_BUSY } else { TOOLTIP_READY })
+            .with_tooltip(tooltip.clone())
             .with_icon(icon)
             .with_menu(Box::new(menu))
             // Click trái để hiện cửa sổ, menu chỉ mở khi bấm chuột phải.
@@ -86,18 +97,19 @@ impl Tray {
             boost,
             restore_item,
             check_auto,
-            busy_shown: busy,
+            tooltip,
         })
     }
 
     /// Đồng bộ tooltip / dấu tick / trạng thái disable theo trạng thái hiện tại (gọi trong `update`).
     pub fn sync(&mut self, sh: &Shared) {
         let busy = sh.busy.load(Ordering::SeqCst);
-        if busy != self.busy_shown {
-            self.busy_shown = busy;
+        let tip = tooltip_text(sh);
+        if tip != self.tooltip {
+            self.tooltip = tip;
             let _ = self
                 .icon
-                .set_tooltip(Some(if busy { TOOLTIP_BUSY } else { TOOLTIP_READY }));
+                .set_tooltip(Some(self.tooltip.clone()));
         }
         // Đang tối ưu/khôi phục thì hai lệnh này bị `busy` chặn -> disable cho khỏi bấm hụt.
         self.boost.set_enabled(!busy);

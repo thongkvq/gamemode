@@ -18,6 +18,9 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_RemoteDesktop",
     "Win32_Storage_FileSystem",
     "Win32_NetworkManagement_WiFi",
+    # Ping ICMP (IcmpCreateFile/IcmpSendEcho) và GetBestRoute để tìm gateway mặc định.
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
     "Win32_UI_WindowsAndMessaging",
     "Win32_Security",
 ] }

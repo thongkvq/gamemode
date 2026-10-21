@@ -18,7 +18,18 @@ cargo build --release
 | `--launchtest` | Mở notepad bằng quyền user thường (token explorer) | `launchtest.txt` |
 | `--tasktest` | Tạo task "GameMode", đọc XML, rồi xoá | `tasktest.txt` |
 | `--traytest` | Tạo icon khay + menu trong 5 giây rồi thoát | `traytest.txt` |
+| `--pingtest` | Ping gateway (`GetBestRoute`) và host internet 5 lần mỗi đích (IP, RTT, mất gói) | `pingtest.txt` |
+| `--reporttest` | Chạy recorder giả lập 20 giây (mẫu mỗi 2 giây, không cần game, cho phép trận < 60 s) và lưu một báo cáo `game = "test"` | `reporttest.txt` |
 | `--minimized` | Khởi động **ẩn xuống khay hệ thống** (task chạy cùng Windows dùng cờ này) | |
+
+## Báo cáo trận đấu (2026-10-23)
+- Bật/tắt bằng `report:enabled=1/0` (mặc định 1) — công tắc "Ghi báo cáo trận đấu" trong card "Tối ưu khi chơi". Ghi cả khi auto mode tắt.
+- Watcher thấy game trong danh sách chạy: mở báo cáo, chạy thread ping (1 gói/giây tới gateway + host internet) và thread lấy mẫu (mỗi 5 giây: RAM khả dụng, Free/Standby, commit, CPU toàn hệ thống, ping TB/max, % mất gói).
+- Game tắt (đúng mốc 15 giây của watcher): dừng ghi, tính `Summary` + nhận xét tiếng Việt, ghi `reports/<id>.json` cạnh exe (id dạng `20261022-213005`) rồi log một dòng `▣ [BÁO CÁO] ...`. Trận dưới 60 giây không lưu; chỉ giữ 30 báo cáo mới nhất.
+- `report:ping_host=<host>` (mặc định `1.1.1.1`) là đích ping internet, có thể là tên miền.
+- Thư mục `reports/` nằm cạnh exe, đã thêm vào `.gitignore` và `[UninstallDelete]` của bộ cài.
+- Cảnh báo commit: watcher kiểm tra mỗi 5 giây; `commit >= 90%` thì log đỏ (tối thiểu 2 phút một lần), bật `Shared.commit_alert` (icon khay thêm `⚠ Commit X%`), thêm event `commit_warn` vào báo cáo và — nếu đang chơi — xả standby ngay **một lần** (xả standby không giảm commit nên vẫn giữ cảnh báo). Dưới 85% thì tắt cảnh báo.
+- API cho tab báo cáo (task sau): `report::list_reports()`, `report::load_report(id)`, `report::delete_report(id)`.
 
 ## Khay hệ thống (2026-10-22)
 - Nút X trên title bar và Alt+F4 **không thoát** nữa: cửa sổ ẩn xuống khay (icon cạnh đồng hồ). Thoát hẳn bằng menu chuột phải ở icon khay → `Thoát`.
@@ -32,7 +43,8 @@ cargo build --release
   - Logic: `do_optimize`, `do_restore`, `start_watcher`, config, session.
   - UI: `App::new`, `update`, `running_app_row`.
   - `Shared` (các `Arc<Mutex>`) là cầu nối giữa UI và thread watcher.
-- `src/sys.rs`: WinAPI (snapshot process, cmdline, kill, WM_CLOSE, service có timeout 5 giây, standby purge, WLAN, Game DVR, GPU pref, schtasks, mở app bằng token explorer, ẩn/hiện cửa sổ chính + named mutex một bản).
+- `src/sys.rs`: WinAPI (snapshot process, cmdline, kill, WM_CLOSE, service có timeout 5 giây, standby purge, WLAN, Game DVR, GPU pref, schtasks, mở app bằng token explorer, ẩn/hiện cửa sổ chính + named mutex một bản, commit charge, `CpuMeter` từ `GetSystemTimes`, gateway + ICMP ping).
+- `src/report.rs`: báo cáo trận đấu (`Sample`, `Event`, `Summary`, `GameReport`, `ReportMeta`, `Live` đang ghi, đọc/ghi/xoá file trong `reports/`).
 - `src/tray.rs`: icon khay + menu chuột phải, thread nhận sự kiện menu/click (chạy được khi cửa sổ đã ẩn).
 - `src/ui.rs`: bảng màu và widget dùng chung (`card`, `section_header`, `toggle_row` có switch, `ghost_button`, `primary_button`, `callout_warning`).
 

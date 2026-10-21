@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"]
 
+mod report;
 mod sys;
 mod tray;
 mod ui;
@@ -412,6 +413,8 @@ struct Opts {
     auto_restore: bool,
     /// `ui:close_to_tray`: bấm X thì ẩn xuống khay thay vì thoát.
     close_to_tray: bool,
+    /// `report:enabled`: ghi số liệu và lưu báo cáo sau mỗi trận.
+    report_enabled: bool,
 }
 
 impl Default for Opts {
@@ -425,6 +428,7 @@ impl Default for Opts {
             auto_enabled: false,
             auto_restore: true,
             close_to_tray: true,
+            report_enabled: true,
         }
     }
 }
@@ -437,6 +441,8 @@ struct Config {
     games: Vec<String>,
     /// Đường dẫn exe đã biết của từng game: exe (viết thường) -> đường dẫn đầy đủ.
     game_paths: HashMap<String, String>,
+    /// Host ping internet của báo cáo trận (`report:ping_host`).
+    ping_host: String,
     opts: Opts,
 }
 
@@ -446,7 +452,7 @@ fn is_on(v: &str) -> bool {
 
 /// Đọc cấu hình: `keep:<exe>=1/0`, `svc:<tên>=1/0`, `game:<exe>=1`, `gamepath:<exe>=<path>`,
 /// `auto:enabled/restore=1/0`, `opt:standby/trim/gpu/wlan/gamedvr=1/0`,
-/// `ui:close_to_tray=1/0`.
+/// `ui:close_to_tray=1/0`, `report:enabled=1/0`, `report:ping_host=<host>`.
 /// Các dòng `app:...` của bản cũ được bỏ qua (không còn danh sách app cố định).
 fn load_config() -> Config {
     let text = std::fs::read_to_string(config_path()).unwrap_or_default();
@@ -454,6 +460,7 @@ fn load_config() -> Config {
     let mut svc_saved: HashMap<String, bool> = HashMap::new();
     let mut games: Vec<String> = Vec::new();
     let mut game_paths: HashMap<String, String> = HashMap::new();
+    let mut ping_host = report::PING_HOST_DEFAULT.to_string();
     let mut opts = Opts::default();
 
     for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
@@ -506,6 +513,19 @@ fn load_config() -> Config {
                     opts.close_to_tray = is_on(v);
                 }
             }
+        } else if let Some(rest) = line.strip_prefix("report:") {
+            if let Some((k, v)) = rest.rsplit_once('=') {
+                match k.trim() {
+                    "enabled" => opts.report_enabled = is_on(v),
+                    "ping_host" => {
+                        let host = v.trim();
+                        if !host.is_empty() {
+                            ping_host = host.to_string();
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
         // dòng "app:..." / dòng rác của bản cũ: bỏ qua
     }
@@ -524,6 +544,7 @@ fn load_config() -> Config {
         svcs,
         games,
         game_paths,
+        ping_host,
         opts,
     }
 }
@@ -557,6 +578,8 @@ fn write_config(cfg: &Config) -> bool {
     lines.push(format!("opt:wlan={}", if o.wlan { 1 } else { 0 }));
     lines.push(format!("opt:gamedvr={}", if o.gamedvr { 1 } else { 0 }));
     lines.push(format!("ui:close_to_tray={}", if o.close_to_tray { 1 } else { 0 }));
+    lines.push(format!("report:enabled={}", if o.report_enabled { 1 } else { 0 }));
+    lines.push(format!("report:ping_host={}", cfg.ping_host));
     std::fs::write(config_path(), lines.join("\n")).is_ok()
 }
 
@@ -843,6 +866,14 @@ struct Shared {
     last_auto: Arc<AtomicBool>,
     /// Số lần tối ưu đã chạy: watcher dùng để không tối ưu lặp khi người dùng vừa bấm tay.
     opt_count: Arc<AtomicUsize>,
+    /// Báo cáo trận đang ghi (None khi không có game nào chạy).
+    live_report: Arc<Mutex<Option<Arc<Mutex<report::Live>>>>>,
+    /// Host ping internet cho báo cáo (`report:ping_host`).
+    ping_host: Arc<Mutex<String>>,
+    /// Commit đã chạm trần (>= 90%): UI hiện banner, icon khay thêm cảnh báo.
+    commit_alert: Arc<AtomicBool>,
+    /// % commit gần nhất, chỉ để hiển thị trong cảnh báo.
+    commit_pct: Arc<Mutex<f32>>,
 }
 
 impl Shared {
@@ -852,6 +883,7 @@ impl Shared {
             svcs: self.svc.lock().unwrap().clone(),
             games: self.games.lock().unwrap().clone(),
             game_paths: self.game_paths.lock().unwrap().clone(),
+            ping_host: self.ping_host.lock().unwrap().clone(),
             opts: *self.opts.lock().unwrap(),
         };
         write_config(&cfg)
@@ -864,6 +896,22 @@ impl Shared {
     fn opts(&self) -> Opts {
         *self.opts.lock().unwrap()
     }
+
+    /// Thêm một sự kiện vào báo cáo trận đang ghi (bỏ qua nếu đang không ghi trận).
+    fn event(&self, kind: &str, text: impl Into<String>) {
+        // Lấy Arc ra rồi nhả khoá `live_report` trước khi khoá báo cáo:
+        // tránh giữ hai khoá cùng lúc không cần thiết.
+        let live = self.live_report.lock().unwrap().clone();
+        if let Some(l) = live {
+            let text: String = text.into();
+            report::add_event(&l, kind, &text);
+        }
+    }
+
+    /// % commit gần nhất (0.0 nếu chưa đo lần nào).
+    fn commit_pct(&self) -> f32 {
+        *self.commit_pct.lock().unwrap()
+    }
 }
 
 /// Bắt đầu tối ưu ở thread nền. Dùng chung cho nút trên UI và watcher.
@@ -873,6 +921,14 @@ fn optimize(sh: Shared, from_auto: bool) {
     }
     sh.last_auto.store(from_auto, Ordering::SeqCst);
     sh.opt_count.fetch_add(1, Ordering::SeqCst);
+    sh.event(
+        "optimize",
+        if from_auto {
+            "Tối ưu tự động khi game mở"
+        } else {
+            "Tối ưu bằng tay (nút Game Boost / menu khay)"
+        },
+    );
     std::thread::spawn(move || {
         do_optimize(&sh);
         sh.busy.store(false, Ordering::SeqCst);
@@ -884,6 +940,7 @@ fn restore(sh: Shared) {
     if sh.busy.swap(true, Ordering::SeqCst) {
         return;
     }
+    sh.event("restore", "Khôi phục hệ thống (app, service, Wi-Fi, Game DVR)");
     std::thread::spawn(move || {
         do_restore(&sh);
         sh.busy.store(false, Ordering::SeqCst);
@@ -1669,8 +1726,49 @@ fn log_clear(sh: &Shared) {
     sh.log.lock().unwrap().clear();
 }
 
+/// % commit hiện tại (0.0 nếu không đọc được).
+fn commit_pct() -> f32 {
+    let (used, limit) = sys::commit();
+    if limit == 0 {
+        0.0
+    } else {
+        used as f32 * 100.0 / limit as f32
+    }
+}
+
+/// Ping `times` lần tới một địa chỉ IPv4, trả về các dòng kết quả cho `--pingtest`.
+fn ping_lines(label: &str, addr: u32, times: u32) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut got = 0u32;
+    let mut sum = 0.0f32;
+    let mut max = 0.0f32;
+    for i in 1..=times {
+        match sys::ping(addr, 1000) {
+            Some(rtt) => {
+                got += 1;
+                sum += rtt;
+                max = max.max(rtt);
+                lines.push(format!("  {} #{}: {:.0} ms", label, i, rtt));
+            }
+            None => lines.push(format!("  {} #{}: mất gói (chờ 1000 ms)", label, i)),
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    lines.push(format!(
+        "  {}: {}/{} hồi âm, TB {:.0} ms, max {:.0} ms, mất {:.0}%",
+        label,
+        got,
+        times,
+        if got > 0 { sum / got as f32 } else { 0.0 },
+        max,
+        (times - got) as f32 * 100.0 / times as f32
+    ));
+    lines
+}
+
 /// Watcher chạy suốt đời app ở thread riêng: tự tối ưu khi game mở, tự Restore khi game tắt,
-/// và xả standby list khi RAM trống xuống thấp trong lúc chơi.
+/// xả standby list khi RAM trống xuống thấp trong lúc chơi, cảnh báo commit gần trần,
+/// và ghi báo cáo số liệu cho mỗi trận (RAM / commit / CPU / ping).
 /// Không phụ thuộc `update()` nên vẫn hoạt động khi cửa sổ bị thu nhỏ.
 fn start_watcher(sh: Shared) {
     std::thread::spawn(move || {
@@ -1681,33 +1779,122 @@ fn start_watcher(sh: Shared) {
         const PURGE_GAP: Duration = Duration::from_secs(60);
         const LOW_FREE: u64 = 1024 * 1024 * 1024;
         const HIGH_STANDBY: u64 = 1024 * 1024 * 1024;
+        // Nhịp kiểm tra commit (chạy cả khi không có game).
+        const COMMIT_CHECK: Duration = Duration::from_secs(5);
+        // Dưới mức này thì tắt cờ cảnh báo commit.
+        const COMMIT_CLEAR_PCT: f32 = 85.0;
+        // Hai dòng cảnh báo commit cách nhau tối thiểu.
+        const COMMIT_WARN_GAP: Duration = Duration::from_secs(120);
 
         let mut game_seen: Option<(Instant, usize)> = None;
         let mut game_gone: Option<Instant> = None;
         let mut optimized = false;
         let mut last_mem_check = Instant::now();
         let mut last_purge = Instant::now() - PURGE_GAP;
+        // Báo cáo trận đang ghi (None khi không có game nào chạy).
+        let mut live: Option<Arc<Mutex<report::Live>>> = None;
+        let mut last_commit_check = Instant::now() - COMMIT_CHECK;
+        let mut last_commit_warn = Instant::now() - COMMIT_WARN_GAP;
+        // Đợt cảnh báo commit này đã xả standby một lần chưa.
+        let mut commit_purged = false;
 
         loop {
             std::thread::sleep(SCAN);
             let opts = sh.opts();
             let games: Vec<String> = sh.games.lock().unwrap().clone();
-            if games.is_empty() {
+            let (up, any) = if games.is_empty() {
+                (Vec::new(), false)
+            } else {
+                let names: Vec<String> = sys::list_processes()
+                    .into_iter()
+                    .map(|p| p.name.to_lowercase())
+                    .collect();
+                let up: Vec<String> = games
+                    .iter()
+                    .filter(|g| names.iter().any(|n| n == *g))
+                    .cloned()
+                    .collect();
+                let any = !up.is_empty();
+                (up, any)
+            };
+
+            // Cảnh báo commit gần trần — chạy cả khi không có game nào.
+            if last_commit_check.elapsed() >= COMMIT_CHECK {
+                last_commit_check = Instant::now();
+                let pct = commit_pct();
+                *sh.commit_pct.lock().unwrap() = pct;
+                if pct >= report::COMMIT_WARN_PCT {
+                    let already = sh.commit_alert.swap(true, Ordering::SeqCst);
+                    let mut announced = false;
+                    if !already || last_commit_warn.elapsed() >= COMMIT_WARN_GAP {
+                        last_commit_warn = Instant::now();
+                        announced = true;
+                        sh.log(
+                            format!(
+                                "  ⚠ [COMMIT] Commit {:.0}% — sắp chạm trần (RAM + pagefile). Game có thể văng: tăng pagefile (16–24 GB) hoặc thêm RAM.",
+                                pct
+                            ),
+                            Color32::from_rgb(255, 59, 59),
+                        );
+                    }
+                    if announced {
+                        sh.event("commit_warn", format!("Commit {:.0}% — gần chạm trần", pct));
+                    }
+                    // Đang chơi mà commit chạm trần: xả standby ngay, bỏ qua khoảng cách 60 giây,
+                    // nhưng chỉ MỘT lần cho mỗi đợt. Xả standby KHÔNG làm giảm commit nên vẫn giữ cảnh báo.
+                    if any && opts.standby && !commit_purged && !sh.busy.load(Ordering::SeqCst) {
+                        commit_purged = true;
+                        last_purge = Instant::now();
+                        match sys::purge_standby() {
+                            Ok(_) => {
+                                sh.log(
+                                    format!(
+                                        "  ✔ [COMMIT] Xả standby vì commit {:.0}% (xả standby không giảm commit — vẫn giữ cảnh báo).",
+                                        pct
+                                    ),
+                                    Color32::from_rgb(50, 215, 255),
+                                );
+                                sh.event("purge", format!("Xả standby do commit {:.0}%", pct));
+                            }
+                            Err(e) => sh.log(
+                                format!("  ⚠ [COMMIT] Không xả được standby: {}", e),
+                                Color32::from_rgb(255, 120, 120),
+                            ),
+                        }
+                    }
+                } else if pct < COMMIT_CLEAR_PCT {
+                    sh.commit_alert.store(false, Ordering::SeqCst);
+                    commit_purged = false;
+                }
+            }
+
+            // Không có game trong danh sách và cũng không ghi trận nào: hết việc.
+            if games.is_empty() && live.is_none() {
                 continue;
             }
-            let names: Vec<String> = sys::list_processes()
-                .into_iter()
-                .map(|p| p.name.to_lowercase())
-                .collect();
-            let up: Vec<String> = games
-                .iter()
-                .filter(|g| names.iter().any(|n| n == *g))
-                .cloned()
-                .collect();
-            let any = !up.is_empty();
 
             if any {
                 game_gone = None;
+                // Bắt đầu ghi báo cáo trận — ghi cả khi auto mode tắt.
+                if live.is_none() && opts.report_enabled {
+                    let host = sh.ping_host.lock().unwrap().clone();
+                    let started = report::start(
+                        &up.join(", "),
+                        &host,
+                        report::SAMPLE_SEC,
+                        report::MIN_DURATION_SEC,
+                    );
+                    *sh.live_report.lock().unwrap() = Some(started.clone());
+                    sh.log(
+                        format!(
+                            "  • [BÁO CÁO] Bắt đầu ghi trận {} (mẫu mỗi {} giây).",
+                            up.join(", "),
+                            report::SAMPLE_SEC
+                        ),
+                        Color32::from_rgb(0, 229, 255),
+                    );
+                    live = Some(started);
+                }
                 if opts.auto_enabled && !optimized {
                     let (since, count_at_seen) = *game_seen
                         .get_or_insert_with(|| (Instant::now(), sh.opt_count.load(Ordering::SeqCst)));
@@ -1729,14 +1916,37 @@ fn start_watcher(sh: Shared) {
                 }
             } else {
                 game_seen = None;
+                let just_gone = game_gone.is_none();
                 let since = *game_gone.get_or_insert_with(Instant::now);
+                // Chốt mốc game tắt ngay lần đầu thấy vắng (không đợi hết 15 giây xác nhận).
+                if just_gone {
+                    if let Some(l) = live.as_ref() {
+                        report::mark_game_end(l);
+                    }
+                }
                 if since.elapsed() >= GAME_GONE {
-                    // Chỉ tự Restore khi phiên game này do auto khởi động, và không chạy lặp.
-                    if opts.auto_restore
+                    // Cùng mốc 15 giây với auto-restore: đóng báo cáo trận rồi mới khôi phục.
+                    let will_restore = opts.auto_restore
                         && optimized
                         && sh.last_auto.load(Ordering::SeqCst)
-                        && !sh.busy.load(Ordering::SeqCst)
-                    {
+                        && !sh.busy.load(Ordering::SeqCst);
+                    if let Some(l) = live.take() {
+                        *sh.live_report.lock().unwrap() = None;
+                        if will_restore {
+                            report::add_event(&l, "restore", "Tự khôi phục sau khi game tắt 15 giây");
+                        }
+                        let out = report::finish(l);
+                        sh.log(
+                            out.line.clone(),
+                            if out.saved {
+                                Color32::from_rgb(0, 255, 163)
+                            } else {
+                                Color32::from_rgb(130, 150, 170)
+                            },
+                        );
+                    }
+                    // Chỉ tự Restore khi phiên game này do auto khởi động, và không chạy lặp.
+                    if will_restore {
                         optimized = false;
                         sh.log(
                             "[AUTO] Game đã tắt 15 giây — tự khôi phục lại hệ thống.".into(),
@@ -1772,6 +1982,14 @@ fn start_watcher(sh: Shared) {
                                         after.standby_bytes as f64 / GB
                                     ),
                                     Color32::from_rgb(50, 215, 255),
+                                );
+                                sh.event(
+                                    "purge",
+                                    format!(
+                                        "Xả standby khi RAM trống {:.1} GB / standby {:.1} GB",
+                                        lists.free_bytes as f64 / GB,
+                                        lists.standby_bytes as f64 / GB
+                                    ),
                                 );
                             }
                             Err(e) => {
@@ -1895,6 +2113,10 @@ impl App {
             is_admin,
             last_auto: Arc::new(AtomicBool::new(false)),
             opt_count: Arc::new(AtomicUsize::new(0)),
+            live_report: Arc::new(Mutex::new(None)),
+            ping_host: Arc::new(Mutex::new(cfg.ping_host.clone())),
+            commit_alert: Arc::new(AtomicBool::new(false)),
+            commit_pct: Arc::new(Mutex::new(0.0)),
         };
 
         let mut app = Self {
@@ -2327,6 +2549,16 @@ fn render_optimize_card(
             &mut opts_view.gamedvr,
             "Tắt Game DVR / quay màn hình nền của Windows",
             "Đặt GameDVR_Enabled và AppCaptureEnabled về 0; Restore khôi phục lại",
+        ) {
+            *save_needed = true;
+        }
+        ui.add_space(2.0);
+
+        if ui::toggle_row(
+            ui,
+            &mut opts_view.report_enabled,
+            "Ghi báo cáo trận đấu",
+            "Ghi RAM, commit, CPU, ping mỗi 5 giây khi game chạy",
         ) {
             *save_needed = true;
         }
@@ -3298,9 +3530,96 @@ fn main() -> eframe::Result<()> {
         ));
         lines.push(format!("game list = {:?}", cfg.games));
         lines.push(format!("game paths = {:?}", cfg.game_paths));
+        lines.push(format!(
+            "report:enabled={} report:ping_host={} gateway={:?} reports_dir={}",
+            cfg.opts.report_enabled as u8,
+            cfg.ping_host,
+            sys::gateway_ip().map(sys::ip_to_string),
+            report::reports_dir().display()
+        ));
 
         let _ = std::fs::write(config_path().with_file_name("selftest.txt"), lines.join("
 "));
+        return Ok(());
+    }
+
+    // --pingtest: ping gateway và host internet 5 lần mỗi đích, ghi IP / RTT / mất gói ra pingtest.txt.
+    if std::env::args().any(|a| a == "--pingtest") {
+        let cfg = load_config();
+        let mut lines = vec![format!("admin={}", sys::is_admin())];
+
+        let gw = sys::gateway_ip();
+        match gw {
+            Some(addr) => {
+                lines.push(format!("gateway = {}", sys::ip_to_string(addr)));
+                lines.extend(ping_lines("gateway", addr, 5));
+            }
+            None => lines.push("gateway = KHÔNG lấy được route mặc định (GetBestRoute)".into()),
+        }
+
+        match sys::resolve_ipv4(&cfg.ping_host) {
+            Some((addr, name)) => {
+                lines.push(format!("internet = {} (host {})", sys::ip_to_string(addr), name));
+                lines.extend(ping_lines("internet", addr, 5));
+            }
+            None => lines.push(format!("internet = KHÔNG phân giải được host {:?}", cfg.ping_host)),
+        }
+        let _ = std::fs::write(config_path().with_file_name("pingtest.txt"), lines.join("\n"));
+        return Ok(());
+    }
+
+    // --reporttest: recorder giả lập 20 giây (mẫu mỗi 2 giây, không cần game, cho phép trận ngắn),
+    // lưu báo cáo game="test" vào reports/ rồi ghi đường dẫn ra reporttest.txt.
+    if std::env::args().any(|a| a == "--reporttest") {
+        let cfg = load_config();
+        let live = report::start("test", &cfg.ping_host, 2, 0);
+        for _ in 0..10 {
+            std::thread::sleep(Duration::from_secs(2));
+        }
+        let out = report::finish(live);
+        let mut lines = vec![
+            format!("admin={}", sys::is_admin()),
+            format!("id={} samples={} saved={}", out.id, out.samples, out.saved),
+            format!("thư mục reports = {}", report::reports_dir().display()),
+            format!(
+                "file = {}",
+                out.path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "KHÔNG ghi được".to_string())
+            ),
+            format!("tóm tắt: {}", out.line),
+        ];
+        // Đọc lại file vừa ghi: đúng đường mà tab báo cáo (task sau) sẽ dùng.
+        match report::load_report(&out.id) {
+            Some(r) => {
+                lines.push(format!(
+                    "đọc lại: game={} duration={}s samples={} events={} kết thúc={}",
+                    r.game,
+                    r.summary.duration_sec,
+                    r.samples.len(),
+                    r.events.len(),
+                    r.ended_at
+                ));
+                if let Some(s) = r.samples.first() {
+                    lines.push(format!(
+                        "mẫu đầu: t={:.1}s ram={:.2} GB ({:.0}%) commit={:.0}% cpu={:.0}% ping_gw={:?} ping_net={:?}",
+                        s.t, s.avail_gb, s.ram_used_pct, s.commit_pct, s.cpu_pct, s.ping_gw_ms, s.ping_net_ms
+                    ));
+                }
+                for v in r.summary.verdict.iter() {
+                    lines.push(format!("nhận xét: {v}"));
+                }
+            }
+            None => lines.push("đọc lại: LỖI (load_report trả None)".into()),
+        }
+        let ids: Vec<String> = report::list_reports()
+            .into_iter()
+            .take(5)
+            .map(|m| m.id)
+            .collect();
+        lines.push(format!("list_reports (5 mới nhất) = {:?}", ids));
+        let _ = std::fs::write(config_path().with_file_name("reporttest.txt"), lines.join("\n"));
         return Ok(());
     }
 

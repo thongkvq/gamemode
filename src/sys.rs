@@ -8,8 +8,11 @@ use std::mem::{size_of, transmute, zeroed};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, INVALID_HANDLE_VALUE, LPARAM,
-    LUID, STILL_ACTIVE, SYSTEMTIME, WPARAM,
+    CloseHandle, ERROR_ALREADY_EXISTS, FILETIME, GetLastError, HANDLE, HWND, INVALID_HANDLE_VALUE,
+    LPARAM, LUID, STILL_ACTIVE, SYSTEMTIME, WPARAM,
+};
+use windows_sys::Win32::NetworkManagement::IpHelper::{
+    GetBestRoute, ICMP_ECHO_REPLY, IcmpCloseHandle, IcmpCreateFile, IcmpSendEcho, MIB_IPFORWARDROW,
 };
 use windows_sys::Win32::NetworkManagement::WiFi::{
     WlanCloseHandle, WlanEnumInterfaces, WlanFreeMemory, WlanOpenHandle, WlanQueryInterface,
@@ -37,10 +40,10 @@ use windows_sys::Win32::System::SystemInformation::{
     GetLocalTime, GlobalMemoryStatusEx, MEMORYSTATUSEX,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateMutexW, CreateProcessWithTokenW, GetCurrentProcess, GetExitCodeProcess, OpenProcess,
-    OpenProcessToken, QueryFullProcessImageNameW, TerminateProcess, PROCESS_INFORMATION,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA, PROCESS_TERMINATE, PROCESS_VM_READ,
-    STARTUPINFOW,
+    CreateMutexW, CreateProcessWithTokenW, GetCurrentProcess, GetExitCodeProcess, GetSystemTimes,
+    OpenProcess, OpenProcessToken, QueryFullProcessImageNameW, TerminateProcess,
+    PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+    PROCESS_VM_READ, STARTUPINFOW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, FindWindowW, GetWindow, GetWindowTextLengthW, GetWindowTextW,
@@ -1099,6 +1102,166 @@ pub fn memory() -> Mem {
             commit_used: m.ullTotalPageFile - m.ullAvailPageFile,
             commit_limit: m.ullTotalPageFile,
         }
+    }
+}
+
+/// Commit charge của Windows: `(đang dùng, giới hạn)` theo byte.
+/// Lấy từ `GlobalMemoryStatusEx`: giới hạn = `ullTotalPageFile`,
+/// đang dùng = `ullTotalPageFile - ullAvailPageFile`.
+pub fn commit() -> (u64, u64) {
+    unsafe {
+        let mut m: MEMORYSTATUSEX = zeroed();
+        m.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+        if GlobalMemoryStatusEx(&mut m) == 0 {
+            return (0, 0);
+        }
+        (m.ullTotalPageFile - m.ullAvailPageFile, m.ullTotalPageFile)
+    }
+}
+
+/// Đọc `GetSystemTimes` thành mili-giây (đơn vị FILETIME là 100 ns).
+fn system_times() -> Option<(u64, u64, u64)> {
+    unsafe {
+        let mut idle: FILETIME = zeroed();
+        let mut kernel: FILETIME = zeroed();
+        let mut user: FILETIME = zeroed();
+        if GetSystemTimes(&mut idle, &mut kernel, &mut user) == 0 {
+            return None;
+        }
+        let f = |t: FILETIME| ((t.dwHighDateTime as u64) << 32) | t.dwLowDateTime as u64;
+        Some((f(idle), f(kernel), f(user)))
+    }
+}
+
+/// CPU toàn hệ thống theo delta giữa hai lần đọc `GetSystemTimes`.
+/// `kernel` đã bao gồm thời gian idle nên tổng = kernel + user.
+pub struct CpuMeter {
+    last: Option<(u64, u64, u64)>,
+}
+
+impl Default for CpuMeter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CpuMeter {
+    pub fn new() -> Self {
+        Self { last: None }
+    }
+
+    /// % CPU toàn hệ thống kể từ lần gọi trước. Lần gọi đầu trả 0.0
+    /// (chưa có mốc so sánh); không đọc được thì cũng trả 0.0.
+    pub fn pct(&mut self) -> f32 {
+        let Some((idle, kernel, user)) = system_times() else {
+            return 0.0;
+        };
+        let prev = self.last.replace((idle, kernel, user));
+        let Some((p_idle, p_kernel, p_user)) = prev else {
+            return 0.0;
+        };
+        let d_idle = idle.saturating_sub(p_idle);
+        let total = kernel.saturating_sub(p_kernel) + user.saturating_sub(p_user);
+        if total == 0 {
+            return 0.0;
+        }
+        ((total.saturating_sub(d_idle)) as f64 * 100.0 / total as f64) as f32
+    }
+}
+
+/// 4 octet IPv4 -> u32 đúng như WinAPI mong đợi: byte mạng nằm trong bộ nhớ
+/// (giống `in_addr` của `inet_addr`), KHÔNG phải giá trị big-endian.
+fn ip_u32(octets: [u8; 4]) -> u32 {
+    u32::from_ne_bytes(octets)
+}
+
+/// u32 của WinAPI -> chuỗi "a.b.c.d".
+pub fn ip_to_string(addr: u32) -> String {
+    let b = addr.to_ne_bytes();
+    format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3])
+}
+
+/// Phân giải "a.b.c.d" hoặc tên miền thành địa chỉ cho `ping`.
+/// Trả `(địa chỉ, tên hiển thị)`.
+pub fn resolve_ipv4(host: &str) -> Option<(u32, String)> {
+    let host = host.trim();
+    if host.is_empty() {
+        return None;
+    }
+    if let Some(octets) = parse_ipv4(host) {
+        let a = ip_u32(octets);
+        return Some((a, ip_to_string(a)));
+    }
+    use std::net::ToSocketAddrs;
+    let octets = (host, 0u16)
+        .to_socket_addrs()
+        .ok()?
+        .find_map(|s| match s.ip() {
+            std::net::IpAddr::V4(v4) => Some(v4.octets()),
+            std::net::IpAddr::V6(_) => None,
+        })?;
+    let a = ip_u32(octets);
+    Some((a, format!("{} ({})", ip_to_string(a), host)))
+}
+
+fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
+    let mut out = [0u8; 4];
+    let mut parts = s.split('.');
+    for slot in out.iter_mut() {
+        *slot = parts.next()?.parse::<u8>().ok()?;
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(out)
+}
+
+/// Gateway mặc định: route tốt nhất tới 1.1.1.1 (`GetBestRoute`).
+/// `None` khi không có route hoặc next hop = 0.0.0.0 (chưa có mạng).
+pub fn gateway_ip() -> Option<u32> {
+    unsafe {
+        let mut row: MIB_IPFORWARDROW = zeroed();
+        let rc = GetBestRoute(ip_u32([1, 1, 1, 1]), 0, &mut row);
+        if rc != 0 || row.dwForwardNextHop == 0 {
+            return None;
+        }
+        Some(row.dwForwardNextHop)
+    }
+}
+
+/// Một gói ICMP echo tới địa chỉ IPv4 của WinAPI. Trả RTT (ms) khi có hồi âm,
+/// `None` khi mất gói / hết thời gian chờ / không tạo được handle ICMP.
+pub fn ping(addr: u32, timeout_ms: u32) -> Option<f32> {
+    unsafe {
+        let handle = IcmpCreateFile();
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let payload = [0u8; 32];
+        // Vùng đệm trả về phải chứa ICMP_ECHO_REPLY + dữ liệu gửi + phần dư.
+        // Cấp bằng u64 để chắc chắn căn 8 byte: ICMP_ECHO_REPLY có con trỏ bên trong.
+        let need = size_of::<ICMP_ECHO_REPLY>() + payload.len() + 32;
+        let mut reply = vec![0u64; need.div_ceil(8)];
+        let n = IcmpSendEcho(
+            handle,
+            addr,
+            payload.as_ptr() as *const c_void,
+            payload.len() as u16,
+            std::ptr::null(),
+            reply.as_mut_ptr() as *mut c_void,
+            (reply.len() * 8) as u32,
+            timeout_ms,
+        );
+        IcmpCloseHandle(handle);
+        if n == 0 {
+            return None;
+        }
+        let r = &*(reply.as_ptr() as *const ICMP_ECHO_REPLY);
+        // Status 0 = IP_SUCCESS; các mã khác (TTL hết hạn, unreachable...) coi như mất.
+        if r.Status != 0 {
+            return None;
+        }
+        Some(r.RoundTripTime as f32)
     }
 }
 
