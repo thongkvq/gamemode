@@ -56,3 +56,10 @@ App đòi quyền admin nên shell thường không chụp được cửa sổ. 
 - `svc:sshd=1` trong config sẽ dừng SSH server khi bật Game Mode.
 - Auto mode mặc định tắt, phải tự bật trong UI.
 - Khi tắt quét Wi-Fi, nếu mạng rớt thì máy không tự kết nối lại cho tới khi Restore.
+
+## Bộ cài (Inno Setup)
+- Cài Inno Setup 6: `winget install JRSoftware.InnoSetup --scope user`.
+- Build: `cargo build --release`, rồi `"%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" installer\gamemode.iss`, ra file `dist\GameMode-Setup-<version>.exe` (thư mục `dist/` không đưa lên git).
+- Version phải sửa ở 2 chỗ: `Cargo.toml` và `#define AppVersion` trong `installer/gamemode.iss`.
+- Bộ cài cài theo từng user vào `%LOCALAPPDATA%\Programs\GameMode`, không cần admin khi cài. Gỡ cài đặt sẽ xoá config/session và task "chạy cùng Windows".
+- Exe chưa ký số nên lần đầu chạy sẽ bị SmartScreen cảnh báo.

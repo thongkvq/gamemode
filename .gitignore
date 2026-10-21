@@ -4,3 +4,4 @@ session*.json
 gamemode-crash.log
 selftest.txt
 launchtest.txt
+/dist
