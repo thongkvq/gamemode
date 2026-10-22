@@ -4,6 +4,7 @@ mod report;
 mod sys;
 mod tray;
 mod ui;
+mod update;
 
 use eframe::egui::{self, Color32, FontId, Margin, Rect, RichText, Rounding, Stroke, pos2, vec2};
 use egui_plot::{GridInput, GridMark, HLine, Line, LineStyle, MarkerShape, Plot, PlotPoints, Points, VLine};
@@ -416,6 +417,8 @@ struct Opts {
     close_to_tray: bool,
     /// `report:enabled`: ghi số liệu và lưu báo cáo sau mỗi trận.
     report_enabled: bool,
+    /// `update:enabled`: tự kiểm tra bản cập nhật OTA từ server nội bộ.
+    update_enabled: bool,
 }
 
 impl Default for Opts {
@@ -430,6 +433,7 @@ impl Default for Opts {
             auto_restore: true,
             close_to_tray: true,
             report_enabled: true,
+            update_enabled: true,
         }
     }
 }
@@ -444,6 +448,8 @@ struct Config {
     game_paths: HashMap<String, String>,
     /// Host ping internet của báo cáo trận (`report:ping_host`).
     ping_host: String,
+    /// URL manifest cập nhật OTA (`update:url`).
+    update_url: String,
     opts: Opts,
 }
 
@@ -453,7 +459,8 @@ fn is_on(v: &str) -> bool {
 
 /// Đọc cấu hình: `keep:<exe>=1/0`, `svc:<tên>=1/0`, `game:<exe>=1`, `gamepath:<exe>=<path>`,
 /// `auto:enabled/restore=1/0`, `opt:standby/trim/gpu/wlan/gamedvr=1/0`,
-/// `ui:close_to_tray=1/0`, `report:enabled=1/0`, `report:ping_host=<host>`.
+/// `ui:close_to_tray=1/0`, `report:enabled=1/0`, `report:ping_host=<host>`,
+/// `update:enabled=1/0`, `update:url=<url manifest>`.
 /// Các dòng `app:...` của bản cũ được bỏ qua (không còn danh sách app cố định).
 fn load_config() -> Config {
     let text = std::fs::read_to_string(config_path()).unwrap_or_default();
@@ -462,6 +469,7 @@ fn load_config() -> Config {
     let mut games: Vec<String> = Vec::new();
     let mut game_paths: HashMap<String, String> = HashMap::new();
     let mut ping_host = report::PING_HOST_DEFAULT.to_string();
+    let mut update_url = update::DEFAULT_MANIFEST_URL.to_string();
     let mut opts = Opts::default();
 
     for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
@@ -527,6 +535,19 @@ fn load_config() -> Config {
                     _ => {}
                 }
             }
+        } else if let Some(rest) = line.strip_prefix("update:") {
+            if let Some((k, v)) = rest.rsplit_once('=') {
+                match k.trim() {
+                    "enabled" => opts.update_enabled = is_on(v),
+                    "url" => {
+                        let url = v.trim();
+                        if !url.is_empty() {
+                            update_url = url.to_string();
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
         // dòng "app:..." / dòng rác của bản cũ: bỏ qua
     }
@@ -546,6 +567,7 @@ fn load_config() -> Config {
         games,
         game_paths,
         ping_host,
+        update_url,
         opts,
     }
 }
@@ -581,6 +603,8 @@ fn write_config(cfg: &Config) -> bool {
     lines.push(format!("ui:close_to_tray={}", if o.close_to_tray { 1 } else { 0 }));
     lines.push(format!("report:enabled={}", if o.report_enabled { 1 } else { 0 }));
     lines.push(format!("report:ping_host={}", cfg.ping_host));
+    lines.push(format!("update:enabled={}", if o.update_enabled { 1 } else { 0 }));
+    lines.push(format!("update:url={}", cfg.update_url));
     std::fs::write(config_path(), lines.join("\n")).is_ok()
 }
 
@@ -876,6 +900,16 @@ struct Shared {
     commit_alert: Arc<AtomicBool>,
     /// % commit gần nhất, chỉ để hiển thị trong cảnh báo.
     commit_pct: Arc<Mutex<f32>>,
+    /// Trạng thái cập nhật OTA (thread nền trong `update.rs` ghi, UI đọc).
+    update_state: Arc<Mutex<update::UpdateState>>,
+    /// Manifest của bản đang chờ cài (giữ lại để biết version đích khi cài).
+    update_manifest: Arc<Mutex<Option<update::Manifest>>>,
+    /// Thời điểm kiểm tra cập nhật gần nhất.
+    update_last_check: Arc<Mutex<Option<Instant>>>,
+    /// UI bấm "Kiểm tra cập nhật" -> thread nền kiểm tra ngay.
+    update_request: Arc<AtomicBool>,
+    /// URL manifest (`update:url`).
+    update_url: Arc<Mutex<String>>,
 }
 
 impl Shared {
@@ -886,6 +920,7 @@ impl Shared {
             games: self.games.lock().unwrap().clone(),
             game_paths: self.game_paths.lock().unwrap().clone(),
             ping_host: self.ping_host.lock().unwrap().clone(),
+            update_url: self.update_url.lock().unwrap().clone(),
             opts: *self.opts.lock().unwrap(),
         };
         write_config(&cfg)
@@ -913,6 +948,11 @@ impl Shared {
     /// % commit gần nhất (0.0 nếu chưa đo lần nào).
     fn commit_pct(&self) -> f32 {
         *self.commit_pct.lock().unwrap()
+    }
+
+    /// Trạng thái cập nhật OTA hiện tại (bản sao, không giữ khoá).
+    fn update_state(&self) -> update::UpdateState {
+        self.update_state.lock().unwrap().clone()
     }
 }
 
@@ -2045,6 +2085,14 @@ struct App {
     /// Chu kỳ đọc sys::commit() cho thẻ Pagefile (tối đa mỗi 2 giây).
     last_commit_sys: Instant,
     commit_sys: (u64, u64),
+    /// Lỗi khi bấm cài cập nhật (đang chơi game / đang Game Boost...) để hiện trong card hoặc banner.
+    update_err: Option<String>,
+    /// Phiên bản cập nhật mà người dùng đã bấm "Để sau" (chỉ nhớ trong phiên, không ghi config).
+    update_dismissed_version: Option<String>,
+    /// Mở/đóng vùng xem changelog trong banner cập nhật.
+    update_changelog_open: bool,
+    /// Đã bấm Cập nhật (đang trong luồng tải / cài / thử lại) — để phân biệt với lỗi kiểm tra mạng định kỳ.
+    update_download_started: bool,
 }
 
 impl App {
@@ -2098,22 +2146,28 @@ impl App {
             .map(|s| s.apps.iter().map(|a| (app_key(a), true)).collect())
             .unwrap_or_default();
 
+        let mut boot_log: Vec<(String, Color32)> = vec![
+            ("[SYSTEM] DELTA FORCE TACTICAL RAM SUITE READY".into(), Color32::from_rgb(0, 229, 255)),
+            (
+                if is_admin {
+                    "[PERM] Quyền Administrator: ĐÃ KÍCH HOẠT (Đủ quyền quản lý Services)".into()
+                } else {
+                    "[PERM] Chạy người dùng thường. Nhấp 'Cấp Quyền Admin' để tắt Services.".into()
+                },
+                if is_admin { Color32::from_rgb(0, 255, 163) } else { Color32::from_rgb(255, 170, 40) },
+            ),
+            (
+                "[SCAN] Đang quét các ứng dụng đang chạy trong session hiện tại...".into(),
+                Color32::from_rgb(50, 215, 255),
+            ),
+        ];
+        // Vừa cài bản cập nhật ở lần chạy trước (`update-pending.json`): báo kết quả trong nhật ký.
+        if let Some((line, ok)) = update::take_startup_log() {
+            boot_log.push((line, if ok { ui::SUCCESS } else { ui::DANGER }));
+        }
+
         let sh = Shared {
-            log: Arc::new(Mutex::new(vec![
-                ("[SYSTEM] DELTA FORCE TACTICAL RAM SUITE READY".into(), Color32::from_rgb(0, 229, 255)),
-                (
-                    if is_admin {
-                        "[PERM] Quyền Administrator: ĐÃ KÍCH HOẠT (Đủ quyền quản lý Services)".into()
-                    } else {
-                        "[PERM] Chạy người dùng thường. Nhấp 'Cấp Quyền Admin' để tắt Services.".into()
-                    },
-                    if is_admin { Color32::from_rgb(0, 255, 163) } else { Color32::from_rgb(255, 170, 40) },
-                ),
-                (
-                    "[SCAN] Đang quét các ứng dụng đang chạy trong session hiện tại...".into(),
-                    Color32::from_rgb(50, 215, 255),
-                ),
-            ])),
+            log: Arc::new(Mutex::new(boot_log)),
             busy: Arc::new(AtomicBool::new(false)),
             running: Arc::new(Mutex::new(Vec::new())),
             session: Arc::new(Mutex::new(session)),
@@ -2130,6 +2184,11 @@ impl App {
             ping_host: Arc::new(Mutex::new(cfg.ping_host.clone())),
             commit_alert: Arc::new(AtomicBool::new(false)),
             commit_pct: Arc::new(Mutex::new(0.0)),
+            update_state: Arc::new(Mutex::new(update::UpdateState::Idle)),
+            update_manifest: Arc::new(Mutex::new(None)),
+            update_last_check: Arc::new(Mutex::new(None)),
+            update_request: Arc::new(AtomicBool::new(false)),
+            update_url: Arc::new(Mutex::new(cfg.update_url.clone())),
         };
 
         let mut app = Self {
@@ -2156,11 +2215,17 @@ impl App {
             delete_confirm: None,
             last_commit_sys: Instant::now(),
             commit_sys: sys::commit(),
+            update_err: None,
+            update_dismissed_version: None,
+            update_changelog_open: false,
+            update_download_started: false,
         };
         app.save();
         app.start_scan();
         // Watcher sống độc lập với UI: vẫn tự tối ưu khi cửa sổ bị thu nhỏ hoặc ẩn xuống khay.
         start_watcher(sh.clone());
+        // Kiểm tra cập nhật OTA: 20 giây sau khi mở app rồi mỗi 6 giờ (thread riêng).
+        update::start_update_thread(sh.clone());
         // Icon khay phải tạo trên main thread (Windows cần message loop của thread này);
         // `Tray` được giữ trong `App` để icon không bị bỏ khi hàm này kết thúc.
         match tray::Tray::new(&sh) {
@@ -2301,6 +2366,96 @@ fn render_stat_card(
             );
         } else {
             ui.add_space(18.0);
+        }
+    });
+}
+
+/// Dòng trạng thái cập nhật (kèm mốc kiểm tra gần nhất) và màu tương ứng.
+fn update_status_text(state: &update::UpdateState, last: Option<Instant>) -> (String, Color32) {
+    let color = match state {
+        update::UpdateState::Idle | update::UpdateState::Checking => ui::TEXT_MUTED,
+        update::UpdateState::UpToDate => ui::SUCCESS,
+        update::UpdateState::Available(_) => ui::ACCENT,
+        update::UpdateState::Downloading { .. } => ui::DATA_CYAN,
+        update::UpdateState::Ready(_) => ui::SUCCESS,
+        update::UpdateState::Failed(_) => ui::DANGER,
+    };
+    let when = match last {
+        Some(t) => {
+            let secs = t.elapsed().as_secs();
+            if secs < 90 {
+                format!(" · kiểm tra {secs} giây trước")
+            } else if secs < 5400 {
+                format!(" · kiểm tra {} phút trước", secs / 60)
+            } else {
+                format!(" · kiểm tra {} giờ trước", secs / 3600)
+            }
+        }
+        None => String::new(),
+    };
+    (format!("{}{}", state.label(), when), color)
+}
+
+/// Card "Cập nhật ứng dụng" trong tab Tự động & Tối ưu: công tắc tự kiểm tra, phiên bản hiện tại, trạng thái + lần kiểm tra cuối, nút kiểm tra.
+fn render_update_card(
+    ui: &mut egui::Ui,
+    sh: &Shared,
+    opts_view: &mut Opts,
+    save_needed: &mut bool,
+    update_err: &mut Option<String>,
+) {
+    ui::card(ui, |ui| {
+        ui::section_header(
+            ui,
+            "OTA",
+            "Cập nhật ứng dụng",
+            Some("Tự động kiểm tra bản phát hành mới từ server nội bộ"),
+        );
+        ui.add_space(ui::SPACE_HEADER_GAP);
+
+        if ui::toggle_row(
+            ui,
+            &mut opts_view.update_enabled,
+            "Tự động kiểm tra cập nhật",
+            "Kiểm tra 20 giây sau khi mở app, sau đó mỗi 6 giờ",
+        ) {
+            *save_needed = true;
+        }
+        ui.add_space(8.0);
+
+        let state = sh.update_state();
+        let last = *sh.update_last_check.lock().unwrap();
+        let (status_text, color) = update_status_text(&state, last);
+
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            ui.label(
+                RichText::new(format!("Phiên bản: v{}", update::current_version()))
+                    .size(11.5)
+                    .monospace()
+                    .color(ui::TEXT_MAIN),
+            );
+            ui.label(RichText::new("·").size(11.5).color(ui::TEXT_DIM));
+            ui.label(RichText::new(status_text).size(11.5).color(color));
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let busy_net = matches!(
+                    &state,
+                    update::UpdateState::Checking | update::UpdateState::Downloading { .. }
+                );
+                if ui
+                    .add_enabled(!busy_net, ui::ghost_button_sized("Kiểm tra cập nhật", 11.5))
+                    .clicked()
+                {
+                    update::request_check(sh);
+                    *update_err = None;
+                }
+            });
+        });
+
+        if let Some(e) = update_err.as_ref() {
+            ui.add_space(6.0);
+            ui.label(RichText::new(format!("⚠ {e}")).size(11.0).color(ui::DANGER));
         }
     });
 }
@@ -3766,6 +3921,253 @@ impl App {
             self.delete_confirm = Some((id, Instant::now()));
         }
     }
+
+    /// Banner thông báo cập nhật OTA trên cùng cột phải (phía trên hàng tab).
+    /// Chỉ hiện khi có bản mới (Available), đang tải (Downloading), đã tải xong (Ready),
+    /// hoặc lỗi tải/cài sau khi người dùng đã bấm cập nhật (Failed).
+    fn render_update_banner(&mut self, ui: &mut egui::Ui) {
+        let state = self.sh.update_state();
+
+        match &state {
+            update::UpdateState::Available(m) => {
+                if self.update_dismissed_version.as_deref() == Some(&m.version) {
+                    return;
+                }
+
+                ui::banner_card(ui, ui::ACCENT, Color32::from_rgb(70, 50, 15), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        ui.label(RichText::new("⬆").size(14.0).strong().color(ui::ACCENT));
+                        ui.label(
+                            RichText::new(format!("Có bản mới {}", m.version))
+                                .size(13.0)
+                                .strong()
+                                .color(ui::TEXT_MAIN),
+                        );
+                        ui.label(
+                            RichText::new(format!("(hiện tại v{})", update::current_version()))
+                                .size(11.0)
+                                .color(ui::TEXT_MUTED),
+                        );
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+
+                            // Nút chính "Cập nhật" ở ngoài cùng bên phải
+                            if ui.add(ui::primary_button_sized("Cập nhật", 11.5)).clicked() {
+                                self.update_download_started = true;
+                                self.update_err = None;
+                                update::start_download(self.sh.clone());
+                            }
+
+                            // Nút phụ "Xem thay đổi"
+                            let changelog_btn_text = if self.update_changelog_open {
+                                "Ẩn thay đổi"
+                            } else {
+                                "Xem thay đổi"
+                            };
+                            if ui.add(ui::ghost_button_sized(changelog_btn_text, 11.5)).clicked() {
+                                self.update_changelog_open = !self.update_changelog_open;
+                            }
+
+                            // Nút "Để sau": ẩn banner cho tới khi có version khác
+                            if ui.add(ui::ghost_button_sized("Để sau", 11.5)).clicked() {
+                                self.update_dismissed_version = Some(m.version.clone());
+                            }
+                        });
+                    });
+
+                    if self.update_changelog_open {
+                        ui.add_space(8.0);
+                        egui::Frame::none()
+                            .fill(Color32::from_rgb(9, 12, 16))
+                            .stroke(Stroke::new(1.0, ui::BORDER))
+                            .inner_margin(Margin::same(10.0))
+                            .show(ui, |ui| {
+                                egui::ScrollArea::vertical()
+                                    .max_height(160.0)
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
+                                        if m.changelog.trim().is_empty() {
+                                            ui.label(
+                                                RichText::new("Không có ghi chú thay đổi.")
+                                                    .size(11.0)
+                                                    .color(ui::TEXT_MUTED),
+                                            );
+                                        } else {
+                                            for raw in m.changelog.lines() {
+                                                let trimmed = raw.trim();
+                                                if trimmed.is_empty() {
+                                                    ui.add_space(3.0);
+                                                    continue;
+                                                }
+                                                if let Some(h) = trimmed.strip_prefix('#') {
+                                                    let heading = h.trim_start_matches('#').trim();
+                                                    ui.add_space(4.0);
+                                                    ui.label(
+                                                        RichText::new(heading)
+                                                            .font(FontId::proportional(12.0))
+                                                            .strong()
+                                                            .color(ui::ACCENT),
+                                                    );
+                                                } else if let Some(bullet) = trimmed.strip_prefix("- ") {
+                                                    ui.horizontal(|ui| {
+                                                        ui.spacing_mut().item_spacing.x = 4.0;
+                                                        ui.add_space(4.0);
+                                                        ui.label(
+                                                            RichText::new("–")
+                                                                .size(11.0)
+                                                                .color(ui::TEXT_MUTED),
+                                                        );
+                                                        ui.label(
+                                                            RichText::new(bullet)
+                                                                .size(11.0)
+                                                                .color(ui::TEXT_MAIN),
+                                                        );
+                                                    });
+                                                } else {
+                                                    ui.label(
+                                                        RichText::new(trimmed)
+                                                            .size(11.0)
+                                                            .color(ui::TEXT_MUTED),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    });
+                            });
+                    }
+                });
+                ui.add_space(ui::SPACE_CARD_GAP);
+            }
+            update::UpdateState::Downloading { done, total } => {
+                let mb_done = *done as f64 / (1024.0 * 1024.0);
+                let text = if *total > 0 {
+                    let mb_total = *total as f64 / (1024.0 * 1024.0);
+                    let pct = (*done as f64 * 100.0 / *total as f64).clamp(0.0, 100.0);
+                    format!("Đang tải {:.1} / {:.1} MB ({:.0}%)", mb_done, mb_total, pct)
+                } else {
+                    format!("Đang tải {:.1} MB", mb_done)
+                };
+
+                let ver_suffix = self
+                    .sh
+                    .update_manifest
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|m| format!(" bản {}", m.version))
+                    .unwrap_or_default();
+
+                ui::banner_card(ui, ui::DATA_CYAN, Color32::from_rgb(15, 60, 55), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        ui.label(RichText::new("⬆").size(14.0).strong().color(ui::DATA_CYAN));
+                        ui.label(
+                            RichText::new(format!("Đang tải{ver_suffix}…"))
+                                .size(13.0)
+                                .strong()
+                                .color(ui::TEXT_MAIN),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                RichText::new(text)
+                                    .size(11.5)
+                                    .monospace()
+                                    .color(ui::DATA_CYAN),
+                            );
+                        });
+                    });
+                    ui.add_space(8.0);
+                    let ratio = if *total > 0 {
+                        (*done as f32 / *total as f32).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    ui::segmented_bar(ui, ratio);
+                });
+                ui.add_space(ui::SPACE_CARD_GAP);
+            }
+            update::UpdateState::Ready(_) => {
+                let ver_str = self
+                    .sh
+                    .update_manifest
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|m| format!(" bản {}", m.version))
+                    .unwrap_or_default();
+
+                ui::banner_card(ui, ui::SUCCESS, Color32::from_rgb(20, 70, 40), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        ui.label(RichText::new("✔").size(14.0).strong().color(ui::SUCCESS));
+                        ui.label(
+                            RichText::new(format!(
+                                "Đã tải xong{} — GameMode sẽ tự đóng, cài rồi mở lại.",
+                                ver_str
+                            ))
+                            .size(12.0)
+                            .strong()
+                            .color(ui::TEXT_MAIN),
+                        );
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add(ui::primary_button_sized("Cài và khởi động lại", 11.5))
+                                .clicked()
+                            {
+                                match update::apply_update(&self.sh) {
+                                    Ok(()) => self.update_err = None,
+                                    Err(msg) => {
+                                        self.sh.log(format!("  ⚠ [UPDATE] {msg}"), ui::DANGER);
+                                        self.update_err = Some(msg);
+                                    }
+                                }
+                            }
+                        });
+                    });
+
+                    if let Some(err) = self.update_err.as_ref() {
+                        ui.add_space(6.0);
+                        ui.label(RichText::new(format!("⚠ {err}")).size(11.5).color(ui::WARNING));
+                    }
+                });
+                ui.add_space(ui::SPACE_CARD_GAP);
+            }
+            update::UpdateState::Failed(msg) if self.update_download_started => {
+                ui::banner_card(ui, ui::DANGER, Color32::from_rgb(80, 25, 25), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        ui.label(RichText::new("⚠").size(14.0).strong().color(ui::DANGER));
+                        ui.label(
+                            RichText::new(format!("Lỗi tải bản cập nhật: {msg}"))
+                                .size(12.0)
+                                .color(ui::DANGER),
+                        );
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+
+                            if ui.add(ui::primary_button_sized("Thử lại", 11.5)).clicked() {
+                                self.update_err = None;
+                                update::start_download(self.sh.clone());
+                            }
+
+                            if ui.add(ui::ghost_button_sized("Để sau", 11.5)).clicked() {
+                                self.update_download_started = false;
+                            }
+                        });
+                    });
+                });
+                ui.add_space(ui::SPACE_CARD_GAP);
+            }
+            update::UpdateState::UpToDate => {
+                self.update_download_started = false;
+            }
+            _ => {}
+        }
+    }
 }
 
 impl eframe::App for App {
@@ -3807,6 +4209,14 @@ impl eframe::App for App {
             ctx.request_repaint_after(Duration::from_secs(2));
         } else {
             ctx.request_repaint_after(Duration::from_millis(400));
+        }
+        // Repaint nhanh khi đang kiểm tra hoặc tải cập nhật OTA
+        let update_st = self.sh.update_state();
+        if matches!(
+            update_st,
+            update::UpdateState::Downloading { .. } | update::UpdateState::Checking
+        ) {
+            ctx.request_repaint_after(Duration::from_millis(100));
         }
         let sh = self.sh.clone();
 
@@ -4098,6 +4508,9 @@ impl eframe::App for App {
             .frame(egui::Frame::none().fill(ui::BG).inner_margin(Margin::same(ui::SPACE_PANEL_PAD)))
             .show(ctx, |ui| {
                 ui::paint_background_grid(ui);
+
+                // Banner cập nhật OTA (nếu có bản mới, đang tải, đã tải xong, hoặc lỗi tải)
+                self.render_update_banner(ui);
 
                 // Thanh tab ở trên cùng
                 ui.horizontal(|ui| {
@@ -4413,6 +4826,16 @@ impl eframe::App for App {
                                     );
                                 }
 
+                                // Cập nhật OTA: luôn nằm dưới cùng, phủ hết chiều rộng tab.
+                                ui.add_space(ui::SPACE_CARD_GAP);
+                                render_update_card(
+                                    ui,
+                                    &sh,
+                                    &mut opts_view,
+                                    &mut save_needed,
+                                    &mut self.update_err,
+                                );
+
                                 if save_needed {
                                     *sh.opts.lock().unwrap() = opts_view;
                                     self.save();
@@ -4652,6 +5075,15 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    // --updatetest: kiểm tra manifest cập nhật, và nếu có bản mới thì tải + kiểm SHA-256
+    // (KHÔNG chạy bộ cài, không cần admin) rồi ghi updatetest.txt.
+    if std::env::args().any(|a| a == "--updatetest") {
+        let url = load_config().update_url;
+        let text = format!("{}\n", update::self_test(&url));
+        let _ = std::fs::write(config_path().with_file_name("updatetest.txt"), text);
+        return Ok(());
+    }
+
     // --purgetest: xả standby list một lần, ghi free/standby trước & sau ra purgetest.txt.
     // --tasktest: tạo task "GameMode", đọc lại XML, rồi xoá (chỉ để kiểm tra cách quote đường dẫn).
     if std::env::args().any(|a| a == "--tasktest") {
@@ -4722,9 +5154,13 @@ delete={:?}
         }
     };
 
-    if std::env::args().any(|a| a == "--minimized") {
+    // Vừa cài bản cập nhật ở lần chạy trước (`update-pending.json`): ghi nhận kết quả và
+    // LUÔN hiện cửa sổ — kể cả khi task "chạy cùng Windows" gọi với `--minimized`.
+    let just_updated = update::check_pending_on_start();
+    if !just_updated && std::env::args().any(|a| a == "--minimized") {
         START_HIDDEN.store(true, Ordering::SeqCst);
     }
+
     let mut viewport = egui::ViewportBuilder::default()
         .with_title(WINDOW_TITLE)
         .with_inner_size([1240.0, 820.0])

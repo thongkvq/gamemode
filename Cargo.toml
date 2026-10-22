@@ -33,6 +33,11 @@ serde_json = "1"
 tray-icon = { version = "0.26", default-features = false }
 # Lấy HWND của cửa sổ eframe từ CreationContext (eframe 0.29 dùng raw-window-handle 0.6).
 raw-window-handle = "0.6"
+# Tự cập nhật OTA: GET manifest + tải bộ cài. HTTPS bằng rustls (feature "tls"; tắt gzip
+# vì manifest/bộ cài không nén qua HTTP — server trả file .exe thẳng).
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
+# Kiểm SHA-256 bộ cài tải về trước khi chạy.
+sha2 = "0.10"
 
 [profile.release]
 opt-level = 3

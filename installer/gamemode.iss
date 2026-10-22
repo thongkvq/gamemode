@@ -62,6 +62,9 @@ Name: "{userdesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopico
 [Run]
 ; shellexec để Windows đọc manifest và hỏi quyền admin như khi mở bằng tay.
 Filename: "{app}\{#AppExe}"; Description: "{cm:RunAppVN}"; Flags: postinstall nowait skipifsilent shellexec
+; Cập nhật OTA: bộ cài do GameMode gọi kèm /UPDATE thì luôn mở lại app sau khi cài xong —
+; không có skipifsilent nên chạy được cả khi bộ cài ở chế độ /VERYSILENT.
+Filename: "{app}\{#AppExe}"; Flags: nowait shellexec; Check: IsUpdateRun
 
 [UninstallRun]
 ; Xoá task "chạy cùng Windows" nếu người dùng đã bật (bỏ qua nếu không có hoặc không đủ quyền).
@@ -72,8 +75,31 @@ Type: files; Name: "{app}\gamemode.cfg"
 Type: files; Name: "{app}\session.json"
 Type: files; Name: "{app}\session.last.json"
 Type: files; Name: "{app}\gamemode-crash.log"
+Type: files; Name: "{app}\update-pending.json"
 Type: files; Name: "{app}\*.txt"
 ; Báo cáo từng trận: xoá hết file .json rồi tới cả thư mục reports.
 Type: files; Name: "{app}\reports\*.json"
 Type: filesandordirs; Name: "{app}\reports"
 Type: dirifempty; Name: "{app}"
+
+[Code]
+{ Bộ cài có được chạy kèm tham số /UPDATE không (do GameMode tự cập nhật OTA gọi).
+  Nhận cả "/UPDATE", "-UPDATE" và "/UPDATE=1". }
+function IsUpdateRun(): Boolean;
+var
+  I: Integer;
+  P: String;
+begin
+  Result := False;
+  for I := 1 to ParamCount do
+  begin
+    P := ParamStr(I);
+    if (CompareText(P, '/UPDATE') = 0) or (CompareText(P, '-UPDATE') = 0) then
+    begin
+      Result := True;
+      Exit;
+    end;
+  end;
+  if ExpandConstant('{param:UPDATE|}') = '1' then
+    Result := True;
+end;

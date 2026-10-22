@@ -6,5 +6,7 @@ selftest.txt
 launchtest.txt
 pingtest.txt
 reporttest.txt
+updatetest.txt
+update-pending.json
 reports/
 /dist

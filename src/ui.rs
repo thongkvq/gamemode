@@ -258,6 +258,35 @@ pub fn card<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui) -> R)
 }
 
 // ==========================================
+// KHUNG BANNER THÔNG BÁO TACTICAL HUD
+// ==========================================
+/// Khung banner thông báo Tactical HUD (góc vát 8px, viền đổi theo mức độ, dải accent 3px mép trái).
+pub fn banner_card<R>(
+    ui: &mut egui::Ui,
+    accent_color: Color32,
+    border_color: Color32,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<R> {
+    let bg_idx = ui.painter().add(egui::Shape::Noop);
+    let bar_idx = ui.painter().add(egui::Shape::Noop);
+    let resp = egui::Frame::none()
+        .inner_margin(Margin::symmetric(16.0, 10.0))
+        .show(ui, add_contents);
+
+    let rect = resp.response.rect;
+    if rect.is_positive() {
+        let shape = hud_card_shape(rect, CARD_BG, border_color, accent_color);
+        ui.painter().set(bg_idx, shape);
+
+        let c = 8.0_f32;
+        let bar_h = (rect.height() - c * 2.0).max(1.0);
+        let bar_rect = Rect::from_min_size(pos2(rect.left(), rect.top() + c), vec2(3.0, bar_h));
+        ui.painter().set(bar_idx, egui::Shape::rect_filled(bar_rect, Rounding::ZERO, accent_color));
+    }
+    resp
+}
+
+// ==========================================
 // SECTION HEADER
 // ==========================================
 /// Tiêu đề khối: vạch accent dọc 3px, chữ in hoa letter-spacing rộng, mã nhỏ "// 01" bên phải.
@@ -807,6 +836,79 @@ impl egui::Widget for PrimaryButton {
 
 pub fn primary_button(text: impl Into<String>, busy: bool) -> PrimaryButton {
     PrimaryButton::new(text, busy)
+}
+
+// ==========================================
+// NÚT PRIMARY CỠ TÙY BIẾN
+// ==========================================
+pub struct PrimaryButtonSized {
+    text: String,
+    size: f32,
+}
+
+impl PrimaryButtonSized {
+    pub fn new(text: impl Into<String>, size: f32) -> Self {
+        Self {
+            text: text.into(),
+            size,
+        }
+    }
+}
+
+impl egui::Widget for PrimaryButtonSized {
+    fn ui(self, ui: &mut egui::Ui) -> egui::Response {
+        let text_color = Color32::from_rgb(10, 14, 21);
+        let galley = ui.painter().layout_no_wrap(
+            self.text,
+            FontId::proportional(self.size),
+            text_color,
+        );
+        let pad_x = 12.0_f32;
+        let pad_y = 5.0_f32;
+        let text_size = galley.size();
+        let desired_size = vec2(text_size.x + pad_x * 2.0, (text_size.y + pad_y * 2.0).max(28.0));
+
+        let (rect, resp) = ui.allocate_at_least(desired_size, egui::Sense::click());
+        let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
+
+        let hovered = resp.hovered();
+        let painter = ui.painter_at(rect);
+
+        let c = 4.0_f32;
+        let points = vec![
+            pos2(rect.left() + c, rect.top()),
+            pos2(rect.right(), rect.top()),
+            pos2(rect.right(), rect.bottom() - c),
+            pos2(rect.right() - c, rect.bottom()),
+            pos2(rect.left(), rect.bottom()),
+            pos2(rect.left(), rect.top() + c),
+        ];
+
+        let bg_fill = if hovered {
+            Color32::from_rgb(255, 195, 65)
+        } else {
+            ACCENT
+        };
+        let border_stroke = if hovered {
+            Stroke::new(1.0_f32, Color32::from_rgb(255, 235, 150))
+        } else {
+            Stroke::new(1.0_f32, Color32::from_rgb(220, 150, 20))
+        };
+
+        painter.add(egui::Shape::convex_polygon(points, bg_fill, border_stroke));
+
+        let text_pos = pos2(
+            rect.center().x - text_size.x / 2.0,
+            rect.center().y - text_size.y / 2.0,
+        );
+        painter.galley(text_pos, galley, text_color);
+
+        resp
+    }
+}
+
+pub fn primary_button_sized(text: impl Into<String>, size: f32) -> PrimaryButtonSized {
+    PrimaryButtonSized::new(text, size)
 }
 
 // ==========================================

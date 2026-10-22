@@ -30,6 +30,7 @@ cargo build --release
 | `--traytest` | Tạo icon khay + menu trong 5 giây rồi thoát | `traytest.txt` |
 | `--pingtest` | Ping gateway (`GetBestRoute`) và host internet 5 lần mỗi đích (IP, RTT, mất gói) | `pingtest.txt` |
 | `--reporttest` | Chạy recorder giả lập 20 giây (mẫu mỗi 2 giây, không cần game, cho phép trận < 60 s) và lưu một báo cáo `game = "test"` | `reporttest.txt` |
+| `--updatetest` | Kiểm tra manifest cập nhật; nếu có bản mới thì tải và kiểm SHA-256 (KHÔNG chạy bộ cài) | `updatetest.txt` |
 | `--minimized` | Khởi động **ẩn xuống khay hệ thống** (task chạy cùng Windows dùng cờ này) | |
 
 ## Báo cáo trận đấu (2026-10-22)
@@ -94,3 +95,32 @@ App đòi quyền admin nên shell thường không chụp được cửa sổ. 
 - Version (hiện 1.2.0) phải sửa ở 2 chỗ: `Cargo.toml` và `#define AppVersion` trong `installer/gamemode.iss`.
 - Bộ cài cài theo từng user vào `%LOCALAPPDATA%\Programs\GameMode`, không cần admin khi cài. Gỡ cài đặt sẽ xoá config/session và task "chạy cùng Windows".
 - Exe chưa ký số nên lần đầu chạy sẽ bị SmartScreen cảnh báo.
+- Bộ cài có nhánh cập nhật OTA: chạy kèm `/UPDATE` thì `[Code] IsUpdateRun` bật entry `[Run]`
+  không có `skipifsilent`, nên cài xong (kể cả `/VERYSILENT`) là tự mở lại `{app}\GameMode.exe`.
+
+## Cập nhật OTA (2026-10-22)
+- Manifest: `https://update-dhcs.paroda.net/apps/gamemode/manifest.json` (nginx, `Cache-Control: no-store`).
+  Bộ cài: `https://update-dhcs.paroda.net/apps/gamemode/releases/<filename>` (kèm `releases.json` — mảng manifest cũ, mới nhất ở đầu).
+- Config trong `gamemode.cfg`: `update:enabled=1/0` (mặc định 1) và `update:url=<url manifest>`.
+  Công tắc "Tự động kiểm tra cập nhật" + một dòng trạng thái và nút Kiểm tra/Cài nằm ở card
+  "Cập nhật OTA" trong tab **Tự động & Tối ưu**. Có bản mới thì banner trên cùng cột phải: Cập nhật / Xem thay đổi / Để sau,
+  thanh tiến độ khi tải, rồi "Cài và khởi động lại".
+- `src/update.rs`: `UpdateState` = `Idle | Checking | UpToDate | Available(manifest) | Downloading{done,total} | Ready(path) | Failed(lỗi)`,
+  giữ trong `Shared` (`update_state`, `update_manifest`, `update_last_check`, `update_request`, `update_url`).
+  Thread nền kiểm tra 20 giây sau khi mở app rồi mỗi 6 giờ (timeout HTTP 10 giây); lỗi mạng chỉ ghi `Failed` + 1 dòng log.
+  Bộ cài tải vào `%TEMP%\GameMode-update\`, phải khớp `size` và `sha256` của manifest (sai thì xoá file), chỉ nhận `download_url` dạng `https://`.
+- Cài: từ chối khi đang có game trong danh sách chạy hoặc đang trong phiên Game Boost; ghi
+  `update-pending.json` (`{"from":"1.2.0","to":"1.3.0"}`) cạnh exe rồi chạy
+  `cmd.exe /c ping -n 4 127.0.0.1 >nul & start "" "<setup>" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /UPDATE`
+  (cửa sổ ẩn, trễ ~3 giây cho app kịp thoát trước khi Inno kiểm `AppMutex`), sau đó thoát như menu khay "Thoát".
+  Lần mở sau thấy file đánh dấu thì log `✔ Đã cập nhật 1.2.0 → 1.3.0` (hoặc báo không thành công), hiện cửa sổ dù có `--minimized`, rồi xoá file.
+- `--updatetest`: kiểm tra manifest + tải thử + kiểm SHA-256 (không chạy bộ cài, không cần admin) → `updatetest.txt`.
+  `GAMEMODE_FAKE_VERSION=1.0.0` để giả version hiện tại khi thử (dùng cho cả `--updatetest`).
+- Publish: `cargo build --release` → `ISCC installer\gamemode.iss` → `scripts\publish_update.ps1 -Version 1.3.0 -Changelog "# 1.3.0 - ..."`
+  (thêm `-DryRun` để chỉ tạo manifest, không upload). Script kiểm version khớp `Cargo.toml` + `installer/gamemode.iss`,
+  scp lên host Proxmox rồi `pct push` vào container 106, `mv` manifest nguyên tử, chown `www-data`, và đọc lại qua HTTPS để so version + sha256.
+  Lưu `.iss` và `.ps1` dạng UTF-8 **có BOM** (Inno Setup và PowerShell 5.1 cần BOM để đọc đúng tiếng Việt).
+- Kênh thử: `-RemoteDir /srv/dhcs-update/apps/gamemode-test -PublicBaseUrl https://update-dhcs.paroda.net/apps/gamemode-test`,
+  app trỏ vào bằng `update:url=https://update-dhcs.paroda.net/apps/gamemode-test/manifest.json`. Kênh này đang có bản 1.2.0 thử.
+- Đã thử trên PC (2026-10-22): publish kênh thử, `--updatetest` tải + khớp SHA-256, banner hiện đủ 3 trạng thái, từ chối cài khi đang chơi.
+  **Chưa thử** vòng cài thật (thoát app → bộ cài `/VERYSILENT /UPDATE` → tự mở lại). Kênh thật `apps/gamemode` **chưa có manifest**: bản đầu tiên publish lên đó nên là 1.3.0.
