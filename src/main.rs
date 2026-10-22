@@ -325,6 +325,133 @@ fn game_family_from_nodes(nodes: &[sys::ProcNode], games: &[String]) -> HashMap<
     fam
 }
 
+/// Tên exe (viết thường) đang được GIỮ theo đúng quy tắc giữ hiện tại: `keep:` trong config
+/// thắng, chưa có thì dùng danh sách mặc định. Game / anti-cheat bị loại vì đã có "họ" process
+/// game bảo vệ riêng (xem `game_family_from_nodes`).
+fn kept_app_names(
+    nodes: &[sys::ProcNode],
+    keep: &HashMap<String, bool>,
+    skip: &[String],
+) -> HashSet<String> {
+    let mut out: HashSet<String> = HashSet::new();
+    for n in nodes.iter() {
+        // Shell/hệ thống không bao giờ làm gốc: con cháu của explorer là gần như mọi app.
+        if n.name.is_empty() || is_ace_or_game(&n.name, skip) || FAMILY_STOP_EXE.contains(&n.name.as_str()) {
+            continue;
+        }
+        if keep_decision(keep, &n.name) {
+            out.insert(n.name.clone());
+        }
+    }
+    out
+}
+
+/// PID -> tên exe của app ĐƯỢC GIỮ mà nó là con cháu (vd `node.exe` -> `claude.exe`).
+/// Chỉ đi XUỐNG theo ppid (con, cháu, chắt...) nên tổ tiên của app được giữ không vì thế mà
+/// được giữ. Mỗi PID chỉ được thăm một lần nên vòng ppid giả / PID tái sử dụng không treo,
+/// và ppid trỏ tới PID không còn trong snapshot thì đơn giản là hết nhánh.
+fn kept_family_from_nodes(
+    nodes: &[sys::ProcNode],
+    keep_names: &HashSet<String>,
+) -> HashMap<u32, String> {
+    let mut kept: HashMap<u32, String> = HashMap::new();
+    if keep_names.is_empty() {
+        return kept;
+    }
+
+    // 1. Process gốc: chính app được giữ (bản thân nó không nằm trong map).
+    let mut roots: Vec<(u32, String)> = Vec::new();
+    let mut visited: HashSet<u32> = HashSet::new();
+    for n in nodes.iter() {
+        if n.pid <= 4 || !keep_names.contains(&n.name) {
+            continue;
+        }
+        if visited.insert(n.pid) {
+            roots.push((n.pid, n.name.clone()));
+        }
+    }
+
+    // 2. Duyệt xuống toàn bộ con cháu; giữ nguyên tên app gốc của cả nhánh.
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for n in nodes.iter() {
+        if n.ppid != n.pid {
+            children.entry(n.ppid).or_default().push(n.pid);
+        }
+    }
+    let mut queue: Vec<(u32, String)> = roots;
+    while let Some((pid, owner)) = queue.pop() {
+        let Some(kids) = children.get(&pid) else { continue };
+        for &kid in kids.iter() {
+            // `visited` đã chứa PID gốc nên app được giữ không bị coi là con của chính nó.
+            if !visited.insert(kid) {
+                continue;
+            }
+            kept.insert(kid, owner.clone());
+            queue.push((kid, owner.clone()));
+        }
+    }
+
+    kept
+}
+
+/// Một dòng log tóm tắt các process con của app được giữ (dùng khi Game Boost / auto optimize).
+fn kept_family_log_line(
+    kept_family: &HashMap<u32, String>,
+    nodes: &[sys::ProcNode],
+) -> Option<String> {
+    if kept_family.is_empty() {
+        return None;
+    }
+    let name_of: HashMap<u32, &str> = nodes.iter().map(|n| (n.pid, n.name.as_str())).collect();
+    // app cha -> (tên exe con -> số instance)
+    let mut by_owner: HashMap<&str, HashMap<&str, usize>> = HashMap::new();
+    for (pid, owner) in kept_family.iter() {
+        let Some(exe) = name_of.get(pid).copied() else { continue };
+        *by_owner.entry(owner.as_str()).or_default().entry(exe).or_insert(0) += 1;
+    }
+    let mut owners: Vec<(&str, Vec<(&str, usize)>)> = by_owner
+        .into_iter()
+        .map(|(owner, counts)| {
+            let mut kids: Vec<(&str, usize)> = counts.into_iter().collect();
+            kids.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+            (owner, kids)
+        })
+        .collect();
+    owners.sort_by(|a, b| a.0.cmp(b.0));
+
+    let parts: Vec<String> = owners
+        .iter()
+        .map(|(owner, kids)| {
+            let list: Vec<String> = kids
+                .iter()
+                .map(|(exe, count)| {
+                    if *count > 1 {
+                        format!("{} ×{}", exe, count)
+                    } else {
+                        (*exe).to_string()
+                    }
+                })
+                .collect();
+            format!("{}: {}", owner, list.join(", "))
+        })
+        .collect();
+    Some(format!(
+        "  · Giữ {} process con của app được giữ ({})",
+        kept_family.len(),
+        parts.join("; ")
+    ))
+}
+
+/// Tên hiển thị của app cha được giữ, dùng cho chú thích "con của ..." trên UI (vd "Claude"):
+/// lấy tên hiển thị của process cha trong snapshot, không có thì rút gọn tên exe.
+fn kept_parent_label(owner_exe: &str, all: &[sys::ProcInfo]) -> String {
+    all.iter()
+        .find(|p| p.name.eq_ignore_ascii_case(owner_exe))
+        .and_then(|p| p.display_name.clone())
+        .filter(|d| !d.trim().is_empty())
+        .unwrap_or_else(|| clean_game_name(owner_exe))
+}
+
 /// Chuỗi (viết thường) trong command line chứng tỏ process là process PHỤ do app khác mở:
 /// COM server, renderer/GPU helper của Chrome, helper do Chrome/extension mở, hay helper
 /// do launcher game mở. Loại khi lưu session và bỏ qua khi Restore.
@@ -740,6 +867,17 @@ struct RunningApp {
     exe_path: Option<String>,
     count: usize,
     total_ws: u64,
+    /// Số instance là CON CHÁU của một app được giữ (không tắt, không nén RAM): chúng không bị
+    /// tắt nên không vào session, và UI hiện "GIỮ LẠI" cho phần này.
+    kept_children: usize,
+    /// Tên hiển thị của app cha được giữ (vd "Claude") khi có instance là con cháu của nó.
+    kept_by: Option<String>,
+}
+
+/// Dòng app này có được GIỮ LẠI hoàn toàn không (mọi instance đều không bị tắt):
+/// do tick "Giữ lại" / danh sách mặc định, hoặc vì mọi instance đều là con cháu của app được giữ.
+fn app_row_kept(keep: &HashMap<String, bool>, app: &RunningApp) -> bool {
+    keep_decision(keep, &app.exe_lower) || (app.kept_children > 0 && app.kept_children >= app.count)
 }
 
 fn load_app_icon() -> Option<egui::IconData> {
@@ -787,15 +925,22 @@ fn fmt_ram(bytes: u64) -> String {
 /// Quét app đang chạy thuộc session của user hiện tại, gom theo tên exe, sắp xếp RAM giảm dần.
 /// `skip` = exe game + anti-cheat: không mở quyền đọc bộ nhớ và không hiện trong danh sách
 /// (game luôn được giữ lại nên không có gì để chọn). `games` = danh sách game trong config:
-/// nhóm exe có PID thuộc "họ" process game cũng không hiện.
-fn scan_running_apps(skip: &[String], games: &[String]) -> Vec<RunningApp> {
+/// nhóm exe có PID thuộc "họ" process game cũng không hiện. `keep` = lựa chọn "Giữ lại" của
+/// config: con cháu của app được giữ vẫn hiện nhưng đánh dấu là đã được giữ.
+fn scan_running_apps(
+    skip: &[String],
+    games: &[String],
+    keep: &HashMap<String, bool>,
+) -> Vec<RunningApp> {
     let me = std::process::id();
     let my_session = sys::current_session();
+    let nodes = sys::process_nodes();
     // Họ process game tính trước khi quét sâu: con cháu game (helper của launcher, CEF...)
     // cũng chỉ được mở bằng quyền hạn chế, không đọc bộ nhớ.
-    let protect: HashSet<u32> = game_family_from_nodes(&sys::process_nodes(), games)
-        .into_keys()
-        .collect();
+    let protect: HashSet<u32> = game_family_from_nodes(&nodes, games).into_keys().collect();
+    // Con cháu của app được giữ (`keep:` + mặc định) cũng không bị tắt -> đánh dấu để UI hiện
+    // "GIỮ LẠI" và khoá công tắc của dòng đó.
+    let kept_family = kept_family_from_nodes(&nodes, &kept_app_names(&nodes, keep, skip));
     let all = sys::snapshot_skip(skip, &protect);
     let family = game_family(&all, games);
     let parent = all.iter().find(|p| p.pid == me).map(|p| p.ppid).unwrap_or(0);
@@ -822,6 +967,9 @@ fn scan_running_apps(skip: &[String], games: &[String]) -> Vec<RunningApp> {
         {
             continue;
         }
+        let kept_by = kept_family
+            .get(&p.pid)
+            .map(|owner| kept_parent_label(owner, &all));
         let entry = map.entry(exe_lower.clone()).or_insert_with(|| RunningApp {
             exe_lower: exe_lower.clone(),
             exe_name: p.name.clone(),
@@ -829,9 +977,17 @@ fn scan_running_apps(skip: &[String], games: &[String]) -> Vec<RunningApp> {
             exe_path: None,
             count: 0,
             total_ws: 0,
+            kept_children: 0,
+            kept_by: None,
         });
         entry.count += 1;
         entry.total_ws += p.ws;
+        if let Some(label) = kept_by {
+            entry.kept_children += 1;
+            if entry.kept_by.is_none() {
+                entry.kept_by = Some(label);
+            }
+        }
         if entry.display.is_none() {
             entry.display = p.display_name.clone();
         }
@@ -1066,11 +1222,15 @@ fn do_optimize(sh: &Shared) {
     let my_session = sys::current_session();
     // Exe game + anti-cheat: chỉ lấy tên/đường dẫn, không mở quyền đọc bộ nhớ.
     let skip = skip_list(&games);
+    let nodes = sys::process_nodes();
     // "Họ" process game (launcher / tổ tiên / con cháu) tính TRƯỚC khi quét sâu để con cháu
     // của game cũng chỉ được mở bằng quyền hạn chế, không đọc bộ nhớ.
-    let family: HashSet<u32> = game_family_from_nodes(&sys::process_nodes(), &games)
+    let family: HashSet<u32> = game_family_from_nodes(&nodes, &games)
         .into_keys()
         .collect();
+    // Con cháu của app được giữ (`keep:` + danh sách mặc định): không tắt, không nén RAM,
+    // không lưu vào session (vì không bị tắt nên Restore cũng không mở lại chúng).
+    let kept_family = kept_family_from_nodes(&nodes, &kept_app_names(&nodes, &keep, &skip));
     let snap = sys::snapshot_skip(&skip, &family);
     let parent = snap.iter().find(|p| p.pid == me).map(|p| p.ppid).unwrap_or(0);
 
@@ -1103,9 +1263,13 @@ fn do_optimize(sh: &Shared) {
         if exe.is_empty() || is_never_kill(&exe, p.exe_path.as_deref()) {
             continue;
         }
-        // Game + anti-cheat (ACE) + họ process game: tuyệt đối không tắt, không lưu session,
-        // không mở quyền đọc bộ nhớ.
-        if keep_decision(&keep, &exe) || is_ace_or_game(&exe, &skip) || family.contains(&p.pid) {
+        // Game + anti-cheat (ACE) + họ process game + con cháu của app được giữ: tuyệt đối
+        // không tắt, không lưu session, không mở quyền đọc bộ nhớ.
+        if keep_decision(&keep, &exe)
+            || is_ace_or_game(&exe, &skip)
+            || family.contains(&p.pid)
+            || kept_family.contains_key(&p.pid)
+        {
             kept_exes.insert(exe);
             continue;
         }
@@ -1135,6 +1299,10 @@ fn do_optimize(sh: &Shared) {
                 Color32::from_rgb(0, 255, 163),
             );
         }
+    }
+    // 1c. Con cháu của app được giữ (vd Claude mở node.exe / cua-driver.exe): cũng không tắt.
+    if let Some(line) = kept_family_log_line(&kept_family, &nodes) {
+        push(line, Color32::from_rgb(0, 255, 163));
     }
     push(
         format!(
@@ -1486,13 +1654,14 @@ fn do_optimize(sh: &Shared) {
     //     Làm sau bước 9 để trang cũ đã bị xả trước, còn trang vừa nén nằm lại trong standby
     //     làm cache (app cần thì lấy lại ngay) -> KHÔNG xả standby lần nữa sau bước này.
     //     Bỏ qua: chính tool, game + anti-cheat + họ process game (không mở handle),
-    //     process hệ thống nhạy cảm, pid <= 4.
+    //     con cháu của app được giữ, process hệ thống nhạy cảm, pid <= 4.
     if opts.trim {
         let mut targets = 0usize;
         let mut total = 0u64;
         let mut hits: Vec<(u64, String)> = Vec::new();
         for p in sys::list_processes() {
-            if p.pid <= 4 || p.pid == me || family.contains(&p.pid) {
+            if p.pid <= 4 || p.pid == me || family.contains(&p.pid) || kept_family.contains_key(&p.pid)
+            {
                 continue;
             }
             let exe = p.name.to_lowercase();
@@ -1532,10 +1701,11 @@ fn do_optimize(sh: &Shared) {
         }
 
         // 9c. Còn gì đang giữ RAM: gom working set SAU khi nén theo tên exe, bỏ game + anti-cheat
-        //     + họ process game.
+        //     + họ process game + con cháu của app được giữ.
         let mut left: HashMap<String, u64> = HashMap::new();
         for p in sys::list_processes() {
-            if p.pid <= 4 || p.pid == me || family.contains(&p.pid) {
+            if p.pid <= 4 || p.pid == me || family.contains(&p.pid) || kept_family.contains_key(&p.pid)
+            {
                 continue;
             }
             let exe = p.name.to_lowercase();
@@ -1588,7 +1758,7 @@ fn do_optimize(sh: &Shared) {
         Color32::from_rgb(0, 255, 163),
     );
 
-    *sh.running.lock().unwrap() = scan_running_apps(&skip, &games);
+    *sh.running.lock().unwrap() = scan_running_apps(&skip, &games, &keep);
 }
 
 /// Thân của Restore: mở lại app, bật lại service, Wi-Fi autoconf, Game DVR.
@@ -1833,6 +2003,8 @@ fn start_watcher(sh: Shared) {
         let mut optimized = false;
         let mut last_mem_check = Instant::now();
         let mut last_purge = Instant::now() - PURGE_GAP;
+        // Lỗi xả standby (thường do thiếu quyền admin) chỉ log một lần, không lặp mỗi phút.
+        let mut purge_fail_logged = false;
         // Báo cáo trận đang ghi (None khi không có game nào chạy).
         let mut live: Option<Arc<Mutex<report::Live>>> = None;
         let mut last_commit_check = Instant::now() - COMMIT_CHECK;
@@ -2036,10 +2208,18 @@ fn start_watcher(sh: Shared) {
                             }
                             Err(e) => {
                                 last_purge = Instant::now();
-                                sh.log(
-                                    format!("  ⚠ [AUTO] Không xả được standby khi đang chơi: {}", e),
-                                    Color32::from_rgb(255, 120, 120),
-                                );
+                                if !purge_fail_logged {
+                                    purge_fail_logged = true;
+                                    let hint = if sys::is_admin() {
+                                        ""
+                                    } else {
+                                        " — GameMode đang chạy quyền thường, thoát ở khay rồi mở lại bằng quyền admin"
+                                    };
+                                    sh.log(
+                                        format!("  ⚠ [AUTO] Không xả được standby khi đang chơi: {}{}", e, hint),
+                                        Color32::from_rgb(255, 120, 120),
+                                    );
+                                }
                             }
                         }
                     }
@@ -2249,9 +2429,10 @@ impl App {
         let running = self.sh.running.clone();
         let scanning = self.scanning.clone();
         let games = self.sh.games.lock().unwrap().clone();
+        let keep = self.sh.keep.lock().unwrap().clone();
         let skip = skip_list(&games);
         std::thread::spawn(move || {
-            let list = scan_running_apps(&skip, &games);
+            let list = scan_running_apps(&skip, &games, &keep);
             *running.lock().unwrap() = list;
             scanning.store(false, Ordering::SeqCst);
         });
@@ -2783,7 +2964,9 @@ enum RowAction {
 }
 
 /// Một dòng app đang chạy: tick "Giữ lại" = không tắt app này; nút nhỏ "Là game" = thêm nhanh
-/// exe vào danh sách game để watcher tự tối ưu.
+/// exe vào danh sách game để watcher tự tối ưu. Dòng mà MỌI instance đều là con cháu của một
+/// app được giữ (vd node.exe do Claude mở) luôn hiện "GIỮ LẠI" và công tắc bị khoá: dòng chỉ
+/// nhận `Sense::hover()` nên bấm vào không có tác dụng, config không đổi.
 fn running_app_row(
     ui: &mut egui::Ui,
     keep: &mut bool,
@@ -2793,9 +2976,17 @@ fn running_app_row(
     use egui::{pos2, vec2, Align2, CursorIcon, FontId, Rect, Sense};
 
     let row_h = ui::ROW_APP_HEIGHT;
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click());
-    let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
-    let mut action = if resp.clicked() {
+    // Khoá công tắc khi mọi instance đều là con cháu của app được giữ: không tắt được dòng này.
+    let locked = app.kept_children > 0 && app.kept_children >= app.count;
+    let keep_shown = *keep || locked;
+    let sense = if locked { Sense::hover() } else { Sense::click() };
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), sense);
+    let resp = if locked {
+        resp
+    } else {
+        resp.on_hover_cursor(CursorIcon::PointingHand)
+    };
+    let mut action = if !locked && resp.clicked() {
         *keep = !*keep;
         RowAction::ToggleKeep
     } else {
@@ -2813,7 +3004,7 @@ fn running_app_row(
     painter.rect_filled(rect, Rounding::ZERO, bg);
 
     // Thanh màu dọc bên trái theo trạng thái (xanh lá = giữ, đỏ = sẽ tắt)
-    let bar_color = if *keep { ui::SUCCESS } else { ui::DANGER };
+    let bar_color = if keep_shown { ui::SUCCESS } else { ui::DANGER };
     let bar = Rect::from_min_size(rect.min + vec2(0.0, 6.0), vec2(3.0, row_h - 12.0));
     painter.rect_filled(bar, Rounding::same(1.0), bar_color);
 
@@ -2821,10 +3012,10 @@ fn running_app_row(
         pos2(rect.left() + 20.0, rect.center().y),
         vec2(28.0, 16.0),
     );
-    ui::draw_switch(&painter, switch_rect, *keep, hovered);
+    ui::draw_switch(&painter, switch_rect, keep_shown, hovered);
 
     let title = app.display.clone().unwrap_or_else(|| app.exe_name.clone());
-    let name_color = if *keep {
+    let name_color = if keep_shown {
         ui::SUCCESS
     } else {
         ui::TEXT_MAIN
@@ -2860,7 +3051,23 @@ fn running_app_row(
     );
 
     // Dòng 2: Tên exe nhỏ (cắt bằng "…") + mini bar RAM + "N proc — X MB"
-    let full_info_str = format!(" · {} proc — {}", app.count, fmt_ram(app.total_ws));
+    // Dòng có instance là con cháu của app được giữ: ghi rõ bao nhiêu giữ / bao nhiêu sẽ tắt.
+    let full_info_str = match app.kept_by.as_deref() {
+        Some(parent) if locked => format!(
+            " · {} proc — {} · con của {}",
+            app.count,
+            fmt_ram(app.total_ws),
+            parent
+        ),
+        Some(parent) => format!(
+            " · {} giữ (con của {}) · {} sẽ tắt — {}",
+            app.kept_children,
+            parent,
+            app.count - app.kept_children,
+            fmt_ram(app.total_ws)
+        ),
+        None => format!(" · {} proc — {}", app.count, fmt_ram(app.total_ws)),
+    };
     let info_needed_w = text_painter.layout_no_wrap(
         full_info_str.clone(),
         FontId::proportional(10.5),
@@ -2894,7 +3101,7 @@ fn running_app_row(
     let ram_ratio = (app.total_ws as f32 / (1024.0 * 1024.0 * 1024.0)).clamp(0.08, 1.0);
     text_painter.rect_filled(mb_rect, Rounding::ZERO, Color32::from_rgb(20, 27, 36));
     let filled_w = (mini_bar_w * ram_ratio).max(2.0);
-    let mb_fill_color = if *keep { ui::DATA_CYAN } else { ui::DANGER };
+    let mb_fill_color = if keep_shown { ui::DATA_CYAN } else { ui::DANGER };
     text_painter.rect_filled(
         Rect::from_min_size(mb_rect.min, vec2(filled_w, 4.0)),
         Rounding::ZERO,
@@ -2919,7 +3126,7 @@ fn running_app_row(
     );
 
     // Cột bên phải: nhãn GIỮ LẠI (xanh lá) / SẼ TẮT (đỏ)
-    let (badge, badge_color) = if *keep {
+    let (badge, badge_color) = if keep_shown {
         ("GIỮ LẠI", ui::SUCCESS)
     } else {
         ("SẼ TẮT", ui::DANGER)
@@ -2939,11 +3146,21 @@ fn running_app_row(
             .exe_path
             .as_deref()
             .unwrap_or("Không đọc được đường dẫn exe của process này.");
-        if app.display.as_deref().map_or(false, |d| !d.eq_ignore_ascii_case(&app.exe_name)) {
+        let lock_str = if locked {
+            format!(
+                "\nCon của {} — app được giữ lại, không tắt được dòng này.",
+                app.kept_by.as_deref().unwrap_or("app được giữ")
+            )
+        } else {
+            String::new()
+        };
+        let mut s = if app.display.as_deref().map_or(false, |d| !d.eq_ignore_ascii_case(&app.exe_name)) {
             format!("{}\n{}\n{}", display_str, app.exe_name, path_str)
         } else {
             format!("{}\n{}", app.exe_name, path_str)
-        }
+        };
+        s.push_str(&lock_str);
+        s
     };
     resp.on_hover_text(hover_text);
 
@@ -4257,10 +4474,7 @@ impl eframe::App for App {
 
         let kept = {
             let keep = sh.keep.lock().unwrap();
-            apps_snapshot
-                .iter()
-                .filter(|a| keep_decision(&keep, &a.exe_lower))
-                .count()
+            apps_snapshot.iter().filter(|a| app_row_kept(&keep, *a)).count()
         };
         let svc_sel = sh.svc.lock().unwrap().iter().filter(|&&x| x).count();
 
@@ -4897,10 +5111,17 @@ fn main() -> eframe::Result<()> {
             cwd_ok += cwd.is_some() as usize;
             lines.push(format!("{}	{}	{}	{:?}", p.pid, p.name, p.cmdline.is_some(), cwd));
         }
-        let apps = scan_running_apps(&skip, &cfg.games);
+        let apps = scan_running_apps(&skip, &cfg.games, &cfg.keep);
         lines.insert(0, format!("processes={} cwd_ok={} apps_listed={}", snap.len(), cwd_ok, apps.len()));
         for a in apps.iter() {
-            lines.push(format!("APP	{}	{}	{}", a.exe_name, a.count, fmt_ram(a.total_ws)));
+            lines.push(format!(
+                "APP	{}	{}	{}	kept_children={}	kept_by={}",
+                a.exe_name,
+                a.count,
+                fmt_ram(a.total_ws),
+                a.kept_children,
+                a.kept_by.as_deref().unwrap_or("-")
+            ));
         }
 
         lines.push(String::new());
@@ -5231,5 +5452,98 @@ mod tests {
                 label_count
             );
         }
+    }
+
+    fn node(pid: u32, ppid: u32, name: &str) -> sys::ProcNode {
+        sys::ProcNode {
+            pid,
+            ppid,
+            name: name.to_string(),
+        }
+    }
+
+    fn kept_names(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Cây giả: claude.exe -> node.exe -> node.exe, claude.exe -> cua-driver.exe;
+    /// node.exe khác do explorer.exe mở KHÔNG được giữ; tổ tiên của claude.exe cũng không.
+    /// Instance nào là con cháu của app được giữ thì giữ, instance khác theo quy tắc cũ.
+    #[test]
+    fn test_kept_family_from_nodes_descendants() {
+        let nodes = vec![
+            node(50, 4, "explorer.exe"),
+            node(100, 50, "claude.exe"),
+            node(101, 100, "node.exe"),
+            node(102, 101, "node.exe"),
+            node(103, 100, "cua-driver.exe"),
+            node(200, 50, "node.exe"),
+        ];
+        let kept = kept_family_from_nodes(&nodes, &kept_names(&["claude.exe"]));
+
+        assert_eq!(kept.len(), 3, "chỉ 3 process con cháu được giữ: {:?}", kept);
+        assert_eq!(kept.get(&101).map(String::as_str), Some("claude.exe"));
+        assert_eq!(kept.get(&102).map(String::as_str), Some("claude.exe"), "cháu cũng được giữ");
+        assert_eq!(kept.get(&103).map(String::as_str), Some("claude.exe"));
+        assert!(!kept.contains_key(&200), "node.exe do explorer mở không được giữ");
+        assert!(!kept.contains_key(&100), "chính app được giữ không nằm trong map con cháu");
+        assert!(!kept.contains_key(&50), "tổ tiên của app được giữ không được bảo vệ");
+    }
+
+    /// Vòng ppid giả (A là cha B, B là cha A) không được treo; ppid trỏ tới PID không tồn tại
+    /// thì chỉ đơn giản là hết nhánh.
+    #[test]
+    fn test_kept_family_from_nodes_cycle_and_missing_ppid() {
+        let nodes = vec![
+            node(10, 11, "a.exe"),
+            node(11, 10, "b.exe"),
+            node(12, 999, "c.exe"),
+            node(13, 12, "d.exe"),
+        ];
+        let kept = kept_family_from_nodes(&nodes, &kept_names(&["a.exe"]));
+
+        assert_eq!(kept.len(), 1, "chỉ b.exe là con của a.exe: {:?}", kept);
+        assert_eq!(kept.get(&11).map(String::as_str), Some("a.exe"));
+        assert!(!kept.contains_key(&10), "a.exe không phải con của chính nó");
+        assert!(!kept.contains_key(&12) && !kept.contains_key(&13), "nhánh ppid 999 không được giữ");
+
+        // Không có app nào được giữ -> map rỗng, không duyệt gì.
+        assert!(kept_family_from_nodes(&nodes, &HashSet::new()).is_empty());
+    }
+
+    /// Dòng log tóm tắt: số process + app cha + tên exe con kèm số instance.
+    #[test]
+    fn test_kept_family_log_line() {
+        let nodes = vec![
+            node(100, 50, "claude.exe"),
+            node(101, 100, "node.exe"),
+            node(102, 100, "node.exe"),
+            node(103, 100, "cua-driver.exe"),
+        ];
+        let kept = kept_family_from_nodes(&nodes, &kept_names(&["claude.exe"]));
+        let line = kept_family_log_line(&kept, &nodes).expect("phải có dòng log");
+        assert!(line.contains("Giữ 3 process con"), "{}", line);
+        assert!(line.contains("claude.exe: node.exe ×2, cua-driver.exe"), "{}", line);
+
+        assert!(kept_family_log_line(&HashMap::new(), &nodes).is_none());
+    }
+
+    /// Đếm "x/y" trên tab: dòng có cả instance được giữ lẫn instance sẽ tắt KHÔNG tính là giữ.
+    #[test]
+    fn test_app_row_kept_mixed_instances() {
+        let make = |count: usize, kept_children: usize| RunningApp {
+            exe_lower: "node.exe".into(),
+            exe_name: "node.exe".into(),
+            display: None,
+            exe_path: None,
+            count,
+            total_ws: 0,
+            kept_children,
+            kept_by: Some("Claude".into()),
+        };
+        let keep: HashMap<String, bool> = HashMap::new();
+        assert!(app_row_kept(&keep, &make(3, 3)), "mọi instance đều là con của app được giữ");
+        assert!(!app_row_kept(&keep, &make(3, 1)), "còn instance sẽ tắt thì không tính là giữ");
+        assert!(app_row_kept(&HashMap::from([("node.exe".to_string(), true)]), &make(3, 1)));
     }
 }

@@ -68,6 +68,7 @@ cargo build --release
 - Ép game dùng GPU rời, tắt quét Wi-Fi nền và Game DVR khi chơi. Restore trả về như cũ.
 - Chạy cùng Windows qua Task Scheduler (`/RL HIGHEST`, không hiện UAC).
 - Giao diện mới (Gemini 3.8 Flash làm).
+- Con cháu của app được giữ (`keep:` + danh sách mặc định) cũng được giữ: khi Game Boost / auto optimize / nén RAM, cả cây con cháu theo ppid của app được giữ (vd Claude mở `node.exe`, `cua-driver.exe`) đều không bị tắt và không bị trim, không lưu vào session nên Restore không mở lại. Chỉ đi xuống — tổ tiên của app được giữ không được bảo vệ; instance không phải con cháu vẫn theo quy tắc cũ. Danh sách "Ứng dụng đang chạy" hiện "GIỮ LẠI" kèm chú thích "con của Claude" và khoá công tắc của dòng đó; dòng có cả instance được giữ lẫn instance sẽ tắt thì ghi "N giữ (con của Claude) · M sẽ tắt". Log Game Boost thêm dòng `· Giữ N process con của app được giữ (<app>: <exe> ×n, …)`.
 
 ## Đã làm thêm (2026-10-21)
 - Nén RAM (trim working set) có chọn lọc, chạy sau bước xả standby. Không nén game, anti-cheat, audiodg, dwm, csrss. Log ghi 5 app còn giữ nhiều RAM nhất. Tuỳ chọn `opt:trim`.
@@ -87,6 +88,8 @@ App đòi quyền admin nên shell thường không chụp được cửa sổ. 
 - Service Office `ClickToRunSvc` phản hồi lệnh dừng rất chậm (từng kẹt ở `StopPending`). Nên bỏ tick nếu không cần.
 - `svc:sshd=1` trong config sẽ dừng SSH server khi bật Game Mode.
 - Auto mode mặc định tắt, phải tự bật trong UI.
+- Chạy quyền thường (vd mở bằng `__COMPAT_LAYER=RunAsInvoker` khi test) thì không xả được standby; lỗi này chỉ log một lần mỗi lần mở app, kèm gợi ý mở lại bằng quyền admin.
+- `--selftest` ghi `kept_children` / `kept_by` ở mỗi dòng `APP` để kiểm quy tắc giữ con cháu của app được giữ.
 - Khi tắt quét Wi-Fi, nếu mạng rớt thì máy không tự kết nối lại cho tới khi Restore.
 
 ## Bộ cài (Inno Setup)
