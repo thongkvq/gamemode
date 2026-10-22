@@ -1201,6 +1201,16 @@ pub fn render_title_bar(ctx: &egui::Context, busy: bool) {
                     .extra_letter_spacing(1.0)
                     .color(TEXT_MAIN),
             );
+            left_ui.add_space(6.0);
+
+            // Version lấy từ Cargo.toml lúc build, để biết ngay máy đang chạy bản nào.
+            left_ui.label(
+                egui::RichText::new(concat!("v", env!("CARGO_PKG_VERSION")))
+                    .monospace()
+                    .size(10.0)
+                    .strong()
+                    .color(TEXT_MUTED),
+            );
             left_ui.add_space(8.0);
 
             // Tag nhỏ
