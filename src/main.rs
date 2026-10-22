@@ -1,7 +1,9 @@
 #![windows_subsystem = "windows"]
 
 mod fps;
+mod hotkey;
 mod report;
+mod startup;
 mod sys;
 mod tray;
 mod ui;
@@ -481,8 +483,57 @@ const GB: f64 = 1024.0 * 1024.0 * 1024.0;
 const MB: f64 = 1024.0 * 1024.0;
 
 /// Tiêu đề cửa sổ chính: dùng cho `ViewportBuilder` và cho `FindWindowW` khi bản chạy
-/// thứ hai cần tìm lại cửa sổ của bản đang chạy.
-const WINDOW_TITLE: &str = "DELTA FORCE - TACTICAL RAM PURGE";
+/// thứ hai cần tìm lại cửa sổ của bản đang chạy (version hiện trên title bar do `ui.rs` vẽ).
+const WINDOW_TITLE: &str = "Paroda GameMode";
+
+/// Exe KHÔNG BAO GIỜ là game: app hệ thống, app luôn chạy, trình duyệt, công cụ dev.
+/// Đưa nhầm một trong số này vào danh sách game từng gây Boost ngay khi vừa mở app
+/// (`game:msedgewebview2.exe=1` — WebView2 luôn chạy nên phiên Boost không bao giờ kết thúc).
+/// Ngoài danh sách này, mọi exe bắt đầu bằng `discord` cũng bị chặn.
+const NOT_GAMES: &[&str] = &[
+    "msedgewebview2.exe",
+    "msedge.exe",
+    "chrome.exe",
+    "firefox.exe",
+    "brave.exe",
+    "opera.exe",
+    "explorer.exe",
+    "svchost.exe",
+    "dwm.exe",
+    "csrss.exe",
+    "winlogon.exe",
+    "services.exe",
+    "lsass.exe",
+    "system",
+    "registry",
+    "searchhost.exe",
+    "startmenuexperiencehost.exe",
+    "shellexperiencehost.exe",
+    "runtimebroker.exe",
+    "applicationframehost.exe",
+    "textinputhost.exe",
+    "ctfmon.exe",
+    "conhost.exe",
+    "cmd.exe",
+    "powershell.exe",
+    "pwsh.exe",
+    "windowsterminal.exe",
+    "taskmgr.exe",
+    "steam.exe",
+    "steamwebhelper.exe",
+    "epicgameslauncher.exe",
+    "obs64.exe",
+    "claude.exe",
+    "code.exe",
+    "node.exe",
+    "python.exe",
+    "gamemode.exe",
+];
+
+/// Tên exe (đã viết thường) có bị cấm đưa vào danh sách game không.
+fn is_not_game(exe_lower: &str) -> bool {
+    NOT_GAMES.contains(&exe_lower) || exe_lower.starts_with("discord")
+}
 
 fn config_path() -> PathBuf {
     std::env::current_exe()
@@ -524,7 +575,12 @@ fn is_never_kill(exe_lower: &str, exe_path: Option<&str>) -> bool {
     false
 }
 
-/// Tuỳ chọn tối ưu khi chơi (khối "Tối ưu khi chơi" + khối "Tự động khi chơi game").
+// ===== BEGIN PURE-PROFILE-HOTKEY =====
+// Vùng này chỉ chứa kiểu/hàm THUẦN: không đọc/ghi đĩa, không WinAPI, không phụ thuộc `Shared`.
+// `.tools/task26test/extract.sh` cắt NGUYÊN VĂN vùng này ra để chạy `cargo test` trên Linux —
+// trong vùng chỉ được dùng item cũng nằm trong vùng, `HashMap` và module `hotkey`.
+
+/// Tuỳ chọn tối ưu khi chơi (khối "Tối ưu khi chơi" + "Tự động khi chơi game" + "Phím tắt").
 #[derive(Clone, Copy)]
 struct Opts {
     /// Xả standby list khi tối ưu và khi RAM trống thấp lúc đang chơi.
@@ -547,6 +603,8 @@ struct Opts {
     report_enabled: bool,
     /// `update:enabled`: tự kiểm tra bản cập nhật OTA từ server nội bộ.
     update_enabled: bool,
+    /// `hotkey:enabled`: bật phím tắt toàn cục (Boost / Khôi phục / Hiện-ẩn cửa sổ).
+    hotkey_enabled: bool,
 }
 
 impl Default for Opts {
@@ -562,9 +620,447 @@ impl Default for Opts {
             close_to_tray: true,
             report_enabled: true,
             update_enabled: true,
+            hotkey_enabled: true,
         }
     }
 }
+
+/// Các key của hồ sơ riêng theo game, kèm nhãn tiếng Việt (dùng cho cả khối "Hồ sơ" trên giao
+/// diện lẫn dòng log). Thứ tự ở đây cũng là thứ tự hiện trên giao diện.
+const PROFILE_KEYS: &[(&str, &str)] = &[
+    ("standby", "Xả standby (RAM chờ)"),
+    ("trim", "Nén RAM app giữ lại"),
+    ("gpu", "Ép GPU rời"),
+    ("wlan", "Tắt quét Wi-Fi nền"),
+    ("gamedvr", "Tắt Game DVR"),
+    ("report", "Ghi báo cáo trận"),
+    ("close_apps", "Tắt app nền"),
+    ("stop_services", "Dừng service"),
+];
+
+/// Hồ sơ riêng của MỘT game: key -> bật/tắt. Key không có trong map nghĩa là "theo cài đặt
+/// chung", nên hồ sơ rỗng = chung hết.
+type GameProfile = HashMap<String, bool>;
+
+/// Thứ tự cố định của ba hành động phím tắt (config, giao diện, đăng ký đều theo thứ tự này).
+const HOTKEY_ACTIONS: [hotkey::HotkeyAction; 3] = [
+    hotkey::HotkeyAction::Boost,
+    hotkey::HotkeyAction::Restore,
+    hotkey::HotkeyAction::ToggleWindow,
+];
+
+fn is_on(v: &str) -> bool {
+    v.trim() == "1"
+}
+
+/// Ghép cài đặt chung với hồ sơ riêng của game: trả `(tuỳ chọn hiệu lực, tắt app nền, dừng
+/// service)`. Hàm thuần (không đụng đĩa/WinAPI) nên có unit test chạy được cả trên Linux.
+///
+/// `close_apps = false` nghĩa là Boost **không tắt app nền nào** — chỉ chạy các bước còn lại và
+/// không ghi app nào vào session. `stop_services = false` thì không dừng service nào.
+fn effective_opts(general: &Opts, profile: Option<&GameProfile>) -> (Opts, bool, bool) {
+    let mut o = *general;
+    let mut close_apps = true;
+    let mut stop_services = true;
+    if let Some(p) = profile {
+        let get = |key: &str, fallback: bool| p.get(key).copied().unwrap_or(fallback);
+        o.standby = get("standby", o.standby);
+        o.trim = get("trim", o.trim);
+        o.gpu = get("gpu", o.gpu);
+        o.wlan = get("wlan", o.wlan);
+        o.gamedvr = get("gamedvr", o.gamedvr);
+        o.report_enabled = get("report", o.report_enabled);
+        close_apps = get("close_apps", true);
+        stop_services = get("stop_services", true);
+    }
+    (o, close_apps, stop_services)
+}
+
+/// Dòng log "đang dùng hồ sơ nào": chỉ liệt kê các key CÓ trong hồ sơ (đó chính là những khác
+/// biệt so với cài đặt chung mà người dùng đã chọn).
+fn profile_diff_line(game: &str, profile: &GameProfile) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for (key, label) in PROFILE_KEYS {
+        if let Some(on) = profile.get(*key) {
+            parts.push(format!("{}={}", label, if *on { "BẬT" } else { "TẮT" }));
+        }
+    }
+    if parts.is_empty() {
+        format!("• [HỒ SƠ] Dùng hồ sơ {} (chưa đặt khác biệt nào).", game)
+    } else {
+        format!("• [HỒ SƠ] Dùng hồ sơ {}: {}", game, parts.join(", "))
+    }
+}
+
+/// Khoá trong config (`hotkey:boost/restore/window`) -> hành động phím tắt.
+fn action_from_config_key(key: &str) -> Option<hotkey::HotkeyAction> {
+    match key.trim().to_ascii_lowercase().as_str() {
+        "boost" => Some(hotkey::HotkeyAction::Boost),
+        "restore" => Some(hotkey::HotkeyAction::Restore),
+        "window" => Some(hotkey::HotkeyAction::ToggleWindow),
+        _ => None,
+    }
+}
+
+/// Phím tắt mặc định (dùng khi config chưa có dòng `hotkey:<tên>` nào).
+fn default_hotkeys() -> HashMap<hotkey::HotkeyAction, String> {
+    hotkey::default_bindings()
+        .into_iter()
+        .map(|(action, combo)| (action, combo.to_string()))
+        .collect()
+}
+
+/// Đọc tổ hợp phím tắt trong config thành danh sách đăng ký được.
+/// Chuỗi rỗng = phím đó đang tắt; chuỗi sai định dạng nằm trong danh sách lỗi thứ hai để giao
+/// diện hiện đỏ trong card "Phím tắt" (không đăng ký phím đó).
+fn parse_hotkeys(
+    map: &HashMap<hotkey::HotkeyAction, String>,
+) -> (
+    Vec<(hotkey::HotkeyAction, hotkey::Hotkey)>,
+    Vec<(hotkey::HotkeyAction, String)>,
+) {
+    let mut ok = Vec::new();
+    let mut errs = Vec::new();
+    for action in HOTKEY_ACTIONS {
+        let raw = map.get(&action).cloned().unwrap_or_default();
+        if raw.trim().is_empty() {
+            continue;
+        }
+        match hotkey::Hotkey::parse(&raw) {
+            Ok(hk) => ok.push((action, hk)),
+            Err(e) => errs.push((action, e)),
+        }
+    }
+    (ok, errs)
+}
+
+/// Cấu hình thêm trong `gamemode.cfg`: hồ sơ riêng theo game + phím tắt toàn cục.
+struct ExtraConfig {
+    profiles: HashMap<String, GameProfile>,
+    /// `hotkey:enabled` (mặc định 1).
+    hotkey_enabled: bool,
+    /// `hotkey:boost/restore/window` — thiếu dòng nào thì dùng mặc định của phím đó.
+    hotkeys: HashMap<hotkey::HotkeyAction, String>,
+}
+
+/// Đọc các dòng `profile:<exe>:<key>=1/0` và `hotkey:enabled|boost|restore|window=...`.
+/// `blocked` là bộ lọc "app hệ thống / luôn chạy" (`is_not_game`): hồ sơ của chúng bị bỏ qua.
+fn parse_extra_config(text: &str, blocked: fn(&str) -> bool) -> ExtraConfig {
+    let mut out = ExtraConfig {
+        profiles: HashMap::new(),
+        hotkey_enabled: true,
+        hotkeys: default_hotkeys(),
+    };
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if let Some(rest) = line.strip_prefix("profile:") {
+            // `profile:<exe>:<key>=1/0`; đường dẫn exe có thể chứa ':' nên cắt ở dấu ':' CUỐI.
+            let Some((head, value)) = rest.rsplit_once('=') else { continue };
+            let Some((exe, key)) = head.rsplit_once(':') else { continue };
+            let exe = exe.trim().to_lowercase();
+            let key = key.trim().to_lowercase();
+            if exe.is_empty() || !PROFILE_KEYS.iter().any(|(name, _)| *name == key) {
+                continue;
+            }
+            // App hệ thống / app luôn chạy không bao giờ là game -> hồ sơ của nó bị bỏ.
+            if blocked(&exe) {
+                continue;
+            }
+            out.profiles.entry(exe).or_default().insert(key, is_on(value));
+        } else if let Some(rest) = line.strip_prefix("hotkey:") {
+            let Some((key, value)) = rest.rsplit_once('=') else { continue };
+            let key = key.trim().to_ascii_lowercase();
+            if key == "enabled" {
+                out.hotkey_enabled = is_on(value);
+            } else if let Some(action) = action_from_config_key(&key) {
+                // Chuỗi rỗng = tắt hẳn phím này (vẫn ghi lại đúng chuỗi rỗng).
+                out.hotkeys.insert(action, value.trim().to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Các dòng config của hồ sơ riêng + phím tắt (ngược của `parse_extra_config`).
+/// Hồ sơ của game KHÔNG còn trong `games` bị bỏ luôn (xoá game là xoá hồ sơ của nó).
+fn extra_config_lines(
+    profiles: &HashMap<String, GameProfile>,
+    games: &[String],
+    hotkey_enabled: bool,
+    hotkeys: &HashMap<hotkey::HotkeyAction, String>,
+) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut exes: Vec<&String> = profiles.keys().filter(|e| games.contains(e)).collect();
+    exes.sort();
+    for exe in exes {
+        let Some(profile) = profiles.get(exe) else { continue };
+        let mut keys: Vec<&String> = profile.keys().collect();
+        keys.sort();
+        for key in keys {
+            lines.push(format!(
+                "profile:{}:{}={}",
+                exe,
+                key,
+                if profile[key] { 1 } else { 0 }
+            ));
+        }
+    }
+    lines.push(format!("hotkey:enabled={}", if hotkey_enabled { 1 } else { 0 }));
+    for action in HOTKEY_ACTIONS {
+        let combo = hotkeys.get(&action).cloned().unwrap_or_default();
+        lines.push(format!("hotkey:{}={}", action.config_key(), combo));
+    }
+    lines
+}
+
+/// Rút gọn dòng lệnh dài của mục khởi động cho vừa một dòng (tooltip hiện đầy đủ).
+fn shorten_command(cmd: &str, max_chars: usize) -> String {
+    if cmd.chars().count() <= max_chars || max_chars <= 20 {
+        return cmd.to_string();
+    }
+    let head: String = cmd.chars().take(max_chars - 18).collect();
+    let tail: String = cmd
+        .chars()
+        .rev()
+        .take(16)
+        .collect::<Vec<char>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{}…{}", head, tail)
+}
+
+/// Mục khởi động chính là bản GameMode đang chạy (exe trùng exe hiện tại) -> khoá công tắc:
+/// tắt nó là tự tắt chính app, còn việc chạy cùng Windows do task "GameMode" lo.
+fn is_self_startup(exe_path: Option<&str>, current_exe: &str) -> bool {
+    let Some(path) = exe_path else { return false };
+    if current_exe.trim().is_empty() {
+        return false;
+    }
+    let norm = |s: &str| s.replace('"', "").replace('/', "\\").trim().to_lowercase();
+    norm(path) == norm(current_exe)
+}
+
+#[cfg(test)]
+mod profile_hotkey_tests {
+    use super::*;
+
+    /// Không có hồ sơ: giữ nguyên cài đặt chung, vẫn tắt app và dừng service.
+    #[test]
+    fn effective_opts_khong_co_ho_so() {
+        let general = Opts { trim: false, wlan: false, ..Opts::default() };
+        let (o, close_apps, stop_services) = effective_opts(&general, None);
+        assert!(!o.trim && !o.wlan && o.standby, "phải giữ nguyên cài đặt chung");
+        assert!(close_apps && stop_services);
+    }
+
+    /// Chỉ key CÓ trong hồ sơ mới đè cài đặt chung; hồ sơ rỗng = chung hết.
+    #[test]
+    fn effective_opts_chi_de_key_co_trong_ho_so() {
+        let general = Opts::default();
+        let (o, close_apps, stop_services) = effective_opts(&general, Some(&GameProfile::new()));
+        assert!(o.trim && o.wlan && o.gpu && o.gamedvr && o.standby && o.report_enabled);
+        assert!(close_apps && stop_services, "hồ sơ rỗng không được tắt app / service");
+
+        let profile = GameProfile::from([
+            ("trim".to_string(), false),
+            ("report".to_string(), false),
+            ("close_apps".to_string(), false),
+            ("stop_services".to_string(), false),
+        ]);
+        let (o, close_apps, stop_services) = effective_opts(&general, Some(&profile));
+        assert!(!o.trim && !o.report_enabled, "key có trong hồ sơ phải đè cài đặt chung");
+        assert!(o.wlan && o.gpu, "key không có trong hồ sơ giữ cài đặt chung");
+        assert!(!close_apps && !stop_services, "close_apps/stop_services = 0");
+    }
+
+    /// Hồ sơ ghi 1 thì bật lại tuỳ chọn mà cài đặt chung đang tắt.
+    #[test]
+    fn effective_opts_bat_lai_tuy_chon_chung_dang_tat() {
+        let general = Opts { standby: false, gamedvr: false, ..Opts::default() };
+        let profile = GameProfile::from([("standby".to_string(), true)]);
+        let (o, close_apps, stop_services) = effective_opts(&general, Some(&profile));
+        assert!(o.standby, "hồ sơ ghi 1 thì bật dù cài đặt chung đang tắt");
+        assert!(!o.gamedvr, "key không có trong hồ sơ vẫn theo cài đặt chung");
+        assert!(close_apps && stop_services);
+    }
+
+    #[test]
+    fn profile_diff_line_liet_ke_dung_thu_tu() {
+        let empty = GameProfile::new();
+        assert!(profile_diff_line("Delta Force", &empty).contains("chưa đặt khác biệt"));
+
+        let profile = GameProfile::from([
+            ("close_apps".to_string(), false),
+            ("trim".to_string(), false),
+            ("standby".to_string(), true),
+        ]);
+        let line = profile_diff_line("Delta Force", &profile);
+        assert!(line.contains("Delta Force"), "{line}");
+        let pos_standby = line.find("Xả standby").expect("thiếu standby");
+        let pos_trim = line.find("Nén RAM").expect("thiếu trim");
+        let pos_close = line.find("Tắt app nền").expect("thiếu close_apps");
+        assert!(pos_standby < pos_trim && pos_trim < pos_close, "sai thứ tự: {line}");
+        assert!(
+            line.contains("Tắt app nền=TẮT") && line.contains("Xả standby (RAM chờ)=BẬT"),
+            "{line}"
+        );
+        assert!(!line.contains("Wi-Fi"), "key không có trong hồ sơ không được liệt kê: {line}");
+    }
+
+    /// Config chưa có dòng `hotkey:` nào -> dùng mặc định của `hotkey::default_bindings()`.
+    #[test]
+    fn parse_extra_config_mac_dinh_phim_tat() {
+        let extra = parse_extra_config("", |_| false);
+        assert!(extra.hotkey_enabled, "hotkey:enabled mặc định là 1");
+        assert!(extra.profiles.is_empty());
+        for (action, combo) in hotkey::default_bindings() {
+            assert_eq!(extra.hotkeys.get(&action).map(String::as_str), Some(combo));
+        }
+        let (bindings, errs) = parse_hotkeys(&extra.hotkeys);
+        assert_eq!(bindings.len(), 3, "ba phím mặc định phải parse được: {errs:?}");
+        assert!(errs.is_empty());
+    }
+
+    /// Chuỗi rỗng = tắt phím đó; `enabled=0` tắt cả dịch vụ phím tắt.
+    #[test]
+    fn parse_extra_config_tat_phim_va_tat_dich_vu() {
+        let text = "hotkey:enabled=0\nhotkey:boost=Ctrl+Shift+F9\nhotkey:restore=\nhotkey:window=Ctrl+Alt+G\n";
+        let extra = parse_extra_config(text, |_| false);
+        assert!(!extra.hotkey_enabled);
+        assert_eq!(
+            extra.hotkeys.get(&hotkey::HotkeyAction::Boost).map(String::as_str),
+            Some("Ctrl+Shift+F9")
+        );
+        assert_eq!(extra.hotkeys.get(&hotkey::HotkeyAction::Restore).map(String::as_str), Some(""));
+        let (bindings, errs) = parse_hotkeys(&extra.hotkeys);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(bindings.len(), 2, "phím để trống bị bỏ qua");
+        assert!(!bindings.iter().any(|(a, _)| *a == hotkey::HotkeyAction::Restore));
+        assert!(bindings.iter().any(|(a, _)| *a == hotkey::HotkeyAction::ToggleWindow));
+    }
+
+    /// Tổ hợp sai định dạng: báo lỗi để UI hiện đỏ, không đăng ký phím đó.
+    #[test]
+    fn parse_hotkeys_bao_loi_to_hop_sai() {
+        let mut map = default_hotkeys();
+        map.insert(hotkey::HotkeyAction::Boost, "Ctrl++B".to_string());
+        map.insert(hotkey::HotkeyAction::ToggleWindow, "   ".to_string());
+        let (bindings, errs) = parse_hotkeys(&map);
+        assert_eq!(bindings.len(), 1, "chỉ còn Restore hợp lệ");
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].0, hotkey::HotkeyAction::Boost);
+        assert!(!errs[0].1.is_empty());
+    }
+
+    #[test]
+    fn action_from_config_key_dung_ba_ten() {
+        assert_eq!(action_from_config_key("boost"), Some(hotkey::HotkeyAction::Boost));
+        assert_eq!(action_from_config_key(" Restore "), Some(hotkey::HotkeyAction::Restore));
+        assert_eq!(action_from_config_key("window"), Some(hotkey::HotkeyAction::ToggleWindow));
+        assert_eq!(action_from_config_key("khac"), None);
+    }
+
+    fn blocked_not_games(exe: &str) -> bool {
+        exe == "explorer.exe" || exe == "msedgewebview2.exe"
+    }
+
+    /// Dòng `profile:` đọc đúng; key lạ / app hệ thống / dòng rác bị bỏ qua.
+    #[test]
+    fn parse_extra_config_doc_ho_so_theo_game() {
+        let text = "\
+profile:DeltaForceClient-Win64-Shipping.exe:trim=0
+profile:deltaforceclient-win64-shipping.exe:close_apps=0
+profile:C:\\Games\\Delta Force\\game.exe:stop_services=0
+profile:explorer.exe:trim=1
+profile:msedgewebview2.exe:gpu=1
+profile:game.exe:khong_co_key_nay=1
+profile:game.exe=1
+profile:game.exe:trim
+hotkey:khong_co=1
+rac
+";
+        let extra = parse_extra_config(text, blocked_not_games);
+        let df = extra
+            .profiles
+            .get("deltaforceclient-win64-shipping.exe")
+            .expect("phải có hồ sơ Delta Force");
+        assert_eq!(df.get("trim"), Some(&false));
+        assert_eq!(df.get("close_apps"), Some(&false), "hai dòng cùng exe phải gộp");
+        assert_eq!(
+            extra
+                .profiles
+                .get(r"c:\games\delta force\game.exe")
+                .and_then(|p| p.get("stop_services")),
+            Some(&false),
+            "đường dẫn có dấu cách vẫn đọc được"
+        );
+        assert!(!extra.profiles.contains_key("explorer.exe"), "app hệ thống bị bỏ");
+        assert!(!extra.profiles.contains_key("msedgewebview2.exe"));
+        assert_eq!(extra.profiles.get("game.exe"), None, "key lạ / dòng thiếu vế bị bỏ");
+        assert!(extra.hotkeys.contains_key(&hotkey::HotkeyAction::Boost), "dòng hotkey lạ không phá mặc định");
+    }
+
+    /// Ghi rồi đọc lại phải ra đúng hồ sơ + phím tắt; hồ sơ của game đã xoá không còn dòng nào.
+    #[test]
+    fn extra_config_lines_round_trip_va_xoa_theo_game() {
+        let profiles = HashMap::from([
+            (
+                "deltaforceclient-win64-shipping.exe".to_string(),
+                GameProfile::from([("trim".to_string(), false), ("close_apps".to_string(), false)]),
+            ),
+            ("cs2.exe".to_string(), GameProfile::from([("gpu".to_string(), true)])),
+        ]);
+        let games = vec!["deltaforceclient-win64-shipping.exe".to_string()];
+        let hotkeys = HashMap::from([
+            (hotkey::HotkeyAction::Boost, "Ctrl+Shift+F9".to_string()),
+            (hotkey::HotkeyAction::Restore, String::new()),
+            (hotkey::HotkeyAction::ToggleWindow, "Ctrl+Alt+G".to_string()),
+        ]);
+        let lines = extra_config_lines(&profiles, &games, false, &hotkeys);
+        let text = lines.join("\n");
+        assert!(!text.contains("cs2.exe"), "game đã xoá thì hồ sơ cũng bị xoá: {text}");
+        assert!(text.contains("profile:deltaforceclient-win64-shipping.exe:trim=0"), "{text}");
+        assert!(text.contains("hotkey:restore=\n"), "phím đang tắt vẫn ghi dòng rỗng: {text}");
+
+        let back = parse_extra_config(&text, |_| false);
+        assert!(!back.hotkey_enabled);
+        assert_eq!(back.profiles.len(), 1);
+        assert_eq!(back.profiles["deltaforceclient-win64-shipping.exe"]["close_apps"], false);
+        assert_eq!(
+            back.hotkeys.get(&hotkey::HotkeyAction::Boost).map(String::as_str),
+            Some("Ctrl+Shift+F9")
+        );
+        assert_eq!(back.hotkeys.get(&hotkey::HotkeyAction::Restore).map(String::as_str), Some(""));
+    }
+
+    #[test]
+    fn shorten_command_cat_giua_dong_lenh() {
+        let short = r"C:\a\b.exe";
+        assert_eq!(shorten_command(short, 60), short);
+        let long = r#""C:\Program Files\Very Long App Name\app.exe" --min --flag other"#;
+        let cut = shorten_command(long, 40);
+        assert!(cut.chars().count() <= 40, "{cut}");
+        assert!(cut.contains('…'), "{cut}");
+        assert!(cut.starts_with(r#""C:\Program Files"#), "{cut}");
+        assert!(cut.ends_with("other"), "{cut}");
+    }
+
+    #[test]
+    fn is_self_startup_so_exe_khong_phan_biet_hoa_thuong() {
+        let me = r"C:\Users\thong\AppData\Local\Programs\GameMode\GameMode.exe";
+        assert!(is_self_startup(Some(me), me));
+        assert!(is_self_startup(
+            Some(r"C:\Users\thong\appdata\local\programs\gamemode\gamemode.exe"),
+            me
+        ));
+        assert!(is_self_startup(Some(r#""C:\Users\thong\AppData\Local\Programs\GameMode\GameMode.exe""#), me));
+        assert!(!is_self_startup(Some(r"C:\Users\thong\GameMode\GameMode.exe"), me), "bản portable cũ không bị khoá");
+        assert!(!is_self_startup(Some("Discord.lnk"), me));
+        assert!(!is_self_startup(None, me), "file .lnk chưa đọc được đích thì không khoá");
+        assert!(!is_self_startup(Some(me), ""), "không biết exe hiện tại thì không khoá gì");
+    }
+}
+// ===== END PURE-PROFILE-HOTKEY =====
 
 /// Toàn bộ nội dung gamemode.cfg.
 struct Config {
@@ -578,23 +1074,35 @@ struct Config {
     ping_host: String,
     /// URL manifest cập nhật OTA (`update:url`).
     update_url: String,
+    /// Dòng `game:` bị bỏ qua vì là app hệ thống / luôn chạy (`NOT_GAMES`): chỉ để báo log
+    /// một lần lúc mở app. Lần ghi config sau sẽ tự bỏ các dòng này.
+    skipped_games: Vec<String>,
+    /// Hồ sơ riêng theo game (`profile:<exe>:<key>=1/0`); xem `PROFILE_KEYS`.
+    profiles: HashMap<String, GameProfile>,
+    /// Phím tắt toàn cục (`hotkey:boost/restore/window`): chuỗi tổ hợp, rỗng = phím đang tắt.
+    /// `hotkey:enabled` nằm trong `opts.hotkey_enabled`.
+    hotkeys: HashMap<hotkey::HotkeyAction, String>,
     opts: Opts,
-}
-
-fn is_on(v: &str) -> bool {
-    v.trim() == "1"
 }
 
 /// Đọc cấu hình: `keep:<exe>=1/0`, `svc:<tên>=1/0`, `game:<exe>=1`, `gamepath:<exe>=<path>`,
 /// `auto:enabled/restore=1/0`, `opt:standby/trim/gpu/wlan/gamedvr=1/0`,
 /// `ui:close_to_tray=1/0`, `report:enabled=1/0`, `report:ping_host=<host>`,
-/// `update:enabled=1/0`, `update:url=<url manifest>`.
+/// `update:enabled=1/0`, `update:url=<url manifest>`,
+/// `profile:<exe>:<key>=1/0` (key xem `PROFILE_KEYS`) và
+/// `hotkey:enabled=1/0`, `hotkey:boost|restore|window=<tổ hợp>` (rỗng = tắt phím đó).
 /// Các dòng `app:...` của bản cũ được bỏ qua (không còn danh sách app cố định).
 fn load_config() -> Config {
     let text = std::fs::read_to_string(config_path()).unwrap_or_default();
+    parse_config(&text)
+}
+
+/// Đọc nội dung `gamemode.cfg` đã tách khỏi đĩa (để unit test được). Xem `load_config`.
+fn parse_config(text: &str) -> Config {
     let mut keep_saved: HashMap<String, bool> = HashMap::new();
     let mut svc_saved: HashMap<String, bool> = HashMap::new();
     let mut games: Vec<String> = Vec::new();
+    let mut skipped_games: Vec<String> = Vec::new();
     let mut game_paths: HashMap<String, String> = HashMap::new();
     let mut ping_host = report::PING_HOST_DEFAULT.to_string();
     let mut update_url = update::DEFAULT_MANIFEST_URL.to_string();
@@ -622,7 +1130,15 @@ fn load_config() -> Config {
             if let Some((k, v)) = rest.rsplit_once('=') {
                 let exe = k.trim().to_lowercase();
                 if is_on(v) && !exe.is_empty() && !games.contains(&exe) {
-                    games.push(exe);
+                    // App hệ thống / app luôn chạy không bao giờ là game: bỏ qua dòng này
+                    // (không nạp vào danh sách, lần ghi config sau sẽ tự xoá khỏi file).
+                    if is_not_game(&exe) {
+                        if !skipped_games.contains(&exe) {
+                            skipped_games.push(exe);
+                        }
+                    } else {
+                        games.push(exe);
+                    }
                 }
             }
         } else if let Some(rest) = line.strip_prefix("opt:") {
@@ -684,6 +1200,10 @@ fn load_config() -> Config {
         games = DEFAULT_GAMES.iter().map(|s| s.to_string()).collect();
     }
 
+    // Hồ sơ riêng theo game + phím tắt toàn cục (phần đọc nằm trong vùng thuần để test được).
+    let extra = parse_extra_config(text, is_not_game);
+    opts.hotkey_enabled = extra.hotkey_enabled;
+
     let svcs = SERVICE_TARGETS
         .iter()
         .map(|(name, _, _, def)| svc_saved.get(*name).copied().unwrap_or(*def))
@@ -696,6 +1216,9 @@ fn load_config() -> Config {
         game_paths,
         ping_host,
         update_url,
+        skipped_games,
+        profiles: extra.profiles,
+        hotkeys: extra.hotkeys,
         opts,
     }
 }
@@ -733,6 +1256,14 @@ fn write_config(cfg: &Config) -> bool {
     lines.push(format!("report:ping_host={}", cfg.ping_host));
     lines.push(format!("update:enabled={}", if o.update_enabled { 1 } else { 0 }));
     lines.push(format!("update:url={}", cfg.update_url));
+    // Hồ sơ riêng theo game + phím tắt toàn cục (hồ sơ của game đã bị xoá khỏi danh sách
+    // tự động bị bỏ ở đây).
+    lines.extend(extra_config_lines(
+        &cfg.profiles,
+        &cfg.games,
+        o.hotkey_enabled,
+        &cfg.hotkeys,
+    ));
     std::fs::write(config_path(), lines.join("\n")).is_ok()
 }
 
@@ -1022,6 +1553,7 @@ fn restart_as_admin(sh: &Shared) {
 enum ConfigTab {
     Apps,
     Services,
+    Startup,
     AutoOpt,
     Reports,
 }
@@ -1069,6 +1601,19 @@ struct Shared {
     update_request: Arc<AtomicBool>,
     /// URL manifest (`update:url`).
     update_url: Arc<Mutex<String>>,
+    /// `session.json` còn nhưng KHÔNG có game nào trong danh sách đang chạy: phiên Game Boost
+    /// bị bỏ lửng (app bị tắt giữa phiên). Bật banner "Khôi phục ngay", watcher không tự Boost
+    /// để khỏi ghi đè session. Tắt khi `do_restore` chạy xong (session.json -> session.last.json).
+    orphan_session: Arc<AtomicBool>,
+    /// Lúc mở app thấy `session.json` còn VÀ game trong danh sách vẫn đang chạy: watcher đọc cờ
+    /// này một lần rồi tự coi như đang trong phiên (không Boost lần nữa, game tắt thì khôi phục).
+    resume_session: Arc<AtomicBool>,
+    /// Hồ sơ riêng theo game (`profile:<exe>:<key>=1/0`), đọc/ghi cùng config.
+    profiles: Arc<Mutex<HashMap<String, GameProfile>>>,
+    /// Tổ hợp phím tắt trong config: rỗng = phím đang tắt. UI sửa map này rồi gọi `rebind`.
+    hotkeys: Arc<Mutex<HashMap<hotkey::HotkeyAction, String>>>,
+    /// Tổ hợp đã parse và ĐANG có hiệu lực (thread phím tắt đọc để ghi log).
+    hotkey_bindings: Arc<Mutex<Vec<(hotkey::HotkeyAction, hotkey::Hotkey)>>>,
 }
 
 impl Shared {
@@ -1080,9 +1625,32 @@ impl Shared {
             game_paths: self.game_paths.lock().unwrap().clone(),
             ping_host: self.ping_host.lock().unwrap().clone(),
             update_url: self.update_url.lock().unwrap().clone(),
+            skipped_games: Vec::new(),
+            profiles: self.profiles.lock().unwrap().clone(),
+            hotkeys: self.hotkeys.lock().unwrap().clone(),
             opts: *self.opts.lock().unwrap(),
         };
         write_config(&cfg)
+    }
+
+    /// Hồ sơ riêng của một game (`None` = chưa có dòng `profile:` nào cho game đó).
+    fn profile_of(&self, exe: &str) -> Option<GameProfile> {
+        self.profiles
+            .lock()
+            .unwrap()
+            .get(&exe.to_lowercase())
+            .cloned()
+    }
+
+    /// Tổ hợp đang có hiệu lực của một hành động (rỗng = phím đang tắt).
+    fn hotkey_display(&self, action: hotkey::HotkeyAction) -> String {
+        self.hotkey_bindings
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(a, _)| *a == action)
+            .map(|(_, hk)| hk.display())
+            .unwrap_or_default()
     }
 
     fn log(&self, text: String, color: Color32) {
@@ -1134,19 +1702,49 @@ fn finish_live_report(sh: &Shared) {
     }
 }
 
-/// Bắt đầu tối ưu ở thread nền. Dùng chung cho nút trên UI và watcher.
+/// Tự sửa task "chạy cùng Windows" lúc mở app: task cũ tạo bằng `/SC ONLOGON` (chỉ chạy khi
+/// cắm sạc, tự chết sau 72 giờ, priority thấp) hoặc trỏ sai exe thì tạo lại bằng XML mới.
+///
+/// Chạy ở thread riêng vì `schtasks` là tiến trình ngoài (mất vài trăm ms), không được chặn UI.
+/// `task_needs_repair()` trả `false` khi task chưa tồn tại — việc tạo task vẫn do người dùng chọn
+/// bằng công tắc trong tab Tự động & Tối ưu.
+fn repair_task_in_background(sh: Shared) {
+    std::thread::spawn(move || {
+        if !sys::task_needs_repair() {
+            return;
+        }
+        match sys::task_create() {
+            Ok(_) => sh.log(
+                "✔ [TASK] Đã cập nhật task GameMode: trỏ đúng exe, chạy cả khi dùng pin.".into(),
+                ui::SUCCESS,
+            ),
+            Err(e) => sh.log(
+                format!("  ⚠ [TASK] Không cập nhật được task GameMode: {}", e),
+                ui::DANGER,
+            ),
+        }
+    });
+}
+
+/// Bắt đầu tối ưu ở thread nền. Dùng chung cho nút trên UI, menu khay và phím tắt.
 fn optimize(sh: Shared, from_auto: bool) {
     if sh.busy.swap(true, Ordering::SeqCst) {
         return;
     }
     sh.last_auto.store(from_auto, Ordering::SeqCst);
     sh.opt_count.fetch_add(1, Ordering::SeqCst);
+    // Xoá nhật ký NGAY trên thread gọi (trước khi spawn): tự Boost khi game mở thì giữ nhật ký
+    // (dòng "[AUTO] Phát hiện", "Bắt đầu ghi trận"). Trước đây `do_optimize` xoá ở thread nền
+    // nên dòng "vừa bấm phím tắt" ghi ngay sau đó bị mất.
+    if !from_auto {
+        log_clear(&sh);
+    }
     sh.event(
         "optimize",
         if from_auto {
             "Tối ưu tự động khi game mở"
         } else {
-            "Tối ưu bằng tay (nút Game Boost / menu khay)"
+            "Tối ưu bằng tay (nút Game Boost / menu khay / phím tắt)"
         },
     );
     std::thread::spawn(move || {
@@ -1155,7 +1753,7 @@ fn optimize(sh: Shared, from_auto: bool) {
     });
 }
 
-/// Bắt đầu Restore ở thread nền (UI và watcher dùng chung).
+/// Bắt đầu Restore ở thread nền (UI, menu khay, phím tắt và watcher dùng chung).
 /// `from_auto`: watcher tự khôi phục sau khi game tắt -> giữ nhật ký (dòng tóm tắt trận vừa ghi).
 fn restore(sh: Shared, from_auto: bool) {
     if sh.busy.swap(true, Ordering::SeqCst) {
@@ -1164,15 +1762,85 @@ fn restore(sh: Shared, from_auto: bool) {
     // Đã khôi phục thì phiên Game Boost tự động kết thúc: watcher không khôi phục thêm lần nữa
     // khi game tắt (trước đây bấm Khôi phục giữa trận thì lúc game tắt lại chạy restore lần 2).
     sh.last_auto.store(false, Ordering::SeqCst);
+    // Xoá nhật ký ở đây (không phải trong `do_restore` chạy ở thread nền) để dòng "vừa bấm
+    // phím tắt" ghi sau lời gọi này không bị xoá.
+    if !from_auto {
+        log_clear(&sh);
+    }
     sh.event("restore", "Khôi phục hệ thống (app, service, Wi-Fi, Game DVR)");
     std::thread::spawn(move || {
-        do_restore(&sh, !from_auto);
+        do_restore(&sh, false);
         sh.busy.store(false, Ordering::SeqCst);
     });
 }
 
+/// Bắt đầu Restore ở thread nền và GIỮ nhật ký. Dùng cho banner "phiên Game Boost bị bỏ lửng"
+/// (người dùng cần đọc log của phiên trước) — khác nút Khôi phục thường là nút đó xoá log.
+fn restore_keep_log(sh: Shared) {
+    if sh.busy.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    sh.last_auto.store(false, Ordering::SeqCst);
+    sh.event("restore", "Khôi phục phiên Game Boost bị bỏ lửng");
+    std::thread::spawn(move || {
+        do_restore(&sh, false);
+        sh.busy.store(false, Ordering::SeqCst);
+    });
+}
+
+/// Xử lý một phím tắt vừa bấm. Chạy trên **thread phím tắt** (`hotkey.rs`), không phải thread
+/// UI — giống thread sự kiện của khay, vì eframe không gọi `update()` khi cửa sổ đã ẩn.
+///
+/// Boost/Restore làm đúng như mục menu khay tương ứng; "Hiện/ẩn cửa sổ" dùng `sys` như click
+/// icon khay / thu vào khay (KHÔNG dùng `SW_HIDE` trực tiếp — xem ghi chú hiệu năng ở NOTES.md).
+fn on_hotkey(sh: &Shared, ctx: &egui::Context, hwnd: isize, action: hotkey::HotkeyAction) {
+    let combo = sh.hotkey_display(action);
+    let busy = sh.busy.load(Ordering::SeqCst);
+    match action {
+        // `optimize`/`restore` tự chặn khi đang bận; gọi sau cùng của lần bấm trước vẫn đúng thứ tự.
+        hotkey::HotkeyAction::Boost if !busy => optimize(sh.clone(), false),
+        hotkey::HotkeyAction::Restore if !busy => restore(sh.clone(), false),
+        hotkey::HotkeyAction::ToggleWindow => {
+            let now_visible = sys::toggle_main_window(hwnd);
+            sh.log(
+                format!(
+                    "  • [PHÍM TẮT] {} — cửa sổ {}.",
+                    combo,
+                    if now_visible { "hiện ra" } else { "thu vào khay" }
+                ),
+                if now_visible { ui::ACCENT } else { ui::TEXT_MUTED },
+            );
+            ctx.request_repaint();
+            return;
+        }
+        _ => {}
+    }
+    // Ghi log SAU khi hành động chạy: `optimize`/`restore` xoá nhật ký ở đầu nên ghi trước sẽ mất.
+    sh.log(
+        format!(
+            "  ⌨ [PHÍM TẮT] {}{}",
+            combo,
+            if busy { " — bỏ qua vì đang chạy tối ưu/khôi phục" } else { "" }
+        ),
+        if busy { ui::WARNING } else { ui::ACCENT },
+    );
+    ctx.request_repaint();
+}
+
 /// Thêm một app đang chạy vào danh sách game, lưu đường dẫn exe và (nếu bật) đặt GPU rời.
 fn mark_as_game(sh: &Shared, app: &RunningApp) {
+    // App hệ thống / app luôn chạy (WebView2, trình duyệt, explorer...) không bao giờ là game:
+    // đưa nhầm vào đây làm Game Boost chạy ngay khi mở app và không bao giờ tự khôi phục.
+    if is_not_game(&app.exe_lower) {
+        sh.log(
+            format!(
+                "  ⚠ [GAME] Không thêm {} vào danh sách game: đây là app hệ thống/luôn chạy.",
+                app.exe_lower
+            ),
+            Color32::from_rgb(255, 170, 40),
+        );
+        return;
+    }
     {
         let mut games = sh.games.lock().unwrap();
         if !games.contains(&app.exe_lower) {
@@ -1226,19 +1894,31 @@ fn mark_as_game(sh: &Shared, app: &RunningApp) {
 }
 
 /// Thân của tối ưu: tắt app / service / WLAN / Game DVR, xả standby, lưu session.
+///
+/// Hồ sơ riêng theo game: tự Boost do game X mở thì dùng hồ sơ X; Boost tay (nút, menu khay,
+/// phím tắt) thì chỉ dùng hồ sơ khi ĐÚNG MỘT game trong danh sách đang chạy, còn lại dùng cài
+/// đặt chung. Nhật ký đã được `optimize()` xoá trước khi thread này chạy (xem chú thích ở đó).
 fn do_optimize(sh: &Shared) {
     let log = sh.log.clone();
     let push = |s: String, c: Color32| log.lock().unwrap().push((s, c));
-    // Tự Game Boost khi game mở: giữ nhật ký (dòng "[AUTO] Phát hiện", "Bắt đầu ghi trận").
-    if !sh.last_auto.load(Ordering::SeqCst) {
-        log.lock().unwrap().clear();
-    }
 
     let keep = sh.keep.lock().unwrap().clone();
     let svcs = sh.svc.lock().unwrap().clone();
     let games: Vec<String> = sh.games.lock().unwrap().clone();
-    let opts = sh.opts();
     let is_admin = sh.is_admin;
+
+    // 0a. Hồ sơ riêng của game quyết định lần Boost này (nếu có).
+    let from_auto = sh.last_auto.load(Ordering::SeqCst);
+    let running = running_games(&games);
+    let profile_game = if from_auto {
+        running.first().cloned()
+    } else if running.len() == 1 {
+        running.first().cloned()
+    } else {
+        None
+    };
+    let profile = profile_game.as_ref().and_then(|exe| sh.profile_of(exe));
+    let (opts, close_apps, stop_services) = effective_opts(&sh.opts(), profile.as_ref());
 
     let before_mem = sys::memory();
     let before = before_mem.avail;
@@ -1246,6 +1926,12 @@ fn do_optimize(sh: &Shared) {
         format!("▶ [DEPLOY] Bắt đầu thanh lọc | RAM khả dụng ban đầu: {:.1} GB", before as f64 / GB),
         Color32::from_rgb(0, 229, 255),
     );
+    if let (Some(exe), Some(prof)) = (profile_game.as_ref(), profile.as_ref()) {
+        push(
+            profile_diff_line(&clean_game_name(exe), prof),
+            Color32::from_rgb(0, 229, 255),
+        );
+    }
 
     let me = std::process::id();
     let my_session = sys::current_session();
@@ -1281,31 +1967,34 @@ fn do_optimize(sh: &Shared) {
 
     // 1. Quét app đang chạy -> nhóm theo tên exe, bỏ nhóm được tick "Giữ lại".
     //    Exe nằm trong danh sách game LUÔN được giữ lại, bất kể config ghi gì.
+    //    Hồ sơ `close_apps=0` thì bỏ hẳn bước này: Boost không tắt app nào.
     let mut groups: HashMap<String, Vec<u32>> = HashMap::new();
     let mut labels: HashMap<String, String> = HashMap::new();
     let mut kept_exes: HashSet<String> = HashSet::new();
-    for p in snap.iter() {
-        if p.pid == 0 || p.pid == me || p.pid == parent || p.session != my_session {
-            continue;
+    if close_apps {
+        for p in snap.iter() {
+            if p.pid == 0 || p.pid == me || p.pid == parent || p.session != my_session {
+                continue;
+            }
+            let exe = p.name.to_lowercase();
+            if exe.is_empty() || is_never_kill(&exe, p.exe_path.as_deref()) {
+                continue;
+            }
+            // Game + anti-cheat (ACE) + họ process game + con cháu của app được giữ: tuyệt đối
+            // không tắt, không lưu session, không mở quyền đọc bộ nhớ.
+            if keep_decision(&keep, &exe)
+                || is_ace_or_game(&exe, &skip)
+                || family.contains(&p.pid)
+                || kept_family.contains_key(&p.pid)
+            {
+                kept_exes.insert(exe);
+                continue;
+            }
+            groups.entry(exe.clone()).or_default().push(p.pid);
+            labels
+                .entry(exe)
+                .or_insert_with(|| p.display_name.clone().unwrap_or_else(|| p.name.clone()));
         }
-        let exe = p.name.to_lowercase();
-        if exe.is_empty() || is_never_kill(&exe, p.exe_path.as_deref()) {
-            continue;
-        }
-        // Game + anti-cheat (ACE) + họ process game + con cháu của app được giữ: tuyệt đối
-        // không tắt, không lưu session, không mở quyền đọc bộ nhớ.
-        if keep_decision(&keep, &exe)
-            || is_ace_or_game(&exe, &skip)
-            || family.contains(&p.pid)
-            || kept_family.contains_key(&p.pid)
-        {
-            kept_exes.insert(exe);
-            continue;
-        }
-        groups.entry(exe.clone()).or_default().push(p.pid);
-        labels
-            .entry(exe)
-            .or_insert_with(|| p.display_name.clone().unwrap_or_else(|| p.name.clone()));
     }
     // 1b. Exe được bảo vệ nhờ QUAN HỆ cha/con (tên exe không nằm trong danh sách game/ACE):
     //     báo một dòng để biết vì sao launcher / helper của game không bị tắt.
@@ -1334,16 +2023,22 @@ fn do_optimize(sh: &Shared) {
         push(line, Color32::from_rgb(0, 255, 163));
     }
     push(
-        format!(
-            "  • [SCAN] {} app sẽ tắt / {} app được giữ lại (session user hiện tại).",
-            groups.len(),
-            kept_exes.len()
-        ),
+        if close_apps {
+            format!(
+                "  • [SCAN] {} app sẽ tắt / {} app được giữ lại (session user hiện tại).",
+                groups.len(),
+                kept_exes.len()
+            )
+        } else {
+            "  • [HỒ SƠ] close_apps=0 — không tắt app nền nào lần này.".to_string()
+        },
         Color32::from_rgb(50, 215, 255),
     );
 
     // 2. Gom "process gốc" của từng app để lưu session (TRƯỚC khi tắt).
     //    Cửa sổ phải đọc trước khi gửi WM_CLOSE, sau đó app đã đóng nên không còn gì để đọc.
+    //    Không tắt app (hồ sơ close_apps=0) thì cũng KHÔNG lưu app nào vào session để Restore
+    //    không mở lại app vốn chưa hề bị tắt.
     let window_pids = sys::pids_with_user_window();
     let mut startup_lower: Option<Vec<String>> = None;
     let mut session_apps: Vec<SessionApp> = Vec::new();
@@ -1461,10 +2156,17 @@ fn do_optimize(sh: &Shared) {
         }
     }
 
-    // 4. Tạm dừng các Services được chọn (nếu có quyền Admin)
+    // 4. Tạm dừng các Services được chọn (nếu có quyền Admin).
+    //    Hồ sơ `stop_services=0` thì không dừng service nào (và không ghi service vào session).
     let mut newly_stopped = Vec::new();
+    if !stop_services {
+        push(
+            "  • [HỒ SƠ] stop_services=0 — không dừng service nào lần này.".into(),
+            Color32::from_rgb(130, 150, 170),
+        );
+    }
     for ((svc_name, display_name, _, _), on) in SERVICE_TARGETS.iter().zip(&svcs) {
-        if !on {
+        if !on || !stop_services {
             continue;
         }
         if sys::is_service_running(svc_name) {
@@ -1644,7 +2346,11 @@ fn do_optimize(sh: &Shared) {
     }
     if !killed_any {
         push(
-            "  • [SKIP APPS] Không có app nền nào cần tắt (tất cả đang được giữ lại).".into(),
+            if close_apps {
+                "  • [SKIP APPS] Không có app nền nào cần tắt (tất cả đang được giữ lại).".to_string()
+            } else {
+                "  • [HỒ SƠ] Giữ nguyên mọi app nền (hồ sơ của game này không tắt app).".to_string()
+            },
             Color32::from_rgb(130, 150, 170),
         );
     }
@@ -1784,7 +2490,7 @@ fn do_optimize(sh: &Shared) {
         Color32::from_rgb(0, 255, 163),
     );
     push(
-        "★ [READY] Toàn bộ tài nguyên CPU & RAM đã tối ưu cho DELTA FORCE!".into(),
+        "★ [READY] Đã tối ưu CPU & RAM cho game!".into(),
         Color32::from_rgb(0, 255, 163),
     );
 
@@ -1792,7 +2498,9 @@ fn do_optimize(sh: &Shared) {
 }
 
 /// Thân của Restore: mở lại app, bật lại service, Wi-Fi autoconf, Game DVR.
-fn do_restore(sh: &Shared, clear_log: bool) {
+/// Trả `false` khi không có `session.json` (không có gì để khôi phục) — cờ `--restore` dùng
+/// giá trị này làm exit code, UI bỏ qua.
+fn do_restore(sh: &Shared, clear_log: bool) -> bool {
     if clear_log {
         log_clear(sh);
     }
@@ -1807,7 +2515,7 @@ fn do_restore(sh: &Shared, clear_log: bool) {
             format!("  ⚠ Không tìm thấy {} — chưa có phiên nào được lưu.", session_path().display()),
             Color32::from_rgb(255, 140, 140),
         );
-        return;
+        return false;
     };
 
     // 1. Mở lại app đã tắt (bỏ qua app đang chạy sẵn), chạy bằng quyền user thường.
@@ -1953,6 +2661,8 @@ fn do_restore(sh: &Shared, clear_log: bool) {
         let _ = std::fs::remove_file(&sp);
     }
     *sh.session.lock().unwrap() = None;
+    // Phiên bỏ lửng đã được xử lý: watcher được phép tự Boost trở lại.
+    sh.orphan_session.store(false, Ordering::SeqCst);
 
     sh.log(
         format!(
@@ -1964,6 +2674,7 @@ fn do_restore(sh: &Shared, clear_log: bool) {
         ),
         Color32::from_rgb(140, 165, 190),
     );
+    true
 }
 
 fn log_clear(sh: &Shared) {
@@ -2014,6 +2725,23 @@ fn ping_lines(label: &str, addr: u32, times: u32) -> Vec<String> {
 /// xả standby list khi RAM trống xuống thấp trong lúc chơi, cảnh báo commit gần trần,
 /// và ghi báo cáo số liệu cho mỗi trận (RAM / commit / CPU / ping).
 /// Không phụ thuộc `update()` nên vẫn hoạt động khi cửa sổ bị thu nhỏ.
+/// Game trong danh sách đang chạy (trả về tên exe viết thường). Dùng lúc mở app để biết
+/// `session.json` còn lại là "đang trong phiên" hay "phiên bị bỏ lửng".
+fn running_games(games: &[String]) -> Vec<String> {
+    if games.is_empty() {
+        return Vec::new();
+    }
+    let names: Vec<String> = sys::list_processes()
+        .into_iter()
+        .map(|p| p.name.to_lowercase())
+        .collect();
+    games
+        .iter()
+        .filter(|g| names.iter().any(|n| n == *g))
+        .cloned()
+        .collect()
+}
+
 fn start_watcher(sh: Shared) {
     std::thread::spawn(move || {
         const SCAN: Duration = Duration::from_secs(3);
@@ -2032,7 +2760,11 @@ fn start_watcher(sh: Shared) {
 
         let mut game_seen: Option<(Instant, usize)> = None;
         let mut game_gone: Option<Instant> = None;
-        let mut optimized = false;
+        // Phiên còn dở mà game vẫn đang chạy lúc mở app (app bị tắt giữa trận rồi mở lại):
+        // coi như đang trong phiên -> không Boost lần nữa, game tắt thì tự khôi phục như thường.
+        let mut optimized = sh.resume_session.swap(false, Ordering::SeqCst);
+        // Đã báo một lần vì sao watcher không tự Boost khi có phiên bỏ lửng chưa xử lý.
+        let mut orphan_block_logged = false;
         let mut last_mem_check = Instant::now();
         // Instant trên Windows tính từ lúc bật máy: `now() - X` panic khi máy mới chạy chưa tới X
         // (task chạy cùng Windows mở app ngay sau đăng nhập), nên lùi mốc bằng checked_sub.
@@ -2065,6 +2797,10 @@ fn start_watcher(sh: Shared) {
                 let any = !up.is_empty();
                 (up, any)
             };
+            // Hồ sơ riêng của game đang chạy cũng áp cho việc ghi báo cáo trận và xả standby
+            // trong lúc chơi (các tuỳ chọn khác chỉ dùng lúc Boost).
+            let game_profile = up.first().and_then(|exe| sh.profile_of(exe));
+            let (game_opts, _, _) = effective_opts(&opts, game_profile.as_ref());
 
             // Cảnh báo commit gần trần — chạy cả khi không có game nào.
             if last_commit_check.elapsed() >= COMMIT_CHECK {
@@ -2090,7 +2826,7 @@ fn start_watcher(sh: Shared) {
                     }
                     // Đang chơi mà commit chạm trần: xả standby ngay, bỏ qua khoảng cách 60 giây,
                     // nhưng chỉ MỘT lần cho mỗi đợt. Xả standby KHÔNG làm giảm commit nên vẫn giữ cảnh báo.
-                    if any && opts.standby && !commit_purged && !sh.busy.load(Ordering::SeqCst) {
+                    if any && game_opts.standby && !commit_purged && !sh.busy.load(Ordering::SeqCst) {
                         commit_purged = true;
                         last_purge = Instant::now();
                         match sys::purge_standby() {
@@ -2124,7 +2860,7 @@ fn start_watcher(sh: Shared) {
             if any {
                 game_gone = None;
                 // Bắt đầu ghi báo cáo trận — ghi cả khi auto mode tắt.
-                if live.is_none() && opts.report_enabled {
+                if live.is_none() && game_opts.report_enabled {
                     let host = sh.ping_host.lock().unwrap().clone();
                     let started = report::start(
                         &up.join(", "),
@@ -2145,22 +2881,35 @@ fn start_watcher(sh: Shared) {
                     live = Some(started);
                 }
                 if opts.auto_enabled && !optimized {
-                    let (since, count_at_seen) = *game_seen
-                        .get_or_insert_with(|| (Instant::now(), sh.opt_count.load(Ordering::SeqCst)));
-                    if since.elapsed() >= GAME_STABLE && !sh.busy.load(Ordering::SeqCst) {
-                        // Người dùng vừa bấm tối ưu bằng tay trong lúc chờ -> không chạy lặp.
-                        if sh.opt_count.load(Ordering::SeqCst) != count_at_seen {
+                    // Có phiên Game Boost bỏ lửng chưa xử lý: KHÔNG tự Boost (Boost sẽ ghi
+                    // thêm vào session cũ và người dùng càng khó khôi phục đúng trạng thái).
+                    if sh.orphan_session.load(Ordering::SeqCst) {
+                        if !orphan_block_logged {
+                            orphan_block_logged = true;
+                            sh.log(
+                                "  ⚠ [AUTO] Còn phiên Game Boost chưa khôi phục — không tự tối ưu. Bấm 'Khôi phục ngay' trên banner hoặc chạy GameMode.exe --restore.".into(),
+                                Color32::from_rgb(255, 170, 40),
+                            );
+                        }
+                    } else {
+                        let (since, count_at_seen) = *game_seen.get_or_insert_with(|| {
+                            (Instant::now(), sh.opt_count.load(Ordering::SeqCst))
+                        });
+                        if since.elapsed() >= GAME_STABLE && !sh.busy.load(Ordering::SeqCst) {
+                            // Người dùng vừa bấm tối ưu bằng tay trong lúc chờ -> không chạy lặp.
+                            if sh.opt_count.load(Ordering::SeqCst) != count_at_seen {
+                                optimized = true;
+                                game_seen = None;
+                                continue;
+                            }
+                            sh.log(
+                                format!("[AUTO] Phát hiện {}", up.join(", ")),
+                                Color32::from_rgb(0, 229, 255),
+                            );
                             optimized = true;
                             game_seen = None;
-                            continue;
+                            optimize(sh.clone(), true);
                         }
-                        sh.log(
-                            format!("[AUTO] Phát hiện {}", up.join(", ")),
-                            Color32::from_rgb(0, 229, 255),
-                        );
-                        optimized = true;
-                        game_seen = None;
-                        optimize(sh.clone(), true);
                     }
                 }
             } else {
@@ -2210,7 +2959,7 @@ fn start_watcher(sh: Shared) {
 
             // Trong phiên game: RAM trống thấp mà standby nhiều -> xả, tối thiểu 60 giây một lần.
             if any
-                && opts.standby
+                && game_opts.standby
                 && !sh.busy.load(Ordering::SeqCst)
                 && last_mem_check.elapsed() >= MEM_CHECK
                 && last_purge.elapsed() >= PURGE_GAP
@@ -2248,7 +2997,7 @@ fn start_watcher(sh: Shared) {
                                     let hint = if sys::is_admin() {
                                         ""
                                     } else {
-                                        " — GameMode đang chạy quyền thường, thoát ở khay rồi mở lại bằng quyền admin"
+                                        " — Paroda GameMode đang chạy quyền thường, thoát ở khay rồi mở lại bằng quyền admin"
                                     };
                                     sh.log(
                                         format!("  ⚠ [AUTO] Không xả được standby khi đang chơi: {}{}", e, hint),
@@ -2308,6 +3057,31 @@ struct App {
     update_changelog_open: bool,
     /// Đã bấm Cập nhật (đang trong luồng tải / cài / thử lại) — để phân biệt với lỗi kiểm tra mạng định kỳ.
     update_download_started: bool,
+    /// Banner "phiên Game Boost bỏ lửng" đã bấm "Để sau" (chỉ nhớ trong lần mở này).
+    orphan_dismissed: bool,
+    /// Phím tắt toàn cục đang chạy (`None` khi `hotkey:enabled=0` hoặc không đăng ký được).
+    hotkeys: Option<hotkey::HotkeyService>,
+    /// Lỗi parse tổ hợp phím tắt đọc từ config (hiện đỏ trong card "Phím tắt").
+    hotkey_parse_errors: Vec<(hotkey::HotkeyAction, String)>,
+    /// Ô nhập tổ hợp của mỗi hành động (chuỗi thô trong config; rỗng = phím đang tắt).
+    hotkey_inputs: HashMap<hotkey::HotkeyAction, String>,
+    /// Lỗi parse của lần bấm "Lưu" gần nhất trong phiên này (hành động -> câu lỗi).
+    hotkey_input_errors: HashMap<hotkey::HotkeyAction, String>,
+    /// Game đang mở khối "Hồ sơ riêng" trong card danh sách game.
+    open_profile: Option<String>,
+    /// Danh sách mục khởi động cùng Windows (đọc ở thread nền khi mở tab lần đầu / bấm Làm mới).
+    startup_view: Vec<startup::StartupEntry>,
+    /// Kết quả đọc ở thread nền (`None` = chưa xong); `update()` lấy ra đưa vào `startup_view`.
+    startup_slot: Arc<Mutex<Option<Vec<startup::StartupEntry>>>>,
+    startup_busy: Arc<AtomicBool>,
+    /// Đã đọc xong danh sách khởi động lần nào chưa (lần mở tab đầu tiên tự đọc).
+    startup_loaded: bool,
+    /// Lỗi ghi cờ bật/tắt của từng mục, hiện ngay dưới dòng đó (theo tên mục).
+    startup_row_err: HashMap<String, String>,
+    /// Lỗi chung khi đọc danh sách mục khởi động.
+    startup_err: Option<String>,
+    /// `egui::Context` giữ lại để tạo dịch vụ phím tắt sau này (khi bật lại từ UI).
+    ctx: egui::Context,
 }
 
 impl App {
@@ -2362,7 +3136,7 @@ impl App {
             .unwrap_or_default();
 
         let mut boot_log: Vec<(String, Color32)> = vec![
-            ("[SYSTEM] DELTA FORCE TACTICAL RAM SUITE READY".into(), Color32::from_rgb(0, 229, 255)),
+            ("[SYSTEM] PARODA GAMEMODE READY".into(), Color32::from_rgb(0, 229, 255)),
             (
                 if is_admin {
                     "[PERM] Quyền Administrator: ĐÃ KÍCH HOẠT (Đủ quyền quản lý Services)".into()
@@ -2376,6 +3150,42 @@ impl App {
                 Color32::from_rgb(50, 215, 255),
             ),
         ];
+        // Danh sách game trong config bị bỏ qua vì là app hệ thống / app luôn chạy (bản cũ từng
+        // có `game:msedgewebview2.exe=1` -> Boost ngay khi mở app): báo một lần cho người dùng biết.
+        for exe in cfg.skipped_games.iter() {
+            boot_log.push((
+                format!("  ⚠ Bỏ qua {exe} trong danh sách game: đây là app hệ thống/luôn chạy."),
+                Color32::from_rgb(255, 170, 40),
+            ));
+        }
+        // `session.json` còn từ lần chạy trước. Hai trường hợp:
+        //  - game trong danh sách vẫn đang chạy -> vẫn đang trong phiên: watcher tiếp quản phiên
+        //    cũ (không Boost lần nữa), khi game tắt thì tự khôi phục nếu `auto:restore`.
+        //  - không có game nào chạy -> phiên bị bỏ lửng: hiện banner "Khôi phục ngay".
+        let resume_games = if session.is_some() {
+            running_games(&cfg.games)
+        } else {
+            Vec::new()
+        };
+        let orphan = session.is_some() && resume_games.is_empty();
+        if !resume_games.is_empty() {
+            boot_log.push((
+                format!(
+                    "  • [PHIÊN] {} đang chạy và session.json còn — tiếp tục phiên Game Boost cũ, \
+                     không tối ưu lần nữa; game tắt sẽ tự khôi phục (nếu bật auto:restore).",
+                    resume_games.join(", ")
+                ),
+                Color32::from_rgb(0, 229, 255),
+            ));
+        }
+        if orphan {
+            boot_log.push((
+                "  ⚠ [PHIÊN] Còn phiên Game Boost chưa khôi phục (không thấy game nào đang chạy) — \
+                 xem banner ở cột phải để Khôi phục ngay."
+                    .into(),
+                Color32::from_rgb(255, 170, 40),
+            ));
+        }
         // Vừa cài bản cập nhật ở lần chạy trước (`update-pending.json`): báo kết quả trong nhật ký.
         if let Some((line, ok)) = update::take_startup_log() {
             boot_log.push((line, if ok { ui::SUCCESS } else { ui::DANGER }));
@@ -2398,7 +3208,8 @@ impl App {
             opts: Arc::new(Mutex::new(cfg.opts)),
             restore_sel: Arc::new(Mutex::new(restore_sel)),
             is_admin,
-            last_auto: Arc::new(AtomicBool::new(false)),
+            // Phiên cũ tiếp tục: auto-restore phải chạy như một phiên auto bình thường.
+            last_auto: Arc::new(AtomicBool::new(!resume_games.is_empty())),
             opt_count: Arc::new(AtomicUsize::new(0)),
             live_report: Arc::new(Mutex::new(None)),
             ping_host: Arc::new(Mutex::new(cfg.ping_host.clone())),
@@ -2409,7 +3220,13 @@ impl App {
             update_last_check: Arc::new(Mutex::new(None)),
             update_request: Arc::new(AtomicBool::new(false)),
             update_url: Arc::new(Mutex::new(cfg.update_url.clone())),
+            orphan_session: Arc::new(AtomicBool::new(orphan)),
+            resume_session: Arc::new(AtomicBool::new(!resume_games.is_empty())),
+            profiles: Arc::new(Mutex::new(cfg.profiles.clone())),
+            hotkeys: Arc::new(Mutex::new(cfg.hotkeys.clone())),
+            hotkey_bindings: Arc::new(Mutex::new(Vec::new())),
         };
+        let hotkeys_view = cfg.hotkeys.clone();
 
         let mut app = Self {
             sh: sh.clone(),
@@ -2424,7 +3241,9 @@ impl App {
             game_input: String::new(),
             task_on: sys::task_exists(),
             last_task_check: Instant::now(),
-            start_hidden: START_HIDDEN.load(Ordering::SeqCst),
+            // Có phiên Boost bỏ lửng thì LUÔN hiện cửa sổ, kể cả khi task chạy cùng Windows gọi
+            // với `--minimized` (giống cách xử lý `update-pending.json`).
+            start_hidden: START_HIDDEN.load(Ordering::SeqCst) && !orphan,
             tray: None,
             // HWND lấy ngay từ CreationContext: thread khay cần nó để ẩn/hiện cửa sổ
             // kể cả khi eframe không gọi update() nữa.
@@ -2439,6 +3258,19 @@ impl App {
             update_dismissed_version: None,
             update_changelog_open: false,
             update_download_started: false,
+            orphan_dismissed: false,
+            hotkeys: None,
+            hotkey_parse_errors: Vec::new(),
+            hotkey_inputs: hotkeys_view.clone(),
+            hotkey_input_errors: HashMap::new(),
+            open_profile: None,
+            startup_view: Vec::new(),
+            startup_slot: Arc::new(Mutex::new(None)),
+            startup_busy: Arc::new(AtomicBool::new(false)),
+            startup_loaded: false,
+            startup_row_err: HashMap::new(),
+            startup_err: None,
+            ctx: cc.egui_ctx.clone(),
         };
         app.save();
         app.start_scan();
@@ -2446,6 +3278,47 @@ impl App {
         start_watcher(sh.clone());
         // Kiểm tra cập nhật OTA: 20 giây sau khi mở app rồi mỗi 6 giờ (thread riêng).
         update::start_update_thread(sh.clone());
+        // Task "GameMode" cũ (mặc định `/SC ONLOGON`: chỉ chạy khi cắm sạc, tự chết sau 72 giờ)
+        // hoặc trỏ sai exe: kiểm tra và tạo lại ở thread nền để không chặn UI.
+        repair_task_in_background(sh.clone());
+        // Phím tắt toàn cục: thread riêng (như khay) vì eframe không gọi `update()` khi cửa sổ ẩn.
+        if sh.opts().hotkey_enabled {
+            let (bindings, errs) = parse_hotkeys(&hotkeys_view);
+            *sh.hotkey_bindings.lock().unwrap() = bindings.clone();
+            app.hotkey_parse_errors = errs;
+            let sh_hk = sh.clone();
+            let ctx_hk = cc.egui_ctx.clone();
+            let hwnd_hk = app.hwnd;
+            app.hotkeys = Some(hotkey::HotkeyService::start(bindings, move |action| {
+                on_hotkey(&sh_hk, &ctx_hk, hwnd_hk, action)
+            }));
+            let list: Vec<String> = HOTKEY_ACTIONS
+                .iter()
+                .filter_map(|a| {
+                    let combo = sh.hotkey_display(*a);
+                    (!combo.is_empty()).then(|| format!("{} = {}", a.label(), combo))
+                })
+                .collect();
+            sh.log(
+                if list.is_empty() {
+                    "  • [PHÍM TẮT] Mọi tổ hợp đang tắt (đặt lại trong tab Tự động & Tối ưu).".into()
+                } else {
+                    format!("  • [PHÍM TẮT] Toàn cục: {}", list.join(", "))
+                },
+                ui::ACCENT,
+            );
+        } else {
+            sh.log(
+                "  • [PHÍM TẮT] Đang tắt (hotkey:enabled=0).".into(),
+                ui::TEXT_MUTED,
+            );
+        }
+        for (action, err) in app.hotkey_parse_errors.clone() {
+            sh.log(
+                format!("  ⚠ [PHÍM TẮT] {}: {}", action.label(), err),
+                ui::DANGER,
+            );
+        }
         // Icon khay phải tạo trên main thread (Windows cần message loop của thread này);
         // `Tray` được giữ trong `App` để icon không bị bỏ khi hàm này kết thúc.
         match tray::Tray::new(&sh) {
@@ -2459,6 +3332,357 @@ impl App {
             ),
         }
         app
+    }
+
+    /// Bắt đầu đọc danh sách mục khởi động cùng Windows ở thread nền (mở tab lần đầu / Làm mới).
+    fn start_startup_scan(&mut self) {
+        if self.startup_busy.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let slot = self.startup_slot.clone();
+        let busy = self.startup_busy.clone();
+        std::thread::spawn(move || {
+            let list = startup::list_startup();
+            *slot.lock().unwrap() = Some(list);
+            busy.store(false, Ordering::SeqCst);
+        });
+    }
+
+    /// Lấy kết quả đọc xong của `startup::list_startup` vào `startup_view` (gọi mỗi frame).
+    fn poll_startup(&mut self) {
+        let done = self.startup_slot.lock().unwrap().take();
+        if let Some(list) = done {
+            self.startup_view = list;
+            self.startup_loaded = true;
+        }
+    }
+
+    /// Đăng ký lại toàn bộ phím tắt theo `sh.hotkeys` (chuỗi rỗng = phím đang tắt).
+    /// `rebind` chạy bất đồng bộ; lỗi đăng ký đọc qua `HotkeyService::errors()` ở frame sau.
+    fn apply_hotkeys(&mut self) {
+        let map = self.sh.hotkeys.lock().unwrap().clone();
+        let (bindings, errs) = parse_hotkeys(&map);
+        self.hotkey_parse_errors = errs;
+        *self.sh.hotkey_bindings.lock().unwrap() = bindings.clone();
+        match self.hotkeys.as_mut() {
+            Some(svc) => svc.rebind(bindings),
+            None => {
+                let sh = self.sh.clone();
+                let ctx = self.ctx.clone();
+                let hwnd = self.hwnd;
+                self.hotkeys = Some(hotkey::HotkeyService::start(bindings, move |action| {
+                    on_hotkey(&sh, &ctx, hwnd, action)
+                }));
+            }
+        }
+    }
+
+    /// Bật/tắt phím tắt ngay khi người dùng đổi công tắc (không cần mở lại app).
+    fn set_hotkeys_enabled(&mut self, enabled: bool) {
+        if enabled {
+            self.apply_hotkeys();
+            self.sh.log(
+                "  ✔ [PHÍM TẮT] Đã bật phím tắt toàn cục.".into(),
+                ui::SUCCESS,
+            );
+        } else {
+            // Drop `HotkeyService`: thread nhận WM_QUIT, huỷ hết đăng ký rồi thoát.
+            self.hotkeys = None;
+            self.sh.hotkey_bindings.lock().unwrap().clear();
+            self.sh.log(
+                "  • [PHÍM TẮT] Đã tắt phím tắt toàn cục (tổ hợp được nhả cho app khác).".into(),
+                ui::TEXT_MUTED,
+            );
+        }
+    }
+
+    /// Lưu một tổ hợp người dùng vừa nhập: parse lỗi thì báo đỏ dưới ô và KHÔNG lưu.
+    fn save_hotkey(&mut self, action: hotkey::HotkeyAction, text: String) {
+        let raw = text.trim().to_string();
+        if !raw.is_empty() {
+            if let Err(e) = hotkey::Hotkey::parse(&raw) {
+                self.hotkey_input_errors.insert(action, e);
+                return;
+            }
+        }
+        self.hotkey_input_errors.remove(&action);
+        self.sh.hotkeys.lock().unwrap().insert(action, raw);
+        self.hotkey_inputs.insert(action, text);
+        self.apply_hotkeys();
+        self.save();
+        let combo = self.sh.hotkey_display(action);
+        self.sh.log(
+            format!(
+                "  ✔ [PHÍM TẮT] {}: {}",
+                action.label(),
+                if combo.is_empty() {
+                    "đã tắt".to_string()
+                } else {
+                    combo
+                }
+            ),
+            ui::SUCCESS,
+        );
+    }
+
+    /// Tab "Khởi động": mục chạy cùng Windows (đọc khi mở tab lần đầu và khi bấm Làm mới).
+    fn render_startup_tab(&mut self, ui: &mut egui::Ui) {
+        let loading = self.startup_busy.load(Ordering::SeqCst);
+        let total = self.startup_view.len();
+        let on = self.startup_view.iter().filter(|e| e.enabled).count();
+        let current_exe = std::env::current_exe()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        let mut refresh = false;
+        let mut toggle: Option<(startup::StartupEntry, bool)> = None;
+        let err = self.startup_err.clone();
+        let row_errs = self.startup_row_err.clone();
+
+        ui::card(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = ui::SPACE_TOOLBAR_GAP;
+            ui.label(
+                RichText::new(
+                    "Tắt ở đây giống Task Manager: app không tự chạy khi đăng nhập, bật lại được bất cứ lúc nào.",
+                )
+                .size(11.0)
+                .color(ui::TEXT_MUTED),
+            );
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(if loading && total == 0 {
+                        "Đang đọc danh sách…".to_string()
+                    } else {
+                        format!("{} mục, {} đang bật", total, on)
+                    })
+                    .size(11.5)
+                    .color(ui::TEXT_MAIN),
+                );
+                ui.add_space(ui::SPACE_TOOLBAR_GAP);
+                if ui
+                    .add_enabled(!loading, ui::ghost_button_sized("🔄 Làm mới", 11.0))
+                    .clicked()
+                {
+                    refresh = true;
+                }
+            });
+            if let Some(e) = err.as_ref() {
+                ui.add_space(4.0);
+                ui.label(RichText::new(format!("⚠ {}", e)).size(10.5).color(ui::DANGER));
+            }
+        });
+
+        ui.add_space(ui::SPACE_TOOLBAR_MARGIN_BOTTOM);
+
+        egui::ScrollArea::vertical()
+            .id_salt("startup_scroll_area")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui::card(ui, |ui| {
+                    if total == 0 {
+                        ui.add_space(12.0);
+                        ui.label(
+                            RichText::new(if loading {
+                                "Đang quét registry Run và thư mục Startup…"
+                            } else {
+                                "Không thấy mục nào khởi động cùng Windows."
+                            })
+                            .size(11.5)
+                            .color(ui::TEXT_MUTED),
+                        );
+                        ui.add_space(12.0);
+                        return;
+                    }
+                    let list = self.startup_view.clone();
+                    for entry in list.iter() {
+                        let locked = is_self_startup(entry.exe_path.as_deref(), &current_exe);
+                        let mut enabled = entry.enabled;
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(&entry.name)
+                                            .size(12.0)
+                                            .strong()
+                                            .color(ui::TEXT_MAIN),
+                                    );
+                                    ui.label(
+                                        RichText::new(entry.location.label())
+                                            .size(10.0)
+                                            .color(ui::TEXT_DIM),
+                                    );
+                                    if locked {
+                                        ui.label(
+                                            RichText::new("chính GameMode — không tắt ở đây")
+                                                .size(10.0)
+                                                .color(ui::ACCENT),
+                                        );
+                                    }
+                                });
+                                let full = entry.command.clone();
+                                ui.label(
+                                    RichText::new(shorten_command(&entry.command, 62))
+                                        .size(10.5)
+                                        .monospace()
+                                        .color(if entry.enabled { ui::TEXT_MUTED } else { ui::TEXT_DIM }),
+                                )
+                                .on_hover_text(full);
+                                if let Some(e) = row_errs.get(&entry.name) {
+                                    ui.label(RichText::new(format!("⚠ {}", e)).size(10.0).color(ui::DANGER));
+                                }
+                            });
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if locked {
+                                    // Công tắc bị khoá: bấm không có tác dụng, config không đổi.
+                                    let size = vec2(28.0, 16.0);
+                                    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+                                    ui::draw_switch(&ui.painter(), rect, enabled, false);
+                                } else if ui::compact_switch(ui, &mut enabled) {
+                                    toggle = Some((entry.clone(), enabled));
+                                }
+                            });
+                        });
+                        ui.add_space(6.0);
+                    }
+                });
+            });
+
+        if loading {
+            ui.ctx().request_repaint_after(Duration::from_millis(200));
+        }
+        if refresh {
+            self.startup_err = None;
+            self.start_startup_scan();
+        }
+        if let Some((entry, want)) = toggle {
+            match startup::set_enabled(&entry, want) {
+                Ok(_) => {
+                    self.startup_row_err.remove(&entry.name);
+                    // Ghi cờ chỉ đổi trạng thái cho lần đăng nhập sau -> cập nhật danh sách đang hiện.
+                    if let Some(e) = self
+                        .startup_view
+                        .iter_mut()
+                        .find(|e| e.name == entry.name && e.location == entry.location)
+                    {
+                        e.enabled = want;
+                    }
+                    self.sh.log(
+                        format!(
+                            "  ✔ [KHỞI ĐỘNG] {} — {} (áp dụng từ lần đăng nhập sau).",
+                            entry.name,
+                            if want { "BẬT" } else { "TẮT" }
+                        ),
+                        if want { ui::SUCCESS } else { ui::TEXT_MUTED },
+                    );
+                }
+                Err(e) => {
+                    self.startup_row_err.insert(entry.name.clone(), e.clone());
+                    self.sh.log(
+                        format!("  ⚠ [KHỞI ĐỘNG] {}: {}", entry.name, e),
+                        ui::DANGER,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Card "Phím tắt": công tắc chung, mỗi hành động một ô nhập tổ hợp + nút "Lưu".
+    fn render_hotkey_card(&mut self, ui: &mut egui::Ui, opts_view: &mut Opts, save_needed: &mut bool) {
+        let service_errors = self.hotkeys.as_ref().map(|s| s.errors()).unwrap_or_default();
+        let parse_errors = self.hotkey_parse_errors.clone();
+        let mut toggle_to: Option<bool> = None;
+        let mut save: Option<(hotkey::HotkeyAction, String)> = None;
+
+        ui::card(ui, |ui| {
+            ui::section_header(
+                ui,
+                "⌨",
+                "Phím tắt",
+                Some("Dùng được ở bất cứ đâu, kể cả khi cửa sổ đã ẩn xuống khay"),
+            );
+            ui.add_space(ui::SPACE_HEADER_GAP);
+
+            if ui::toggle_row(
+                ui,
+                &mut opts_view.hotkey_enabled,
+                "Bật phím tắt toàn cục",
+                "Bấm tổ hợp để Boost / Khôi phục / ẩn-hiện cửa sổ; để trống ô để tắt riêng phím đó",
+            ) {
+                *save_needed = true;
+                toggle_to = Some(opts_view.hotkey_enabled);
+            }
+            ui.add_space(6.0);
+
+            if !opts_view.hotkey_enabled {
+                ui.label(
+                    RichText::new("Đang tắt — không phím tắt nào hoạt động.")
+                        .size(11.0)
+                        .color(ui::TEXT_MUTED),
+                );
+                return;
+            }
+
+            for action in HOTKEY_ACTIONS {
+                let mut text = self.hotkey_inputs.get(&action).cloned().unwrap_or_default();
+                let mut clicked = false;
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(action.label())
+                            .size(11.0)
+                            .color(ui::TEXT_MAIN),
+                    );
+                    let btn_w = 54.0_f32;
+                    let spacing = 6.0_f32;
+                    let edit_w = (ui.available_width() - btn_w - spacing).max(80.0_f32);
+                    egui::Frame::none()
+                        .fill(ui::BG)
+                        .stroke(Stroke::new(1.0_f32, ui::BORDER))
+                        .rounding(Rounding::same(6.0))
+                        .inner_margin(Margin::symmetric(8.0, 5.0))
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut text)
+                                    .hint_text("vd: Ctrl+Alt+B (để trống = tắt phím này)")
+                                    .text_color(ui::TEXT_MAIN)
+                                    .frame(false)
+                                    .desired_width(edit_w - 16.0),
+                            );
+                        });
+                    if ui.add(ui::ghost_button_sized("Lưu", 11.0)).clicked() {
+                        clicked = true;
+                    }
+                });
+                if let Some(err) = self.hotkey_input_errors.get(&action) {
+                    ui.label(RichText::new(format!("⚠ {}", err)).size(10.0).color(ui::DANGER));
+                } else if let Some((_, err)) = parse_errors.iter().find(|(a, _)| *a == action) {
+                    ui.label(RichText::new(format!("⚠ {}", err)).size(10.0).color(ui::DANGER));
+                } else if let Some((_, err)) = service_errors.iter().find(|(a, _)| *a == action) {
+                    ui.label(RichText::new(format!("⚠ {}", err)).size(10.0).color(ui::DANGER));
+                } else {
+                    let combo = self.sh.hotkey_display(action);
+                    ui.label(
+                        RichText::new(if combo.is_empty() {
+                            "Đang tắt phím này.".to_string()
+                        } else {
+                            format!("Đang dùng: {}", combo)
+                        })
+                        .size(10.0)
+                        .color(ui::TEXT_DIM),
+                    );
+                }
+                if clicked {
+                    save = Some((action, text));
+                }
+                ui.add_space(4.0);
+            }
+        });
+
+        if let Some(on) = toggle_to {
+            self.set_hotkeys_enabled(on);
+        }
+        if let Some((action, text)) = save {
+            self.save_hotkey(action, text);
+        }
     }
 
     /// Quét lại danh sách app đang chạy ở thread nền.
@@ -2677,6 +3901,87 @@ fn render_update_card(
     });
 }
 
+/// Một lựa chọn nhỏ trong hàng 3 lựa chọn "Chung / Bật / Tắt" của hồ sơ game.
+fn tri_choice(ui: &mut egui::Ui, text: &str, selected: bool) -> bool {
+    let btn = egui::Button::new(
+        RichText::new(text)
+            .size(10.5)
+            .strong()
+            .color(if selected { ui::ACCENT } else { ui::TEXT_MUTED }),
+    )
+    .fill(if selected { ui::CARD_HOVER } else { ui::CARD_BG })
+    .stroke(Stroke::new(1.0_f32, if selected { ui::ACCENT } else { ui::BORDER }))
+    .min_size(vec2(46.0, 20.0))
+    .rounding(Rounding::same(4.0));
+    ui.add(btn).clicked()
+}
+
+/// Khối "Hồ sơ riêng" của một game: mỗi tuỳ chọn một hàng 3 lựa chọn **Chung / Bật / Tắt**.
+/// "Chung" nghĩa là KHÔNG ghi dòng config nào cho key đó (dùng cài đặt ở card "Tối ưu khi chơi").
+fn profile_block(
+    ui: &mut egui::Ui,
+    exe: &str,
+    profiles: &mut HashMap<String, GameProfile>,
+    save_needed: &mut bool,
+) {
+    egui::Frame::none()
+        .fill(ui::BG)
+        .stroke(Stroke::new(1.0_f32, ui::BORDER))
+        .rounding(Rounding::same(6.0))
+        .inner_margin(Margin::symmetric(8.0, 6.0))
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new(format!("HỒ SƠ RIÊNG — {}", clean_game_name(exe)))
+                    .size(10.5)
+                    .strong()
+                    .color(ui::ACCENT),
+            );
+            ui.label(
+                RichText::new(
+                    "Chung = theo cài đặt ở card \"Tối ưu khi chơi\". Hồ sơ chỉ áp cho lần Boost của game này.",
+                )
+                .size(10.0)
+                .color(ui::TEXT_MUTED),
+            );
+            ui.add_space(4.0);
+            let profile = profiles.entry(exe.to_string()).or_default();
+            for (key, label) in PROFILE_KEYS {
+                let cur = profile.get(*key).copied();
+                let mut next = cur;
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(*label).size(11.0).color(ui::TEXT_MAIN));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // Bố cục phải->trái nên thứ tự bấm là Tắt, Bật, Chung.
+                        if tri_choice(ui, "Tắt", cur == Some(false)) {
+                            next = Some(false);
+                        }
+                        if tri_choice(ui, "Bật", cur == Some(true)) {
+                            next = Some(true);
+                        }
+                        if tri_choice(ui, "Chung", cur.is_none()) {
+                            next = None;
+                        }
+                    });
+                });
+                if next != cur {
+                    match next {
+                        Some(v) => {
+                            profile.insert((*key).to_string(), v);
+                        }
+                        None => {
+                            profile.remove(*key);
+                        }
+                    }
+                    *save_needed = true;
+                }
+            }
+        });
+    // Hồ sơ rỗng thì bỏ hẳn khỏi map: game không còn mang nhãn "hồ sơ riêng" nữa.
+    if profiles.get(exe).is_some_and(|p| p.is_empty()) {
+        profiles.remove(exe);
+    }
+}
+
 fn render_auto_card(
     ui: &mut egui::Ui,
     sh: &Shared,
@@ -2686,6 +3991,8 @@ fn render_auto_card(
     games_view: &[String],
     game_input: &mut String,
     save_needed: &mut bool,
+    open_profile: &mut Option<String>,
+    profiles_view: &mut HashMap<String, GameProfile>,
 ) {
     ui::card(ui, |ui| {
         ui::section_header(
@@ -2730,7 +4037,7 @@ fn render_auto_card(
             ui,
             &mut cur_task,
             "Chạy cùng Windows (Task Scheduler, quyền cao nhất)",
-            "Tạo task 'GameMode' chạy lúc đăng nhập với /RL HIGHEST — không hiện UAC",
+            "Task 'GameMode' tạo bằng XML: chạy lúc đăng nhập, quyền cao nhất, chạy cả khi dùng pin — không hiện UAC",
         ) {
             let r = if cur_task { sys::task_create() } else { sys::task_delete() };
             match r {
@@ -2773,11 +4080,13 @@ fn render_auto_card(
         } else {
             egui::ScrollArea::vertical()
                 .id_salt("game_list_scroll")
-                .max_height(100.0)
+                // Mở khối "Hồ sơ" thì nới chiều cao để thấy đủ 8 tuỳ chọn mà không phải cuộn.
+                .max_height(if open_profile.is_some() { 460.0 } else { 100.0 })
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
                     for exe in games_view.iter() {
                         let path = sh.game_paths.lock().unwrap().get(exe).cloned();
+                        let has_profile = profiles_view.get(exe).is_some_and(|p| !p.is_empty());
                         let row_h = 24.0_f32;
                         let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), egui::Sense::hover());
                         let painter = ui.painter_at(rect);
@@ -2789,7 +4098,7 @@ fn render_auto_card(
                         );
                         let del_resp = ui.interact(del_rect, ui.id().with(exe), egui::Sense::click())
                             .on_hover_cursor(egui::CursorIcon::PointingHand)
-                            .on_hover_text("Xoá khỏi danh sách game");
+                            .on_hover_text("Xoá khỏi danh sách game (xoá luôn hồ sơ riêng của nó)");
                         let del_color = if del_resp.hovered() { ui::DANGER } else { ui::TEXT_DIM };
                         let pad = 5.0_f32;
                         let stroke = Stroke::new(1.5_f32, del_color);
@@ -2811,7 +4120,34 @@ fn render_auto_card(
                             remove = Some(exe.clone());
                         }
 
-                        let text_max_w = (rect.width() - 28.0).max(40.0);
+                        // Nút "Hồ sơ": mở/thu khối tuỳ chọn riêng của game này.
+                        let open = open_profile.as_deref() == Some(exe.as_str());
+                        let prof_rect = Rect::from_center_size(
+                            pos2(rect.right() - 58.0, rect.center().y),
+                            vec2(54.0, 18.0),
+                        );
+                        let prof_resp = ui
+                            .interact(prof_rect, ui.id().with(("profile", exe)), egui::Sense::click())
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .on_hover_text(
+                                "Hồ sơ riêng cho game này: tuỳ chọn riêng thay vì dùng cài đặt chung",
+                            );
+                        let prof_color = if open || prof_resp.hovered() { ui::ACCENT } else { ui::TEXT_MUTED };
+                        painter.rect_stroke(prof_rect, Rounding::same(4.0), Stroke::new(1.0_f32, prof_color));
+                        painter.text(
+                            prof_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            if open { "Thu" } else { "Hồ sơ" },
+                            FontId::proportional(10.5),
+                            prof_color,
+                        );
+                        if prof_resp.clicked() {
+                            *open_profile = if open { None } else { Some(exe.clone()) };
+                        }
+
+                        // Chữ chỉ được chiếm tới sát nút "Hồ sơ" (chừa 92px bên phải).
+                        let text_right = rect.right() - 92.0;
+                        let text_max_w = (text_right - rect.left() - 2.0).max(40.0);
                         let exe_galley = painter.layout_no_wrap(
                             exe.clone(),
                             FontId::monospace(11.0),
@@ -2823,12 +4159,31 @@ fn render_auto_card(
                             exe_galley,
                             ui::TEXT_MAIN,
                         );
+                        let mut x_cursor = rect.left() + 2.0 + exe_w + 6.0;
+
+                        // Nhãn nhỏ cho game đang có hồ sơ riêng.
+                        if has_profile {
+                            let tag = painter.layout_no_wrap(
+                                "hồ sơ riêng".to_string(),
+                                FontId::proportional(10.0),
+                                ui::ACCENT,
+                            );
+                            let tag_w = tag.size().x;
+                            if x_cursor + tag_w < text_right {
+                                painter.galley(
+                                    pos2(x_cursor, rect.center().y - tag.size().y / 2.0),
+                                    tag,
+                                    ui::ACCENT,
+                                );
+                                x_cursor += tag_w + 6.0;
+                            }
+                        }
 
                         let path_desc = match path {
                             Some(ref p) => format!(" — {}", p),
                             None => " — (chưa biết đường dẫn)".to_string(),
                         };
-                        let path_max_w = (text_max_w - exe_w - 8.0).max(0.0);
+                        let path_max_w = (rect.left() + 2.0 + text_max_w - x_cursor).max(0.0);
                         if path_max_w > 20.0 {
                             // Một dòng, cắt "…" khi hẹp: xuống dòng trong khe hẹp bị che mất chữ.
                             let mut path_job = egui::text::LayoutJob::simple(
@@ -2841,17 +4196,32 @@ fn render_auto_card(
                             path_job.wrap.break_anywhere = true;
                             let path_galley = painter.layout_job(path_job);
                             painter.galley(
-                                pos2(rect.left() + 2.0 + exe_w + 6.0, rect.center().y - path_galley.size().y / 2.0),
+                                pos2(x_cursor, rect.center().y - path_galley.size().y / 2.0),
                                 path_galley,
                                 ui::TEXT_DIM,
                             );
                         }
                         ui.add_space(2.0);
+
+                        // Khối "Hồ sơ" nằm ngay dưới dòng của game đang mở.
+                        if open {
+                            profile_block(ui, exe, profiles_view, save_needed);
+                            ui.add_space(4.0);
+                        }
                     }
                 });
         }
         if let Some(exe) = remove {
             sh.games.lock().unwrap().retain(|e| e != &exe);
+            // Xoá game thì xoá luôn hồ sơ riêng của nó (config cũng không còn dòng nào).
+            profiles_view.remove(&exe);
+            if open_profile.as_deref() == Some(exe.as_str()) {
+                *open_profile = None;
+            }
+            sh.log(
+                format!("  • [GAME] Đã xoá {} khỏi danh sách game (kèm hồ sơ riêng nếu có).", exe),
+                ui::TEXT_MUTED,
+            );
             *save_needed = true;
         }
 
@@ -2891,17 +4261,29 @@ fn render_auto_card(
             if ui.add(add_btn).clicked() {
                 let exe = game_input.trim().to_lowercase();
                 if !exe.is_empty() {
-                    let mut games = sh.games.lock().unwrap();
-                    if !games.contains(&exe) {
-                        games.push(exe.clone());
+                    // App hệ thống / app luôn chạy (WebView2, trình duyệt, explorer...) không
+                    // bao giờ là game: đưa nhầm vào đây làm Boost chạy ngay khi mở app.
+                    if is_not_game(&exe) {
+                        game_input.clear();
+                        sh.log(
+                            format!(
+                                "  ⚠ [GAME] Không thêm {exe} — đây là app hệ thống/luôn chạy, không phải game."
+                            ),
+                            ui::WARNING,
+                        );
+                    } else {
+                        let mut games = sh.games.lock().unwrap();
+                        if !games.contains(&exe) {
+                            games.push(exe.clone());
+                        }
+                        drop(games);
+                        game_input.clear();
+                        *save_needed = true;
+                        sh.log(
+                            format!("  • [GAME] Đã thêm {} vào danh sách game.", exe),
+                            ui::ACCENT,
+                        );
                     }
-                    drop(games);
-                    game_input.clear();
-                    *save_needed = true;
-                    sh.log(
-                        format!("  • [GAME] Đã thêm {} vào danh sách game.", exe),
-                        ui::ACCENT,
-                    );
                 }
             }
         });
@@ -4330,7 +5712,7 @@ impl App {
                                 );
                                 ui.add_space(8.0);
                                 ui.label(
-                                    RichText::new("Mở game trong danh sách, GameMode sẽ tự ghi số liệu và lưu báo cáo khi bạn tắt game.")
+                                    RichText::new("Mở game trong danh sách, Paroda GameMode sẽ tự ghi số liệu và lưu báo cáo khi bạn tắt game.")
                                         .size(11.5)
                                         .color(ui::TEXT_MUTED),
                                 );
@@ -4545,7 +5927,7 @@ impl App {
                         ui.label(RichText::new("✔").size(14.0).strong().color(ui::SUCCESS));
                         ui.label(
                             RichText::new(format!(
-                                "Đã tải xong{} — GameMode sẽ tự đóng, cài rồi mở lại.",
+                                "Đã tải xong{} — Paroda GameMode sẽ tự đóng, cài rồi mở lại.",
                                 ver_str
                             ))
                             .size(12.0)
@@ -4609,6 +5991,54 @@ impl App {
             _ => {}
         }
     }
+
+    /// Banner "phiên Game Boost bị bỏ lửng": `session.json` còn nhưng không có game nào trong
+    /// danh sách đang chạy (app bị tắt giữa phiên, Wi-Fi/service có thể vẫn đang tắt). Nằm cùng
+    /// chỗ với banner cập nhật OTA, màu cảnh báo. "Để sau" chỉ ẩn banner tới lần mở sau.
+    fn render_orphan_banner(&mut self, ui: &mut egui::Ui) {
+        if self.orphan_dismissed || !self.sh.orphan_session.load(Ordering::SeqCst) {
+            return;
+        }
+        // Số app / service và giờ lưu lấy từ chính session chưa khôi phục.
+        let Some(s) = self.sh.session.lock().unwrap().clone() else {
+            return;
+        };
+        let busy = self.sh.busy.load(Ordering::SeqCst);
+
+        ui::banner_card(ui, ui::WARNING, Color32::from_rgb(80, 55, 15), |ui| {
+            // horizontal_wrapped: câu dài tự xuống dòng trong bề rộng cột phải.
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.label(RichText::new("⚠").size(14.0).strong().color(ui::WARNING));
+                ui.label(
+                    RichText::new(format!(
+                        "Còn phiên Game Boost chưa khôi phục (lưu lúc {}, {} app, {} service). Wi-Fi/service có thể vẫn đang tắt.",
+                        time_part(&s.saved_at),
+                        s.apps.len(),
+                        s.services.len()
+                    ))
+                    .size(12.0)
+                    .strong()
+                    .color(ui::TEXT_MAIN),
+                );
+            });
+            ui.add_space(8.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                if ui
+                    .add_enabled(!busy, ui::primary_button_sized("Khôi phục ngay", 11.5))
+                    .clicked()
+                {
+                    // Giữ nhật ký: người dùng cần đọc log của phiên bị bỏ lửng.
+                    restore_keep_log(self.sh.clone());
+                }
+                if ui.add(ui::ghost_button_sized("Để sau", 11.5)).clicked() {
+                    self.orphan_dismissed = true;
+                }
+            });
+        });
+        ui.add_space(ui::SPACE_CARD_GAP);
+    }
 }
 
 impl eframe::App for App {
@@ -4635,6 +6065,8 @@ impl eframe::App for App {
             self.mem = sys::memory();
             self.last_mem = Instant::now();
         }
+        // Danh sách mục khởi động đọc ở thread nền: lấy kết quả khi xong.
+        self.poll_startup();
         // Danh sách trang bộ nhớ (free / standby) — rẻ, chỉ đọc khi thẻ RAM cần hiển thị.
         if self.last_ml.elapsed() > Duration::from_millis(2000) {
             self.mem_lists = sys::memory_lists();
@@ -4968,11 +6400,15 @@ impl eframe::App for App {
             .show(ctx, |ui| {
                 ui::paint_background_grid(ui);
 
+                // Banner phiên Game Boost bị bỏ lửng (session.json còn, không có game nào chạy)
+                self.render_orphan_banner(ui);
+
                 // Banner cập nhật OTA (nếu có bản mới, đang tải, đã tải xong, hoặc lỗi tải)
                 self.render_update_banner(ui);
 
-                // Thanh tab ở trên cùng
-                ui.horizontal(|ui| {
+                // Thanh tab ở trên cùng: `horizontal_wrapped` để 5 tab tự xuống dòng khi cửa sổ hẹp
+                // (cửa sổ mặc định 1240px không đủ cho 5 tab trên một hàng).
+                ui.horizontal_wrapped(|ui| {
                     let is_app = self.tab == ConfigTab::Apps;
                     let app_tab_btn = ui::tab_button(
                         format!("💻 Ứng dụng đang chạy ({}/{})", kept, apps_snapshot.len()),
@@ -4991,6 +6427,25 @@ impl eframe::App for App {
                     );
                     if ui.add(svc_tab_btn).clicked() {
                         self.tab = ConfigTab::Services;
+                    }
+
+                    let is_startup = self.tab == ConfigTab::Startup;
+                    let startup_on = self.startup_view.iter().filter(|e| e.enabled).count();
+                    let startup_tab_btn = ui::tab_button(
+                        if self.startup_loaded {
+                            format!("🚀 Khởi động ({}/{})", startup_on, self.startup_view.len())
+                        } else {
+                            "🚀 Khởi động".to_string()
+                        },
+                        is_startup,
+                        ui::ACCENT,
+                    );
+                    if ui.add(startup_tab_btn).clicked() {
+                        self.tab = ConfigTab::Startup;
+                        // Đọc khi mở tab lần đầu (đọc ở thread nền vì registry + .lnk hơi chậm).
+                        if !self.startup_loaded {
+                            self.start_startup_scan();
+                        }
                     }
 
                     let is_auto = self.tab == ConfigTab::AutoOpt;
@@ -5240,6 +6695,9 @@ impl eframe::App for App {
                                 });
                             });
                     }
+                    ConfigTab::Startup => {
+                        self.render_startup_tab(ui);
+                    }
                     ConfigTab::AutoOpt => {
                         let is_wide = ui.available_width() >= 560.0;
                         egui::ScrollArea::vertical()
@@ -5247,6 +6705,9 @@ impl eframe::App for App {
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 let mut save_needed = false;
+                                // Bản sao hồ sơ riêng: card sửa bản sao, cuối frame ghi lại vào
+                                // `Shared` + config khi có thay đổi.
+                                let mut profiles_view = sh.profiles.lock().unwrap().clone();
                                 if is_wide {
                                     ui.spacing_mut().item_spacing.x = ui::SPACE_GRID_GAP;
                                     ui.columns(2, |cols| {
@@ -5259,6 +6720,8 @@ impl eframe::App for App {
                                             &games_view,
                                             &mut self.game_input,
                                             &mut save_needed,
+                                            &mut self.open_profile,
+                                            &mut profiles_view,
                                         );
                                         render_optimize_card(
                                             &mut cols[1],
@@ -5276,6 +6739,8 @@ impl eframe::App for App {
                                         &games_view,
                                         &mut self.game_input,
                                         &mut save_needed,
+                                        &mut self.open_profile,
+                                        &mut profiles_view,
                                     );
                                     ui.add_space(ui::SPACE_CARD_GAP);
                                     render_optimize_card(
@@ -5295,8 +6760,13 @@ impl eframe::App for App {
                                     &mut self.update_err,
                                 );
 
+                                // Phím tắt toàn cục (bật/tắt + đổi tổ hợp) — dưới card cập nhật.
+                                ui.add_space(ui::SPACE_CARD_GAP);
+                                self.render_hotkey_card(ui, &mut opts_view, &mut save_needed);
+
                                 if save_needed {
                                     *sh.opts.lock().unwrap() = opts_view;
+                                    *sh.profiles.lock().unwrap() = profiles_view;
                                     self.save();
                                 }
                             });
@@ -5309,6 +6779,90 @@ impl eframe::App for App {
 
         ui::handle_window_resize_and_border(ctx);
     }
+}
+
+/// `Shared` tối thiểu cho việc chạy không có UI (`--restore`): mọi lựa chọn đọc từ config,
+/// không có thread watcher / cập nhật nào chạm vào.
+fn headless_shared(cfg: Config) -> Shared {
+    Shared {
+        log: Arc::new(Mutex::new(Vec::new())),
+        busy: Arc::new(AtomicBool::new(false)),
+        running: Arc::new(Mutex::new(Vec::new())),
+        session: Arc::new(Mutex::new(None)),
+        keep: Arc::new(Mutex::new(cfg.keep)),
+        svc: Arc::new(Mutex::new(cfg.svcs)),
+        games: Arc::new(Mutex::new(cfg.games)),
+        game_paths: Arc::new(Mutex::new(cfg.game_paths)),
+        opts: Arc::new(Mutex::new(cfg.opts)),
+        // Rỗng = mọi entry của session đều được mở lại (như mặc định trong UI).
+        restore_sel: Arc::new(Mutex::new(HashMap::new())),
+        is_admin: sys::is_admin(),
+        last_auto: Arc::new(AtomicBool::new(false)),
+        opt_count: Arc::new(AtomicUsize::new(0)),
+        live_report: Arc::new(Mutex::new(None)),
+        ping_host: Arc::new(Mutex::new(cfg.ping_host)),
+        commit_alert: Arc::new(AtomicBool::new(false)),
+        commit_pct: Arc::new(Mutex::new(0.0)),
+        update_state: Arc::new(Mutex::new(update::UpdateState::Idle)),
+        update_manifest: Arc::new(Mutex::new(None)),
+        update_last_check: Arc::new(Mutex::new(None)),
+        update_request: Arc::new(AtomicBool::new(false)),
+        update_url: Arc::new(Mutex::new(cfg.update_url)),
+        // Đang khôi phục chính là đang xử lý phiên bỏ lửng.
+        orphan_session: Arc::new(AtomicBool::new(true)),
+        resume_session: Arc::new(AtomicBool::new(false)),
+        profiles: Arc::new(Mutex::new(cfg.profiles)),
+        hotkeys: Arc::new(Mutex::new(cfg.hotkeys)),
+        hotkey_bindings: Arc::new(Mutex::new(Vec::new())),
+    }
+}
+
+/// `--restore`: chạy đúng logic khôi phục của `do_restore` mà không mở UI.
+/// Exit code: 0 = khôi phục xong không bước nào lỗi; 1 = đang chơi game / không có session /
+/// có bước lỗi. Trả về (exit code, nội dung file `restore.txt`).
+fn restore_cli() -> (i32, String) {
+    let cfg = load_config();
+    let mut lines: Vec<String> = vec![
+        format!("Paroda GameMode --restore | {}", sys::local_time_string()),
+        format!("admin={}", sys::is_admin()),
+    ];
+    // Đang chơi thì KHÔNG khôi phục (sẽ mở lại app và bật service giữa trận).
+    let up = running_games(&cfg.games);
+    let mut code = 1;
+    if !up.is_empty() {
+        lines.push(format!(
+            "TỪ CHỐI: game trong danh sách đang chạy ({}). Tắt game rồi chạy lại --restore.",
+            up.join(", ")
+        ));
+    } else {
+        let sh = headless_shared(cfg);
+        let restored = do_restore(&sh, false);
+        let logs: Vec<String> = sh
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(text, _)| text.clone())
+            .collect();
+        // Bước nào lỗi thì `do_restore` ghi dòng có '⚠' — tính là thất bại cho exit code.
+        let warns = logs.iter().filter(|l| l.contains('⚠')).count();
+        lines.extend(logs);
+        if !restored {
+            lines.push(
+                "KHÔNG khôi phục được: không có session.json (không có phiên nào đang chờ).".into(),
+            );
+        } else if warns > 0 {
+            lines.push(format!(
+                "KẾT QUẢ: khôi phục xong nhưng có {} bước lỗi (các dòng ⚠ ở trên).",
+                warns
+            ));
+        } else {
+            lines.push("KẾT QUẢ: khôi phục xong, không có bước nào lỗi.".into());
+            code = 0;
+        }
+    }
+    lines.push(String::new());
+    (code, lines.join("\n"))
 }
 
 fn main() -> eframe::Result<()> {
@@ -5333,6 +6887,16 @@ fn main() -> eframe::Result<()> {
         let msg = format!("admin={} result={:?}", sys::is_admin(), r);
         let _ = std::fs::write(config_path().with_file_name("launchtest.txt"), msg);
         return Ok(());
+    }
+
+    // --restore: khôi phục phiên Game Boost bị bỏ lửng mà KHÔNG mở UI (trường hợp app đã bị tắt
+    // giữa phiên, session.json còn lại). Từ chối nếu còn game trong danh sách đang chạy. Kết quả
+    // từng bước (đúng các dòng log của `do_restore`) ghi ra restore.txt cạnh exe.
+    // Exit code: 0 = đã khôi phục, 1 = lỗi hoặc không có session.
+    if std::env::args().any(|a| a == "--restore") {
+        let (code, text) = restore_cli();
+        let _ = std::fs::write(config_path().with_file_name("restore.txt"), text);
+        std::process::exit(code);
     }
 
     // --selftest: đọc mọi process như khi lưu session (cmdline, cwd), KHÔNG tắt gì.
@@ -5552,14 +7116,34 @@ fn main() -> eframe::Result<()> {
 
     // --purgetest: xả standby list một lần, ghi free/standby trước & sau ra purgetest.txt.
     // --tasktest: tạo task "GameMode", đọc lại XML, rồi xoá (chỉ để kiểm tra cách quote đường dẫn).
+    // Task đã có sẵn (người dùng đang bật chạy cùng Windows) thì CHỈ đọc, không tạo/xoá: bản cũ
+    // từng xoá mất task thật của người dùng khi bước tạo bị lỗi.
     if std::env::args().any(|a| a == "--tasktest") {
+        if sys::task_exists() {
+            use std::os::windows::process::CommandExt;
+            let xml = std::process::Command::new("schtasks")
+                .args(["/Query", "/TN", "GameMode", "/XML"])
+                .creation_flags(0x0800_0000)
+                .output()
+                .map(|o| sys::decode_win_output(&o.stdout))
+                .unwrap_or_default();
+            let _ = std::fs::write(
+                config_path().with_file_name("tasktest.txt"),
+                format!(
+                    "task GameMode đã tồn tại — chỉ đọc, không tạo/xoá\nneeds_repair={}\n{}",
+                    sys::task_needs_repair(),
+                    xml
+                ),
+            );
+            return Ok(());
+        }
         let created = sys::task_create();
         use std::os::windows::process::CommandExt;
         let xml = std::process::Command::new("schtasks")
             .args(["/Query", "/TN", "GameMode", "/XML"])
             .creation_flags(0x0800_0000)
             .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .map(|o| sys::decode_win_output(&o.stdout))
             .unwrap_or_default();
         let deleted = sys::task_delete();
         let _ = std::fs::write(
@@ -5701,6 +7285,67 @@ mod tests {
             SERVICE_TARGETS.iter().all(|(name, ..)| !name.eq_ignore_ascii_case("sshd")),
             "Game Boost không được dừng OpenSSH Server"
         );
+    }
+
+    /// App hệ thống / app luôn chạy KHÔNG BAO GIỜ được nằm trong danh sách game: bản cũ có
+    /// `game:msedgewebview2.exe=1` nên WebView2 (luôn chạy) làm Boost chạy ngay khi mở app.
+    #[test]
+    fn test_not_games_blocks_always_on_apps() {
+        for exe in [
+            "msedgewebview2.exe",
+            "msedge.exe",
+            "chrome.exe",
+            "explorer.exe",
+            "svchost.exe",
+            "searchhost.exe",
+            "taskmgr.exe",
+            "steam.exe",
+            "obs64.exe",
+            "claude.exe",
+            "node.exe",
+            "gamemode.exe",
+            "system",
+            "registry",
+            "discord.exe",
+            "discordsystemhelper.exe",
+        ] {
+            assert!(is_not_game(exe), "{exe} phải bị chặn khỏi danh sách game");
+        }
+        // Tên hoa cũng bị chặn sau khi hạ chữ thường (config và UI đều hạ trước khi gọi).
+        assert!(is_not_game(&"MSEDGEWEBVIEW2.EXE".to_lowercase()));
+        for exe in [
+            "deltaforceclient-win64-shipping.exe",
+            "cs2.exe",
+            "game-client-win64-shipping.exe",
+        ] {
+            assert!(!is_not_game(exe), "{exe} vẫn phải được coi là game");
+        }
+    }
+
+    /// Dòng `game:` là app hệ thống bị bỏ qua lúc đọc config (không nạp vào danh sách), tên exe
+    /// được ghi lại vào `skipped_games` để báo log; lần ghi config sau sẽ tự xoá dòng đó.
+    #[test]
+    fn test_parse_config_skips_not_games() {
+        let cfg = parse_config(
+            "game:msedgewebview2.exe=1\ngame:DeltaForceClient-Win64-Shipping.exe=1\n\
+             game:discord.exe=1\nkeep:steam.exe=1\n",
+        );
+        assert_eq!(cfg.games, vec!["deltaforceclient-win64-shipping.exe".to_string()]);
+        assert!(cfg.skipped_games.contains(&"msedgewebview2.exe".to_string()));
+        assert!(cfg.skipped_games.contains(&"discord.exe".to_string()));
+        assert!(!cfg.skipped_games.contains(&"deltaforceclient-win64-shipping.exe".to_string()));
+
+        // Chỉ có dòng bị chặn -> không nạp game nào, rơi về danh sách game mặc định.
+        let only_bad = parse_config("game:explorer.exe=1\n");
+        assert_eq!(only_bad.games, DEFAULT_GAMES.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(only_bad.skipped_games, vec!["explorer.exe".to_string()]);
+    }
+
+    /// Giờ lưu trong banner phiên bỏ lửng lấy từ `saved_at` của session.
+    #[test]
+    fn test_time_part() {
+        assert_eq!(time_part("2026-10-22 18:50:12"), "18:50");
+        assert_eq!(time_part(""), "");
     }
 
     #[test]

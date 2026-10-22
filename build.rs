@@ -23,6 +23,10 @@ fn main() {
 
     let mut res = winres::WindowsResource::new();
     res.set_icon("icon.ico");
+    // Tên hiển thị trong Task Manager / Properties của exe (tên file vẫn là GameMode.exe
+    // để OTA, gỡ cài, task Scheduler và mutex một-bản cũ vẫn nhận ra bản cũ).
+    res.set("ProductName", "Paroda GameMode");
+    res.set("FileDescription", "Paroda GameMode");
     res.set_manifest(r#"
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
 <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">

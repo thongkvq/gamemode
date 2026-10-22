@@ -22,8 +22,8 @@ const ID_RESTORE: &str = "gm_restore";
 const ID_AUTO: &str = "gm_auto";
 const ID_QUIT: &str = "gm_quit";
 
-pub const TOOLTIP_READY: &str = "GameMode — SẴN SÀNG";
-pub const TOOLTIP_BUSY: &str = "GameMode — ĐANG THANH LỌC";
+pub const TOOLTIP_READY: &str = "Paroda GameMode — SẴN SÀNG";
+pub const TOOLTIP_BUSY: &str = "Paroda GameMode — ĐANG THANH LỌC";
 
 /// Bật khi người dùng chọn "Thoát" ở menu khay: `App::update` thấy cờ này thì không
 /// chặn yêu cầu đóng nữa mà bỏ icon khay rồi thoát hẳn.
@@ -55,12 +55,12 @@ impl Tray {
     /// cần message loop của thread đã tạo icon.
     ///
     /// Lưu ý: muda 0.21 không có API đặt mục "mặc định" (in đậm) cho menu khay Win32, nên
-    /// "Mở GameMode" chỉ là mục đầu tiên, không in đậm.
+    /// "Mở Paroda GameMode" chỉ là mục đầu tiên, không in đậm.
     pub fn new(sh: &Shared) -> Result<Self, String> {
         let auto_on = sh.opts().auto_enabled;
 
         let menu = Menu::new();
-        let open = MenuItem::with_id(ID_OPEN, "Mở GameMode", true, None);
+        let open = MenuItem::with_id(ID_OPEN, "Mở Paroda GameMode", true, None);
         let sep1 = PredefinedMenuItem::separator();
         let boost = MenuItem::with_id(ID_BOOST, "Bật Game Boost", true, None);
         let restore_item = MenuItem::with_id(ID_RESTORE, "Khôi phục", true, None);
@@ -237,7 +237,7 @@ pub fn test_tray(ms: u64) -> String {
     let mut lines: Vec<String> = Vec::new();
 
     let menu = Menu::new();
-    let open = MenuItem::with_id(ID_OPEN, "Mở GameMode", true, None);
+    let open = MenuItem::with_id(ID_OPEN, "Mở Paroda GameMode", true, None);
     let sep = PredefinedMenuItem::separator();
     let boost = MenuItem::with_id(ID_BOOST, "Bật Game Boost", true, None);
     let quit = MenuItem::with_id(ID_QUIT, "Thoát", true, None);

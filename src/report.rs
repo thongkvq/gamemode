@@ -53,7 +53,7 @@ const PARTIAL_GAP: Duration = Duration::from_secs(60);
 const PARTIAL_SUFFIX: &str = ".partial";
 /// `ended_at` của báo cáo khôi phục: mốc kết thúc thật không đọc được (app đã chết giữa trận),
 /// nên ghi rõ là bị cắt ngang thay vì bịa một mốc giờ.
-const INTERRUPTED_ENDED_AT: &str = "(GameMode tắt giữa trận)";
+const INTERRUPTED_ENDED_AT: &str = "(Paroda GameMode tắt giữa trận)";
 
 const GIB: f32 = 1024.0 * 1024.0 * 1024.0;
 
@@ -322,7 +322,7 @@ fn recover_partials_in(dir: &Path) -> Vec<String> {
         report.events.push(Event {
             t: duration_sec as f32,
             kind: "interrupted".to_string(),
-            text: "GameMode tắt giữa trận — báo cáo khôi phục từ bản lưu tạm".to_string(),
+            text: "Paroda GameMode tắt giữa trận — báo cáo khôi phục từ bản lưu tạm".to_string(),
         });
 
         if save_report_in(dir, &report).is_some() {
@@ -968,7 +968,7 @@ fn verdicts(s: &Summary, events: &[Event]) -> Vec<String> {
     }
     // Không có số FPS vì không mở được session ETW (thường là thiếu quyền admin).
     if s.fps_avg.is_none() && events.iter().any(|e| e.kind == "fps_off") {
-        out.push("Không đo được FPS — mở GameMode bằng quyền admin để đo FPS.".to_string());
+        out.push("Không đo được FPS — mở Paroda GameMode bằng quyền admin để đo FPS.".to_string());
     }
     if out.is_empty() {
         out.push("Trận ổn định, không phát hiện nút thắt.".to_string());

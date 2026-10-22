@@ -3,6 +3,7 @@
 session*.json
 gamemode-crash.log
 selftest.txt
+restore.txt
 launchtest.txt
 pingtest.txt
 reporttest.txt

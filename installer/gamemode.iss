@@ -1,10 +1,12 @@
-﻿; Bộ cài GameMode (Inno Setup 6).
+﻿; Bộ cài Paroda GameMode (Inno Setup 6).
+; Tên hiển thị là "Paroda GameMode", nhưng tên file exe, thư mục cài, AppId, AppMutex và
+; tên bộ cài vẫn giữ "GameMode" để bản cũ nhận ra nhau khi cập nhật OTA / gỡ cài.
 ; Build: cargo build --release, rồi
 ;   "%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" installer\gamemode.iss
 ; Kết quả: dist\GameMode-Setup-<version>.exe
 
-#define AppName "GameMode"
-#define AppVersion "1.3.4"
+#define AppName "Paroda GameMode"
+#define AppVersion "1.4.0"
 #define AppPublisher "thongkvq"
 #define AppExe "GameMode.exe"
 
@@ -19,8 +21,10 @@ AppSupportURL=https://github.com/thongkvq/gamemode
 ; Cài theo từng user: không cần quyền admin để cài, và app ghi được gamemode.cfg / session.json cạnh exe.
 ; Bản thân GameMode.exe vẫn tự xin quyền admin khi chạy (manifest highestAvailable).
 PrivilegesRequired=lowest
-DefaultDirName={localappdata}\Programs\{#AppName}
-DefaultGroupName={#AppName}
+DefaultDirName={localappdata}\Programs\GameMode
+DefaultGroupName=Paroda GameMode
+; Bản cũ dùng group "GameMode": không kế thừa để nhóm Start Menu mang tên mới.
+UsePreviousGroup=no
 DisableProgramGroupPage=yes
 UninstallDisplayIcon={app}\{#AppExe}
 SetupIconFile=..\icon.ico
@@ -44,10 +48,18 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [CustomMessages]
 english.DesktopIconVN=Tạo shortcut ngoài Desktop
-english.RunAppVN=Mở GameMode ngay
+english.RunAppVN=Mở Paroda GameMode ngay
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:DesktopIconVN}"; GroupDescription: "{cm:AdditionalIcons}"
+
+[InstallDelete]
+; Bản trước tên hiển thị là "GameMode" -> shortcut cũ nằm ở Desktop và nhóm Start Menu "GameMode".
+; Xoá trước khi cài để không còn hai shortcut (một cũ một mới) cùng trỏ GameMode.exe.
+Type: files; Name: "{userdesktop}\GameMode.lnk"
+Type: files; Name: "{userprograms}\GameMode\GameMode.lnk"
+Type: files; Name: "{userprograms}\GameMode\Gỡ cài đặt GameMode.lnk"
+Type: dirifempty; Name: "{userprograms}\GameMode"
 
 [Files]
 Source: "..\target\release\gamemode.exe"; DestDir: "{app}"; DestName: "{#AppExe}"; Flags: ignoreversion

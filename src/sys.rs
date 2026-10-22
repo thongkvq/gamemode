@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ALREADY_EXISTS, FILETIME, GetLastError, HANDLE, HWND, INVALID_HANDLE_VALUE,
-    LPARAM, LUID, STILL_ACTIVE, SYSTEMTIME, WPARAM,
+    LPARAM, LUID, RECT, STILL_ACTIVE, SYSTEMTIME, WPARAM,
 };
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     GetBestRoute, ICMP_ECHO_REPLY, IcmpCloseHandle, IcmpCreateFile, IcmpSendEcho, MIB_IPFORWARDROW,
@@ -47,9 +47,10 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, FindWindowW, GetWindow, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowLongPtrW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, PostMessageW,
-    SetForegroundWindow, SetWindowLongPtrW, ShowWindow, GWL_EXSTYLE, GW_OWNER, SW_HIDE,
-    SW_RESTORE, SW_SHOW, SW_SHOWMINNOACTIVE, WM_CLOSE, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+    GetWindowLongPtrW, GetWindowPlacement, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
+    PostMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPlacement, ShowWindow,
+    SystemParametersInfoW, GWL_EXSTYLE, GW_OWNER, SPI_GETWORKAREA, SW_HIDE, SW_RESTORE, SW_SHOW,
+    SW_SHOWMINNOACTIVE, WINDOWPLACEMENT, WM_CLOSE, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
 };
 
 /// ACCESS bị windows-sys đặt ở module khác -> dùng hằng số gốc của Win32.
@@ -1033,10 +1034,12 @@ fn run_hidden(program: &str, args: &[&str]) -> Result<String, String> {
         .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map_err(|e| format!("chạy {} lỗi: {}", program, e))?;
+    // `schtasks /Query /TN ... /XML` trả stdout UTF-16 LE (có BOM) -> from_utf8_lossy
+    // sẽ cho ra chuỗi rác kiểu "C\0:\0\\\0..." nên phải giải mã riêng.
     let text = format!(
         "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
+        decode_win_output(&out.stdout),
+        decode_win_output(&out.stderr)
     );
     if out.status.success() {
         Ok(text)
@@ -1056,30 +1059,403 @@ pub fn task_exists() -> bool {
 }
 
 /// Tạo task chạy cùng Windows với quyền cao nhất (không bật UAC mỗi lần đăng nhập).
+///
+/// Ghi thẳng file XML rồi `schtasks /Create /XML` thay cho `/SC ONLOGON`, vì `/SC ONLOGON`
+/// để Windows tự chọn mặc định của nó và mặc định đó rất không hợp laptop chạy pin:
+/// chỉ chạy khi đang cắm sạc (`DisallowStartIfOnBatteries`), bị dừng khi rút sạc
+/// (`StopIfGoingOnBatteries`), bị giết sau 72 giờ (`ExecutionTimeLimit PT72H`) và chạy
+/// priority 7 (below normal). File XML đặt các cờ đó đúng ý: chạy cả khi dùng pin,
+/// không giới hạn thời gian, priority 5 (normal).
 pub fn task_create() -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("không lấy được đường dẫn exe: {}", e))?;
-    let tr = format!("\"{}\" --minimized", exe.display());
-    run_hidden(
-        "schtasks",
-        &[
-            "/Create",
-            "/TN",
-            TASK_NAME,
-            "/TR",
-            &tr,
-            "/SC",
-            "ONLOGON",
-            "/RL",
-            "HIGHEST",
-            "/F",
-        ],
-    )
-    .map(|_| ())
+    let exe = exe.display().to_string();
+    let xml = task_xml(&exe, &current_user_sid());
+    let path = task_xml_path();
+    write_utf16le(&path, &xml)?;
+    let file = path.display().to_string();
+    // `schtasks` bắt buộc nhận XML qua file, không nhận qua stdin/đối số.
+    let r = run_hidden("schtasks", &["/Create", "/TN", TASK_NAME, "/XML", &file, "/F"]);
+    // File XML chỉ để schtasks đọc một lần -> luôn xoá, kể cả khi tạo task lỗi.
+    let _ = std::fs::remove_file(&path);
+    r.map(|_| ())
+}
+
+/// Task đã tồn tại nhưng còn mang mặc định cũ của `/SC ONLOGON` (hoặc trỏ sai exe) hay không.
+/// `false` khi task chưa tồn tại (không có gì để sửa) hoặc khi đã đúng.
+pub fn task_needs_repair() -> bool {
+    let Ok(xml) = run_hidden("schtasks", &["/Query", "/TN", TASK_NAME, "/XML"]) else {
+        // Task không tồn tại (schtasks trả mã lỗi) -> việc tạo task là do người dùng chọn.
+        return false;
+    };
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    task_xml_needs_repair(&xml, &exe.display().to_string())
 }
 
 /// Xoá task "GameMode".
 pub fn task_delete() -> Result<(), String> {
     run_hidden("schtasks", &["/Delete", "/TN", TASK_NAME, "/F"]).map(|_| ())
+}
+
+// ===== BEGIN PURE-TASK-XML =====
+// Các hàm thuần dưới đây (không gọi WinAPI) được `.tools/tasktest` cắt nguyên văn ra để
+// chạy unit test trên Linux — đừng dùng item nào ngoài vùng này trong đó.
+
+/// Tìm `needle` trong `hay` không phân biệt hoa thường, trả về byte offset trong `hay`.
+fn find_ci(hay: &str, needle: &str, from: usize) -> Option<usize> {
+    let h = hay.as_bytes();
+    let n = needle.as_bytes();
+    if n.is_empty() || h.len() < n.len() {
+        return None;
+    }
+    (from..=h.len() - n.len())
+        .find(|&i| h[i..i + n.len()].iter().zip(n).all(|(a, b)| a.eq_ignore_ascii_case(b)))
+}
+
+/// Nội dung thẻ `<Tag>...</Tag>` đầu tiên (không phân biệt hoa thường), đã trim.
+fn xml_tag_value(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = find_ci(xml, &open, 0)? + open.len();
+    let end = find_ci(xml, &close, start)?;
+    Some(xml[start..end].trim().to_string())
+}
+
+/// Chuẩn hoá đường dẫn exe để so sánh: bỏ ngoặc kép, thống nhất dấu `\`, bỏ hoa thường.
+fn normalize_exe(s: &str) -> String {
+    s.replace('"', "").replace('/', "\\").trim().to_lowercase()
+}
+
+/// Escape ký tự đặc biệt của XML (đường dẫn/tên user có thể chứa `&`, `<`, `>`).
+fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// XML của task "chạy cùng Windows": LogonTrigger cho `user` (dạng `DOMAIN\tên`),
+/// chạy ẩn (`--minimized`), quyền cao nhất, không phụ thuộc nguồn điện và không giới hạn giờ.
+fn task_xml(exe: &str, user: &str) -> String {
+    let cmd = xml_escape(exe);
+    let user = xml_escape(user);
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Paroda GameMode — chạy cùng Windows, ẩn xuống khay hệ thống.</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>{user}</UserId>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>{user}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>false</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>5</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>"{cmd}"</Command>
+      <Arguments>--minimized</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"#
+    )
+}
+
+/// Task đã có (XML do `schtasks /Query /XML` trả về) có cần tạo lại không:
+/// (a) `Command` không trỏ đúng exe hiện tại, hoặc
+/// (b) còn mặc định cũ: `DisallowStartIfOnBatteries`/`StopIfGoingOnBatteries` = true,
+///     hoặc thiếu `ExecutionTimeLimit` = `PT0S`.
+fn task_xml_needs_repair(xml: &str, exe: &str) -> bool {
+    match xml_tag_value(xml, "Command") {
+        Some(c) if normalize_exe(&c) == normalize_exe(exe) => {}
+        _ => return true,
+    }
+    for tag in ["DisallowStartIfOnBatteries", "StopIfGoingOnBatteries"] {
+        if xml_tag_value(xml, tag).is_some_and(|v| v.eq_ignore_ascii_case("true")) {
+            return true;
+        }
+    }
+    match xml_tag_value(xml, "ExecutionTimeLimit") {
+        Some(v) if v.eq_ignore_ascii_case("PT0S") => {}
+        _ => return true,
+    }
+    false
+}
+
+/// Giải mã UTF-16 LE (bỏ BOM nếu có) thành String.
+fn utf16le_to_string(bytes: &[u8]) -> String {
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    let s = String::from_utf16_lossy(&units);
+    s.trim_end_matches('\0').to_string()
+}
+
+/// Giải mã output của chương trình Windows: `schtasks /Query /XML` trả UTF-16 LE kèm BOM,
+/// một số lệnh khác (theo locale) trả UTF-16 LE không BOM — nhận diện qua byte 0 xen kẽ.
+/// Còn lại coi là UTF-8 (lossy). `pub` để `main.rs` (`--tasktest`) dùng chung.
+pub fn decode_win_output(bytes: &[u8]) -> String {
+    if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE {
+        return utf16le_to_string(&bytes[2..]);
+    }
+    let sample = &bytes[..bytes.len().min(512)];
+    let odd = sample.len() / 2;
+    if odd >= 4 {
+        let zeros = sample.iter().skip(1).step_by(2).filter(|&&b| b == 0).count();
+        // Chữ ASCII ở UTF-16 LE có byte 0 ở mọi vị trí lẻ; UTF-8/ANSI thì gần như không có.
+        if zeros * 4 >= odd * 3 {
+            return utf16le_to_string(bytes);
+        }
+    }
+    String::from_utf8_lossy(bytes).to_string()
+}
+
+/// `DOMAIN\tên` của user hiện tại (cho LogonTrigger và Principal).
+fn current_user() -> String {
+    let domain = std::env::var("USERDOMAIN").unwrap_or_default();
+    let user = std::env::var("USERNAME").unwrap_or_default();
+    if domain.trim().is_empty() {
+        user
+    } else {
+        format!("{}\\{}", domain, user)
+    }
+}
+
+/// File XML tạm cho `schtasks /Create /XML` (pid để hai lần chạy không đè nhau).
+fn task_xml_path() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("GameMode-task-{}.xml", std::process::id()))
+}
+
+/// Ghi file UTF-16 LE có BOM: `schtasks /XML` đọc file theo encoding khai báo trong XML.
+fn write_utf16le(path: &std::path::Path, text: &str) -> Result<(), String> {
+    let mut bytes: Vec<u8> = vec![0xFF, 0xFE];
+    for u in text.encode_utf16() {
+        bytes.extend_from_slice(&u.to_le_bytes());
+    }
+    std::fs::write(path, bytes).map_err(|e| format!("ghi {} lỗi: {}", path.display(), e))
+}
+
+#[cfg(test)]
+mod task_tests {
+    use super::*;
+
+    /// XML task cũ thật trên laptop (`schtasks /Query /TN GameMode /XML`): trỏ exe bản
+    /// portable `C:\Users\thong\GameMode\GameMode.exe` và còn mặc định của `/SC ONLOGON`.
+    const OLD_XML: &str = r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Author>Paroda-Nitro\thong</Author>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>Paroda-Nitro\thong</UserId>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>Paroda-Nitro\thong</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>true</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>true</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>false</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>true</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT72H</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>"C:\Users\thong\GameMode\GameMode.exe"</Command>
+      <Arguments>--minimized</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"#;
+
+    const EXE: &str = r"C:\Users\thong\AppData\Local\Programs\GameMode\GameMode.exe";
+
+    #[test]
+    fn xml_co_du_co_de_chay_tren_laptop() {
+        let xml = task_xml(EXE, "Paroda-Nitro\\thong");
+        for want in [
+            "<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>",
+            "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>",
+            "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>",
+            "<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>",
+            "<Priority>5</Priority>",
+            "<StopOnIdleEnd>false</StopOnIdleEnd>",
+            "<AllowHardTerminate>true</AllowHardTerminate>",
+            "<StartWhenAvailable>false</StartWhenAvailable>",
+            "<LogonType>InteractiveToken</LogonType>",
+            "<RunLevel>HighestAvailable</RunLevel>",
+            "<UserId>Paroda-Nitro\\thong</UserId>",
+            "<Arguments>--minimized</Arguments>",
+            "encoding=\"UTF-16\"",
+        ] {
+            assert!(xml.contains(want), "thiếu {want} trong:\n{xml}");
+        }
+        assert!(xml.contains(&format!("<Command>\"{EXE}\"</Command>")));
+        // Không còn cờ mặc định cũ và không tự dừng khi hết idle.
+        assert!(!xml.contains(">true</DisallowStartIfOnBatteries>"));
+        assert!(!xml.contains("<RunOnlyIfIdle>true"));
+        assert!(!xml.contains("PT72H"));
+    }
+
+    #[test]
+    fn xml_escape_duong_dan() {
+        let xml = task_xml(r"C:\A&B\Tools\x86\<gm>\GameMode.exe", "PC\\user&co");
+        assert!(xml.contains(r"C:\A&amp;B\Tools\x86\&lt;gm&gt;\GameMode.exe"));
+        assert!(xml.contains("<UserId>PC\\user&amp;co</UserId>"));
+        assert!(!xml.contains("A&B"));
+    }
+
+    #[test]
+    fn xml_moi_thi_khong_can_sua() {
+        let xml = task_xml(EXE, "Paroda-Nitro\\thong");
+        // Đúng exe, chỉ khác hoa thường và ngoặc kép -> vẫn coi là đúng.
+        assert!(!task_xml_needs_repair(&xml, &EXE.to_uppercase()));
+        assert!(!task_xml_needs_repair(&xml, EXE));
+    }
+
+    #[test]
+    fn xml_cu_can_sua() {
+        // Trỏ exe bản portable cũ + còn cờ pin + PT72H.
+        assert!(task_xml_needs_repair(OLD_XML, EXE));
+        // Cùng exe nhưng vẫn còn cờ pin -> vẫn phải sửa.
+        let same_exe = OLD_XML.replace(r"C:\Users\thong\GameMode\GameMode.exe", EXE);
+        assert!(task_xml_needs_repair(&same_exe, EXE));
+        // Đã đúng cờ pin + priority nhưng thiếu ExecutionTimeLimit -> phải sửa.
+        let no_limit = same_exe
+            .replace("<DisallowStartIfOnBatteries>true", "<DisallowStartIfOnBatteries>false")
+            .replace("<StopIfGoingOnBatteries>true", "<StopIfGoingOnBatteries>false")
+            .replace("<ExecutionTimeLimit>PT72H</ExecutionTimeLimit>", "");
+        assert!(task_xml_needs_repair(&no_limit, EXE));
+        // Chỉ còn StopIfGoingOnBatteries=true -> phải sửa.
+        let only_stop = no_limit.replace(
+            "<ExecutionTimeLimit></ExecutionTimeLimit>",
+            "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>",
+        );
+        assert!(task_xml_needs_repair(
+            &only_stop.replace(
+                "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>",
+                "<StopIfGoingOnBatteries>true</StopIfGoingOnBatteries>"
+            ),
+            EXE
+        ));
+        // Không có thẻ Command -> coi như phải sửa.
+        assert!(task_xml_needs_repair("<Settings></Settings>", EXE));
+    }
+
+    #[test]
+    fn giai_ma_utf16() {
+        let xml = task_xml(EXE, "PC\\user");
+        let mut bytes: Vec<u8> = vec![0xFF, 0xFE];
+        for u in xml.encode_utf16() {
+            bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        assert_eq!(decode_win_output(&bytes), xml);
+        // UTF-16 LE không BOM (byte 0 xen kẽ) vẫn nhận ra.
+        let no_bom = bytes[2..].to_vec();
+        assert_eq!(decode_win_output(&no_bom), xml);
+        // UTF-8 (kể cả tiếng Việt) giữ nguyên.
+        assert_eq!(decode_win_output("LỖI: không có task".as_bytes()), "LỖI: không có task");
+        assert_eq!(decode_win_output(b""), "");
+    }
+
+    #[test]
+    fn utf16_bo_bom_va_byte_0_cuoi() {
+        assert_eq!(utf16le_to_string(&[b'A', 0, b'B', 0]), "AB");
+        assert_eq!(utf16le_to_string(&[b'A', 0, 0, 0]), "A");
+    }
+
+    #[test]
+    fn ghi_file_utf16le_co_bom() {
+        let p = task_xml_path();
+        write_utf16le(&p, "<Task>ạ</Task>").unwrap();
+        let b = std::fs::read(&p).unwrap();
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(&b[..2], &[0xFF, 0xFE]);
+        assert_eq!(decode_win_output(&b), "<Task>ạ</Task>");
+    }
+
+    #[test]
+    fn user_hien_tai_co_domain() {
+        std::env::set_var("USERDOMAIN", "Paroda-Nitro");
+        std::env::set_var("USERNAME", "thong");
+        assert_eq!(current_user(), "Paroda-Nitro\\thong");
+        std::env::set_var("USERDOMAIN", "");
+        assert_eq!(current_user(), "thong");
+    }
+}
+// ===== END PURE-TASK-XML =====
+
+/// User cho `<UserId>` của task: ưu tiên SID (xem `current_user` cho bản lấy từ env).
+fn current_user_sid() -> String {
+    // SID của user đang chạy: tên `USERDOMAIN\USERNAME` lấy từ env có thể sai (vd phiên SSH
+    // trên máy WORKGROUP ra `WORKGROUP\thong`), schtasks báo "No mapping between account names
+    // and security IDs". `whoami /user /fo csv /nh` in `"máy\user","S-1-5-21-..."`.
+    if let Ok(out) = run_hidden("whoami", &["/user", "/fo", "csv", "/nh"]) {
+        if let Some(sid) = out
+            .split(',')
+            .map(|f| f.trim().trim_matches('"'))
+            .find(|f| f.starts_with("S-1-"))
+        {
+            return sid.to_string();
+        }
+    }
+    current_user()
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1589,11 +1965,49 @@ pub fn show_main_window(hwnd: isize) {
             SetWindowLongPtrW(h, GWL_EXSTYLE, (ex & !tool) | WS_EX_APPWINDOW as isize);
         }
         if IsIconic(h) != 0 {
-            ShowWindow(h, SW_RESTORE);
+            // Mở lúc đăng nhập bằng `--minimized` thì Windows lưu vị trí "bình thường" đúng bằng ô
+            // thu nhỏ 160×28 -> SW_RESTORE ra cửa sổ tí hon ở góc màn hình. Gặp vậy thì đặt lại
+            // cỡ mặc định giữa vùng làm việc rồi restore luôn bằng SetWindowPlacement.
+            let mut wp: WINDOWPLACEMENT = zeroed();
+            wp.length = size_of::<WINDOWPLACEMENT>() as u32;
+            let r = if GetWindowPlacement(h, &mut wp) != 0 { wp.rcNormalPosition } else { zeroed() };
+            if r.right - r.left < 400 || r.bottom - r.top < 300 {
+                let mut work: RECT = zeroed();
+                SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut work as *mut RECT as *mut c_void, 0);
+                let (ww, wh) = (work.right - work.left, work.bottom - work.top);
+                let w = (ww * 9 / 10).min(1400);
+                let hh = (wh * 9 / 10).min(950);
+                let (x, y) = (work.left + (ww - w) / 2, work.top + (wh - hh) / 2);
+                wp.rcNormalPosition = RECT { left: x, top: y, right: x + w, bottom: y + hh };
+                wp.flags = 0;
+                wp.showCmd = SW_RESTORE as u32;
+                SetWindowPlacement(h, &wp);
+            } else {
+                ShowWindow(h, SW_RESTORE);
+            }
         } else {
             ShowWindow(h, SW_SHOW);
         }
         SetForegroundWindow(h);
+    }
+}
+
+/// Đảo trạng thái hiện/ẩn của cửa sổ chính (phím tắt "Hiện/ẩn cửa sổ", giống click icon khay).
+///
+/// "Đang ở khay" nhận biết bằng `IsIconic` — đúng trạng thái mà `hide_main_window` để lại
+/// (thu nhỏ + `WS_EX_TOOLWINDOW`), nên không cần cờ trạng thái riêng và không bao giờ để cửa sổ
+/// ở `SW_HIDE` (xem ghi chú hiệu năng ở `hide_main_window`). Trả `true` nếu sau đó cửa sổ HIỆN.
+pub fn toggle_main_window(hwnd: isize) -> bool {
+    if hwnd == 0 {
+        return false;
+    }
+    let hidden = unsafe { IsIconic(hwnd as HWND) != 0 };
+    if hidden {
+        show_main_window(hwnd);
+        true
+    } else {
+        hide_main_window(hwnd);
+        false
     }
 }
 

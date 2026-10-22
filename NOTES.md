@@ -1,12 +1,22 @@
 # GameMode — ghi chú làm tiếp
 
-Cập nhật: 2026-10-22. Tool Rust + eframe/egui 0.29: tắt app nền trước khi chơi Delta Force, lưu session và khôi phục lại sau.
+Cập nhật: 2026-10-23. Tool Rust + eframe/egui 0.29: tắt app nền trước khi chơi Delta Force, lưu session và khôi phục lại sau.
+
+## Bản 1.4.0 (2026-10-22) — Paroda GameMode
+- Đổi tên hiển thị thành **Paroda GameMode** (title bar, khay, Task Manager, bộ cài, shortcut). GIỮ nguyên: `GameMode.exe`, `AppId`, mutex, task `GameMode`, thư mục cài `%LOCALAPPDATA%\Programs\GameMode`, tên bộ cài `GameMode-Setup-<ver>.exe`, `"app": "GameMode"` của manifest.
+- Mới: tab Khởi động (task-22), phím tắt toàn cục (task-23), task chạy cùng Windows bằng XML — chạy cả khi dùng pin, không giới hạn 72 giờ, tự sửa task cũ lúc mở app (task-24/26), banner + `--restore` cho phiên Boost bỏ lửng, chặn `NOT_GAMES` (task-25), hồ sơ theo game (task-26).
+- Claude sửa thêm khi thử trên laptop: `<UserId>` của task dùng **SID** (`whoami /user`) — tên `USERDOMAIN\USERNAME` từ env có thể sai (phiên SSH ra `WORKGROUP\thong`, schtasks từ chối); `--tasktest` **không tạo/xoá khi task đã có** (bản cũ từng xoá mất task thật); `show_main_window` đặt lại cỡ cửa sổ khi vị trí "bình thường" chỉ là ô thu nhỏ 160×28 (lỗi có từ 1.3.2: app mở bằng `--minimized` lúc đăng nhập thì "Mở" ở khay ra cửa sổ tí hon).
+- Đã thử trên laptop (build ở `C:\build\gamemode-1.4.0`, 71 unit test qua): cài đè 1.3.4 → shortcut/uninstall mang tên mới, shortcut "GameMode" cũ bị xoá; task cũ (pin = true) được tự sửa khi mở app; `Ctrl+Alt+G` hiện/ẩn cửa sổ khi đang ở khay; tab Khởi động khớp Task Manager (15 mục, 5 bật); `--restore` không có session → exit 1.
+- **Chưa thử**: Boost theo hồ sơ (sẽ tắt app thật), banner phiên bỏ lửng bằng mắt, đổi tổ hợp phím + Lưu, bật/tắt mục ở tab Khởi động. `.lnk` trong thư mục Startup **vẫn hiện đường dẫn .lnk** (COM IShellLinkW của task-26 không ra exe, vd `Tailscale.lnk`) — cần xem lại. Card Cập nhật/Phím tắt hơi lấn mép phải ở cửa sổ 1400 px.
+- Mẹo thử UI từ xa: script PowerShell chạy bằng task `/it /rl highest` trong phiên người dùng (`SetProcessDPIAware`, `keybd_event`, `PrintWindow`) — từ phiên SSH (session 0) không thấy cửa sổ.
 
 ## Bàn giao sang laptop (2026-10-22 tối, từ PC)
-- **Bản mới nhất: v1.3.3** trên kênh OTA thật và GitHub Release. Tải trực tiếp:
-  `https://update-dhcs.paroda.net/apps/gamemode/releases/GameMode-Setup-1.3.3.exe`
-  (hoặc `https://github.com/thongkvq/gamemode/releases/download/v1.3.3/GameMode-Setup-1.3.3.exe`).
-  **Laptop đang chạy 1.2.0, chưa có bộ cập nhật OTA**: thoát GameMode ở khay, tải bộ cài trên rồi chạy một lần (không cần admin, giữ config). Từ đó các bản sau tự đến qua banner.
+- **Bản mới nhất: v1.4.0** trên kênh OTA thật và GitHub Release. Tải trực tiếp:
+  `https://update-dhcs.paroda.net/apps/gamemode/releases/GameMode-Setup-1.4.0.exe`
+  (hoặc `https://github.com/thongkvq/gamemode/releases/download/v1.4.0/GameMode-Setup-1.4.0.exe`).
+  **Laptop đã cài 1.3.3 (2026-10-22, qua SSH)** vào `%LOCALAPPDATA%\Programs\GameMode` (trước đó chạy bản 1.1.0 portable ở `C:\Users\thong\GameMode`, thư mục cũ còn nguyên, shortcut cũ dời vào `old-shortcuts\`). Đã chép `gamemode.cfg` + `session.last.json` sang; task "GameMode" trỏ exe mới, thêm `Delay PT2M30S` ở LogonTrigger để né lỗi dưới. Từ đây các bản sau đến qua OTA.
+- **Đã sửa ở 1.3.4** (2026-10-22): crash khi mở trong ~2 phút đầu sau khi bật máy — `Instant::now() - X` (watcher và nút task trong `src/main.rs`) panic khi uptime < X; giờ dùng `checked_sub(..).unwrap_or_else(Instant::now)`. 1.3.4 build trên laptop (PC tắt) từ `main` + commit `8f3efbe` (đã push lên `main`, tag `v1.3.4` + GitHub Release kèm bộ cài), publish OTA thật lúc 18:31. Laptop đã lên 1.3.4.
+- **Config laptop**: từng có `game:msedgewebview2.exe=1` khiến auto mode Boost ngay khi mở (WebView2 luôn chạy). Đã bỏ dòng đó (bản cũ: `gamemode.cfg.bak-20261022`). Báo cáo `20261022-175503` là trận giả do lỗi này.
 - **Code**: repo `thongkvq/gamemode`, nhánh `main`. Trên laptop `git pull` là có đủ (PC commit từ `I:\dev\GameMode`; thư mục `X:\Test AI\GameMode` là bản làm việc đồng bộ).
 - **1.3.3 có gì**: đo FPS/frametime vào báo cáo trận (`src/fps.rs`, xem mục "FPS" dưới); báo cáo không mất khi GameMode tắt giữa trận (lưu tạm `reports/<id>.partial.json` mỗi phút, chốt khi thoát, tự khôi phục lần mở sau); tự khôi phục/tự Boost không xoá log nữa; bấm Khôi phục tay giữa trận thì lúc game tắt không khôi phục lần 2; xoá báo cáo khi đang ghi trận chọn lại đúng; `--minimized` mà không tạo được icon khay thì chỉ thu nhỏ.
 - **CHƯA KIỂM CHỨNG — làm đầu tiên trên laptop**: số FPS thật với Delta Force bằng code mới. Đã kiểm bằng bản ghi ETW thô (`logman` provider DXGI) lúc DF đang chạy: 191 FPS, p99 7,2 ms — đúng nguyên lý, nhưng `FpsMeter` (session ETW real-time + callback) chưa thấy frame thật lần nào vì Edge/Discord không phát event 178. Cách thử: mở Delta Force, đợi vào sảnh, chạy `GameMode.exe --fpstest 20` (thư mục cạnh exe, config có `game:deltaforceclient-win64-shipping.exe=1`) → đọc `fpstest.txt`; hoặc chơi 1 trận rồi xem tab Báo cáo trận có thẻ "FPS TB / 1% low" và biểu đồ FPS. Nếu "không có frame nào": nghi `Wnode.ClientContext`/`PROCESS_TRACE_MODE_RAW_TIMESTAMP` hoặc `EnableTraceEx2` trong `src/fps.rs` (mục "Chưa chắc" của `.delegate/task-19.result.md`).
@@ -24,7 +34,7 @@ Cập nhật: 2026-10-22. Tool Rust + eframe/egui 0.29: tắt app nền trước
   1. ~~Kiểm tra tab "Báo cáo trận"~~ — đã xem trên PC ngày 2026-10-22: danh sách, thẻ chỉ số, nhận xét, 4 biểu đồ, trận đang ghi cập nhật trực tiếp đều đúng. Nút xoá hiện bước "Bấm lại để xoá" nhưng **chưa xác nhận lần bấm thứ hai xoá thật** (chỉ test bằng click giả).
   2. Đã sửa trên PC (task-15 Gemini + vài dòng tay) và đã commit lên `main`; PC giờ có bản clone ở `I:\dev\GameMode` (ngoài thư mục đồng bộ): nhãn trục Y không còn bị mất, trục X dạng `m:ss`, chú thích chuyển ra hàng trên biểu đồ (chấm tự vẽ vì font không có glyph `●`), tên game thân thiện ("Delta Force"), thêm 4 unit test (`cargo test` cần `__COMPAT_LAYER=RunAsInvoker` vì exe test cũng đòi admin).
   3. Còn lại: thử nút xoá báo cáo bằng tay.
-- **Tính năng còn trong danh sách đề xuất**: quản lý app khởi động cùng Windows (máy đang có ~13 mục Run + 1 file Startup), hồ sơ theo game, phím tắt toàn cục.
+- ~~**Tính năng còn trong danh sách đề xuất**: quản lý app khởi động cùng Windows, hồ sơ theo game, phím tắt toàn cục~~ — cả ba đã làm xong ở task-22 → task-26 (xem mục "Khởi động cùng Windows", "Phím tắt toàn cục", "Hồ sơ theo game" dưới).
 - **Ngoài phần mềm (đã khuyên chủ máy)**: thêm thanh RAM 16 GB (đang single channel); đặt pagefile cố định 16–24 GB (commit từng chạm 95%); cắm dây LAN thay Wi-Fi; driver NVIDIA hiện tên "GTX 750 Ti" trong khi card thật là RTX 3060 Laptop (DEV_2520), nên cài lại driver chính hãng nếu FPS bất thường.
 - **Lưu ý khi giao việc**: launcher `delegate.sh` hay thoát sớm khi chạy nền lâu, nhưng worker trên harness vẫn chạy tiếp; theo dõi bằng file `task-NN.status.json` (`"terminal": true` là xong).
 
@@ -32,14 +42,17 @@ Cập nhật: 2026-10-22. Tool Rust + eframe/egui 0.29: tắt app nền trước
 ```
 cargo build --release
 ```
-- Exe nằm ở `target/release/gamemode.exe`. Bản đang dùng trên laptop là `C:\Users\thong\GameMode\GameMode.exe`, chỉ cần copy exe mới đè lên (phải tắt GameMode trước).
+- Exe nằm ở `target/release/gamemode.exe`. Laptop giờ dùng bản cài ở `%LOCALAPPDATA%\Programs\GameMode\GameMode.exe` (cập nhật qua OTA hoặc chạy bộ cài).
 - Manifest yêu cầu quyền admin (`highestAvailable`).
 - Các file `gamemode.cfg`, `session.json`, `session.last.json` và `gamemode-crash.log` nằm cạnh exe. `.gitignore` đã loại chúng khỏi repo.
+- Unit test phần THUẦN (chạy được trên Linux, không cần Windows): `sh .tools/task26test/extract.sh && cd .tools/task26test && cargo test --offline` — `extract.sh` cắt nguyên văn vùng `BEGIN/END PURE-PROFILE-HOTKEY` của `src/main.rs` (hồ sơ theo game, phím tắt, `effective_opts`) rồi nạp kèm `src/hotkey.rs`. Type-check Windows: `CARGO_TARGET_DIR=target/w26 CC_x86_64_pc_windows_gnu=gcc CFLAGS_x86_64_pc_windows_gnu=-m64 cargo check --target x86_64-pc-windows-gnu --offline --all-targets`.
+- Feature `windows-sys` phải có trong `Cargo.toml`: `Win32_UI_Input_KeyboardAndMouse` (phím tắt), `Win32_UI_Shell` + `Win32_System_Com` (đích file `.lnk` của thư mục Startup). Thiếu là `hotkey.rs` / `startup.rs` không biên dịch được.
 
 ## Cờ dòng lệnh để kiểm tra (không tắt app nào)
 | Cờ | Làm gì | Kết quả ghi ra |
 |---|---|---|
 | `--selftest` | Đọc mọi process, RAM free/standby, Wi-Fi autoconf, Game DVR, UserGpuPreferences, task Scheduler, config | `selftest.txt` |
+| `--restore` | Khôi phục phiên Game Boost bị bỏ lửng mà **không mở UI** (mở lại app, service, Wi-Fi, Game DVR...). Từ chối nếu còn game trong danh sách đang chạy. Exit code 0 = xong, 1 = lỗi / không có `session.json` | `restore.txt` |
 | `--purgetest` | Xả standby list một lần | `purgetest.txt` |
 | `--launchtest` | Mở notepad bằng quyền user thường (token explorer) | `launchtest.txt` |
 | `--tasktest` | Tạo task "GameMode", đọc XML, rồi xoá | `tasktest.txt` |
@@ -75,9 +88,18 @@ cargo build --release
 - `src/report.rs`: báo cáo trận đấu (`Sample`, `Event`, `Summary`, `GameReport`, `ReportMeta`, `Live` đang ghi, đọc/ghi/xoá file trong `reports/`).
 - `src/fps.rs`: đo FPS / frametime bằng ETW DXGI (`FpsMeter`: start/set_target_pids/take_window/total/stop), phần tính toán thuần có unit test.
 - `src/tray.rs`: icon khay + menu chuột phải, thread nhận sự kiện menu/click (chạy được khi cửa sổ đã ẩn).
+- `src/startup.rs`: mục khởi động cùng Windows (`list_startup`, `set_enabled`, `StartupEntry`, `StartupLocation`) — đọc `Run` HKCU/HKLM/WOW6432Node + 2 thư mục Startup, bật/tắt bằng cờ `StartupApproved` giống Task Manager (không xoá mục). File `.lnk` trong thư mục Startup được đọc đích thật bằng `IShellLinkW`/`IPersistFile` (`CoInitializeEx` trên thread gọi, `CoUninitialize` sau); lỗi thì `command` = đường dẫn `.lnk`, `exe_path` = `None`.
+- `src/hotkey.rs`: phím tắt toàn cục (`Hotkey::parse/display`, `HotkeyAction`, `HotkeyService::start/rebind/errors`, `default_bindings`) — thread message loop riêng + `RegisterHotKey(null, …)` như `tray.rs`, vì `update()` không chạy khi cửa sổ ẩn.
 - `src/ui.rs`: bảng màu và widget dùng chung (`card`, `section_header`, `toggle_row` có switch, `ghost_button`, `primary_button`, `callout_warning`).
 
 ## Đã xong
+- **Khởi động cùng Windows (task-22, 26)**: tab **🚀 Khởi động** ở cột phải liệt kê mọi mục Run/Startup (tên đậm, nơi lưu, command rút gọn + tooltip đầy đủ) kèm switch bật/tắt; đọc ở thread nền khi mở tab lần đầu và khi bấm *Làm mới*; dòng đếm "N mục, M đang bật"; mục trỏ đúng exe GameMode đang chạy bị **khoá switch** (tắt nó là tự tắt app — việc chạy cùng Windows do task lo).
+- **Tự sửa task chạy cùng Windows (task-24, 26)**: lúc mở app, thread nền gọi `sys::task_needs_repair()`; task cũ (`/SC ONLOGON`: chỉ chạy khi cắm sạc, tự chết sau 72 giờ) hoặc trỏ sai exe thì `sys::task_create()` lại và log `✔ [TASK] Đã cập nhật task GameMode: trỏ đúng exe, chạy cả khi dùng pin.` Nút bật task trong UI cũng dùng `task_create` (XML) mới.
+- **Phím tắt toàn cục (task-23, 26)**: `hotkey:enabled` (mặc định 1) + `hotkey:boost|restore|window` (mặc định `Ctrl+Alt+B/R/G`; **chuỗi rỗng = tắt phím đó**). Đăng ký trong `App::new`, chạy trên thread phím tắt; Boost/Restore làm y như mục menu khay, "Hiện/ẩn cửa sổ" dùng `sys::toggle_main_window` (thu nhỏ + `WS_EX_TOOLWINDOW`, **không SW_HIDE**). Mỗi lần bấm ghi một dòng `⌨ [PHÍM TẮT] …`. Card **Phím tắt** (dưới card Cập nhật OTA ở tab Tự động & Tối ưu): công tắc chung, mỗi hành động một ô nhập + nút *Lưu* (parse lỗi thì hiện đỏ ngay dưới ô, không lưu), hiện luôn lỗi đăng ký (`errors()` — vd tổ hợp đã bị app khác chiếm).
+- **Hồ sơ theo game (task-26)**: `profile:<exe>:<key>=1/0` với key `standby, trim, gpu, wlan, gamedvr, report, close_apps, stop_services`; **không có dòng = theo cài đặt chung**. Tự Boost do game X mở dùng hồ sơ X; Boost tay (nút / khay / phím tắt) chỉ dùng hồ sơ khi **đúng một** game trong danh sách đang chạy. `close_apps=0` thì Boost không tắt app nào và **không ghi app vào session**; `stop_services=0` thì không dừng service và không ghi service. Log một dòng `• [HỒ SƠ] Dùng hồ sơ <tên game>: …`. UI: nút **Hồ sơ** trên từng dòng game mở khối 8 tuỳ chọn, mỗi tuỳ chọn 3 lựa chọn **Chung / Bật / Tắt** ("Chung" = không ghi dòng config); game có hồ sơ riêng hiện nhãn nhỏ "hồ sơ riêng". Xoá game khỏi danh sách thì xoá luôn hồ sơ của nó (`write_config` cũng tự bỏ hồ sơ của game không còn trong danh sách); game trong `NOT_GAMES` bị bỏ qua. Hàm thuần `effective_opts()` có unit test.
+- Tên hiển thị là **Paroda GameMode** (title bar + log READY). Tên game hiển thị ("Delta Force"), task `GameMode`, mutex và tên file giữ nguyên.
+- Phiên Game Boost bị bỏ lửng (app bị tắt giữa phiên, `session.json` còn lại): lần mở sau nếu game trong danh sách **đang chạy** thì watcher tiếp tục phiên đó (không Boost lần nữa, game tắt vẫn tự khôi phục theo `auto:restore`); nếu **không có game nào chạy** thì bật banner cột phải "Còn phiên Game Boost chưa khôi phục…" với nút *Khôi phục ngay* / *Để sau*, hiện cửa sổ dù có `--minimized`, và watcher không tự Boost cho tới khi phiên được xử lý. Cờ `--restore` khôi phục không cần UI.
+- Danh sách cấm `NOT_GAMES`: exe hệ thống / app luôn chạy (WebView2, trình duyệt, explorer, svchost, steam, obs64, claude, node, gamemode...) và mọi exe bắt đầu bằng `discord` không vào được danh sách game — dòng `game:` cũ trong config bị bỏ qua (lần ghi sau tự xoá), UI thêm game và "Đánh dấu là game" đều bị chặn kèm thông báo.
 - Danh sách app đang chạy có công tắc "Giữ lại", lựa chọn nhớ trong `keep:` của config.
 - Mặc định giữ lại: mọi exe bắt đầu bằng `discord` (gồm DiscordSystemHelper — cần cho livestream), OBS (`obs64.exe`), Steam, JBL Quantum, Tailscale, WARP, UniKey/EVKey, Claude, NVIDIA, webview2, NitroSense, game và anti-cheat ACE. Discord/OBS cũng không bị nén RAM (giật stream).
 - Session chỉ lưu app thật: do explorer mở, có cửa sổ hoặc nằm trong danh sách tự khởi động. Restore không bao giờ chạy lại shell, Python hay agent nền.
@@ -113,7 +135,7 @@ App đòi quyền admin nên shell thường không chụp được cửa sổ. 
 ## Bộ cài (Inno Setup)
 - Cài Inno Setup 6: `winget install JRSoftware.InnoSetup --scope user`.
 - Build: `cargo build --release`, rồi `"%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" installer\gamemode.iss`, ra file `dist\GameMode-Setup-<version>.exe` (thư mục `dist/` không đưa lên git).
-- Version (hiện 1.3.3) phải sửa ở 2 chỗ: `Cargo.toml` và `#define AppVersion` trong `installer/gamemode.iss`.
+- Version (hiện 1.4.0) phải sửa ở 2 chỗ: `Cargo.toml` và `#define AppVersion` trong `installer/gamemode.iss`.
 - Bộ cài cài theo từng user vào `%LOCALAPPDATA%\Programs\GameMode`, không cần admin khi cài. Gỡ cài đặt sẽ xoá config/session và task "chạy cùng Windows".
 - Exe chưa ký số nên lần đầu chạy sẽ bị SmartScreen cảnh báo.
 - Bộ cài có nhánh cập nhật OTA: chạy kèm `/UPDATE` thì `[Code] IsUpdateRun` bật entry `[Run]`

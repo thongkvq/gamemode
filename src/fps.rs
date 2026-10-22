@@ -771,7 +771,7 @@ mod win {
     /// Thông điệp lỗi tiếng Việt kèm mã lỗi Win32.
     fn describe(what: &str, code: u32) -> String {
         let hint = match code {
-            ERROR_ACCESS_DENIED => " — cần quyền admin để đo FPS (chạy GameMode bằng Administrator)",
+            ERROR_ACCESS_DENIED => " — cần quyền admin để đo FPS (chạy Paroda GameMode bằng Administrator)",
             ERROR_ALREADY_EXISTS => " — session ETW cùng tên đang tồn tại",
             _ => "",
         };

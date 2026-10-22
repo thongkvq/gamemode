@@ -1112,7 +1112,7 @@ pub fn status_badge(ui: &mut egui::Ui, busy: bool) {
 // TITLE BAR TUỲ BIẾN VÀ ĐIỀU KHIỂN CỬA SỔ
 // ==========================================
 /// Vẽ title bar tuỳ biến cao 40px phủ hết chiều rộng cửa sổ:
-/// - Bên trái: icon tia sét amber, "DELTA FORCE" amber + "RAM PURGE" trắng, tag nhỏ
+/// - Bên trái: icon tia sét amber, "PARODA" amber + "GAMEMODE" trắng, version, tag nhỏ
 /// - Badge SYSTEM READY / PURGING di chuyển lên title bar
 /// - Bên phải: 3 nút thu nhỏ / phóng to-khôi phục / đóng (vẽ bằng painter)
 /// - Kéo cửa sổ (StartDrag) khi giữ vùng trống; double-click để phóng to/khôi phục
@@ -1207,7 +1207,7 @@ pub fn render_title_bar(ctx: &egui::Context, busy: bool) {
 
             // Tên app
             left_ui.label(
-                egui::RichText::new("DELTA FORCE")
+                egui::RichText::new("PARODA")
                     .size(13.0)
                     .strong()
                     .extra_letter_spacing(1.0)
@@ -1215,7 +1215,7 @@ pub fn render_title_bar(ctx: &egui::Context, busy: bool) {
             );
             left_ui.add_space(3.0);
             left_ui.label(
-                egui::RichText::new("RAM PURGE")
+                egui::RichText::new("GAMEMODE")
                     .size(13.0)
                     .strong()
                     .extra_letter_spacing(1.0)
@@ -1235,7 +1235,7 @@ pub fn render_title_bar(ctx: &egui::Context, busy: bool) {
 
             // Tag nhỏ
             left_ui.label(
-                egui::RichText::new("TACTICAL MEMORY BOOSTER")
+                egui::RichText::new("GAME BOOST SUITE")
                     .monospace()
                     .size(9.5)
                     .color(TEXT_DIM),
