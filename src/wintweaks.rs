@@ -1422,17 +1422,9 @@ pub fn all_tweaks(game_dirs: &[String]) -> Vec<Tweak> {
         ],
     ));
 
-    list.push(tweak(
-        "no_widgets",
-        Group::Background,
-        Risk::Safe,
-        "Tắt Widget / Tin tức trên taskbar",
-        "Tắt bảng Widget của Windows 11 (Widgets vẫn nạp tin và chạy nền liên tục). \
-         Mất: không xem được thời tiết/tin ngay trên taskbar.",
-        false,
-        true,
-        vec![dword(Hive::Hklm, "SOFTWARE\\Policies\\Microsoft\\Dsh", "AllowNewsAndInterests", 0)],
-    ));
+    // Không có "Tắt Widget" (`HKLM\SOFTWARE\Policies\Microsoft\Dsh` `AllowNewsAndInterests`):
+    // Windows 11 chặn ghi value này bằng driver UCPD (kể cả reg.exe quyền admin) — đã bỏ ở 1.5.1,
+    // không lách UCPD. Ẩn nút Widgets thì Windows tự làm qua Settings > Personalization > Taskbar.
 
     list.push(tweak(
         "telemetry_min",
