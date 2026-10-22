@@ -1426,7 +1426,7 @@ fn do_optimize(sh: &Shared) {
         }
         if written == 0 && already == 0 && games.iter().all(|g| !paths.contains_key(g)) {
             push(
-                "  • [GPU] Chưa biết đường dẫn exe game — mở game rồi bấm 'Là game' để lưu vị trí.".into(),
+                "  • [GPU] Chưa biết đường dẫn exe game — mở game rồi chuột phải vào game ở tab Ứng dụng đang chạy → 'Đánh dấu là game' để lưu vị trí.".into(),
                 Color32::from_rgb(130, 150, 170),
             );
         }
@@ -2493,11 +2493,21 @@ fn render_stat_card(
                     .extra_letter_spacing(1.0)
                     .color(ui::ACCENT),
             );
+            // % nằm cùng hàng tiêu đề: hàng số GB lớn bên dưới không còn chữ bên phải để đè
+            // khi cột hẹp (cửa sổ nhỏ hoặc Windows scale 125–150%).
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
-                    RichText::new(sub_text)
-                        .size(10.0)
-                        .color(if ratio > 0.80 { ui::DANGER } else { ui::TEXT_MUTED }),
+                    RichText::new(format!("{:.0}%", ratio * 100.0))
+                        .size(11.5)
+                        .strong()
+                        .monospace()
+                        .color(if ratio > 0.80 {
+                            ui::DANGER
+                        } else if ratio >= 0.60 {
+                            ui::ACCENT
+                        } else {
+                            ui::DATA_CYAN
+                        }),
                 );
             });
         });
@@ -2516,38 +2526,24 @@ fn render_stat_card(
                     .size(11.0)
                     .color(ui::TEXT_MUTED),
             );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(
-                    RichText::new(format!("{:.0}%", ratio * 100.0))
-                        .size(11.5)
-                        .strong()
-                        .monospace()
-                        .color(if ratio > 0.80 {
-                            ui::DANGER
-                        } else if ratio >= 0.60 {
-                            ui::ACCENT
-                        } else {
-                            ui::DATA_CYAN
-                        }),
-                );
-            });
         });
         ui.add_space(6.0);
 
         // Thanh RAM và Pagefile chia đoạn (~20 ô nhỏ, cách nhau 2px)
         ui::segmented_bar(ui, ratio);
 
-        if let Some(text) = extra {
-            ui.add_space(5.0);
-            ui.label(
-                RichText::new(text)
-                    .monospace()
-                    .size(9.5)
-                    .color(ui::TEXT_MUTED),
-            );
-        } else {
-            ui.add_space(18.0);
-        }
+        ui.add_space(5.0);
+        ui.label(
+            RichText::new(sub_text)
+                .size(10.0)
+                .color(if ratio > 0.80 { ui::DANGER } else { ui::TEXT_MUTED }),
+        );
+        // Font thường thay monospace: monospace bị giãn chữ khi xuống dòng ở cột hẹp.
+        ui.label(
+            RichText::new(extra.unwrap_or(" "))
+                .size(9.5)
+                .color(ui::TEXT_MUTED),
+        );
     });
 }
 
@@ -2866,7 +2862,7 @@ fn render_auto_card(
 
         ui.add_space(4.0);
         ui.label(
-            RichText::new("(hoặc bấm 'Là game' ở tab Ứng dụng đang chạy)")
+            RichText::new("(hoặc chuột phải vào app ở tab Ứng dụng đang chạy → 'Đánh dấu là game')")
                 .size(10.5)
                 .color(ui::TEXT_MUTED),
         );
@@ -2963,8 +2959,8 @@ enum RowAction {
     MarkGame,
 }
 
-/// Một dòng app đang chạy: tick "Giữ lại" = không tắt app này; nút nhỏ "Là game" = thêm nhanh
-/// exe vào danh sách game để watcher tự tối ưu. Dòng mà MỌI instance đều là con cháu của một
+/// Một dòng app đang chạy: tick "Giữ lại" = không tắt app này; menu chuột phải "Đánh dấu là game"
+/// = thêm nhanh exe vào danh sách game để watcher tự tối ưu. Dòng mà MỌI instance đều là con cháu của một
 /// app được giữ (vd node.exe do Claude mở) luôn hiện "GIỮ LẠI" và công tắc bị khoá: dòng chỉ
 /// nhận `Sense::hover()` nên bấm vào không có tác dụng, config không đổi.
 fn running_app_row(
@@ -3162,33 +3158,29 @@ fn running_app_row(
         s.push_str(&lock_str);
         s
     };
-    resp.on_hover_text(hover_text);
+    let resp = resp.on_hover_text(hover_text);
 
-    // Cột bên phải: Nút nhỏ "Là game" (hoặc nhãn ✔ nếu exe đã nằm trong danh sách game).
-    let btn_rect = Rect::from_center_size(
-        pos2(rect.right() - 42.0, y_sub),
-        vec2(68.0, 20.0),
-    );
+    // Exe đã nằm trong danh sách game thì hiện nhãn ✔; thêm vào danh sách game qua menu chuột phải
+    // (nút "Là game" trên mỗi dòng trông rối nên đã bỏ).
     if is_game {
         painter.text(
-            btn_rect.center(),
-            Align2::CENTER_CENTER,
+            pos2(rect.right() - 8.0, y_sub),
+            Align2::RIGHT_CENTER,
             "✔ LÀ GAME",
             FontId::proportional(9.5),
             ui::SUCCESS,
         );
-    } else {
-        let btn = egui::Button::new(
-            RichText::new("Là game")
-                .size(9.5)
-                .color(ui::ACCENT),
-        )
-        .fill(ui::CARD_BG)
-        .stroke(Stroke::new(1.0_f32, ui::BORDER))
-        .rounding(Rounding::ZERO);
-        if ui.put(btn_rect, btn).on_hover_text("Thêm exe này vào danh sách game để tự tối ưu khi mở game").clicked() {
-            action = RowAction::MarkGame;
-        }
+    } else if !locked {
+        resp.context_menu(|ui| {
+            if ui
+                .button("Đánh dấu là game")
+                .on_hover_text("Thêm exe này vào danh sách game để tự tối ưu khi mở game")
+                .clicked()
+            {
+                action = RowAction::MarkGame;
+                ui.close_menu();
+            }
+        });
     }
 
     action
@@ -4466,7 +4458,7 @@ impl eframe::App for App {
         let mut opts_view = sh.opts();
         let ram_extra = self.mem_lists.map(|l| {
             format!(
-                "Free {:.1} GB · Standby {:.1} GB",
+                "Free {:.1} · Standby {:.1} GB",
                 l.free_bytes as f64 / GB,
                 l.standby_bytes as f64 / GB
             )
