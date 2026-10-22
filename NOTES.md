@@ -5,9 +5,9 @@ Cập nhật: 2026-10-22. Tool Rust + eframe/egui 0.29: tắt app nền trước
 ## Đang dở và làm tiếp (2026-10-22)
 - **Bản đã phát hành**: v1.2.0 trên GitHub Releases (có thu xuống khay). Bản trong `main` mới hơn: đã có phần **ghi báo cáo trận** (`src/report.rs`), đã test `--pingtest` và `--reporttest` trên máy thật, nhưng **chưa có giao diện xem báo cáo**.
 - **Tab "Báo cáo trận" (task-14, Gemini) đã vào `main`** cùng banner cảnh báo commit và biểu đồ `egui_plot` 0.29. Build Windows OK, logic không đổi, **nhưng chưa xem giao diện**: lúc đó GameMode bản cài đang chạy dưới khay nên bản test bị chặn bởi chế độ một bản. Việc tiếp theo:
-  1. Thoát GameMode ở khay (chuột phải → Thoát), chạy `target\release\gamemode.exe --reporttest` để có báo cáo mẫu, rồi mở app, vào tab "Báo cáo trận" kiểm tra danh sách, thẻ chỉ số, nhận xét, 4 biểu đồ, nút xoá.
-  2. Lỗi giao diện thì giao Gemini sửa; lỗi logic thì giao DeepSeek.
-  3. Ổn thì nâng version 1.3.0 (Cargo.toml + installer), build bộ cài, tạo Release.
+  1. ~~Kiểm tra tab "Báo cáo trận"~~ — đã xem trên PC ngày 2026-10-22: danh sách, thẻ chỉ số, nhận xét, 4 biểu đồ, trận đang ghi cập nhật trực tiếp đều đúng. Nút xoá hiện bước "Bấm lại để xoá" nhưng **chưa xác nhận lần bấm thứ hai xoá thật** (chỉ test bằng click giả).
+  2. Đã sửa trên PC (task-15 Gemini + vài dòng tay) và đã commit lên `main`; PC giờ có bản clone ở `I:\dev\GameMode` (ngoài thư mục đồng bộ): nhãn trục Y không còn bị mất, trục X dạng `m:ss`, chú thích chuyển ra hàng trên biểu đồ (chấm tự vẽ vì font không có glyph `●`), tên game thân thiện ("Delta Force"), thêm 4 unit test (`cargo test` cần `__COMPAT_LAYER=RunAsInvoker` vì exe test cũng đòi admin).
+  3. Thử nút xoá bằng tay, rồi nâng version 1.3.0 (Cargo.toml + installer), build bộ cài, tạo Release.
 - **Tính năng còn trong danh sách đề xuất**: quản lý app khởi động cùng Windows (máy đang có ~13 mục Run + 1 file Startup), hồ sơ theo game, phím tắt toàn cục.
 - **Ngoài phần mềm (đã khuyên chủ máy)**: thêm thanh RAM 16 GB (đang single channel); đặt pagefile cố định 16–24 GB (commit từng chạm 95%); cắm dây LAN thay Wi-Fi; driver NVIDIA hiện tên "GTX 750 Ti" trong khi card thật là RTX 3060 Laptop (DEV_2520), nên cài lại driver chính hãng nếu FPS bất thường.
 - **Lưu ý khi giao việc**: launcher `delegate.sh` hay thoát sớm khi chạy nền lâu, nhưng worker trên harness vẫn chạy tiếp; theo dõi bằng file `task-NN.status.json` (`"terminal": true` là xong).

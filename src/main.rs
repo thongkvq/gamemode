@@ -6,7 +6,7 @@ mod tray;
 mod ui;
 
 use eframe::egui::{self, Color32, FontId, Margin, Rect, RichText, Rounding, Stroke, pos2, vec2};
-use egui_plot::{HLine, Line, LineStyle, MarkerShape, Plot, PlotPoints, Points, VLine};
+use egui_plot::{GridInput, GridMark, HLine, Line, LineStyle, MarkerShape, Plot, PlotPoints, Points, VLine};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -2831,20 +2831,39 @@ fn time_part(saved_at: &str) -> String {
     }
 }
 
-/// Rút gọn tên exe game cho gọn gàng trên HUD.
+/// Rút gọn và chuẩn hoá tên game thân thiện cho HUD.
 fn clean_game_name(raw: &str) -> String {
-    let lower = raw.trim();
-    let no_ext = if let Some(stripped) = lower.strip_suffix(".exe") {
-        stripped
-    } else if let Some(stripped) = lower.strip_suffix(".EXE") {
-        stripped
+    let trimmed = raw.trim();
+    let no_exe = if trimmed.len() >= 4 && trimmed[trimmed.len() - 4..].eq_ignore_ascii_case(".exe") {
+        &trimmed[..trimmed.len() - 4]
     } else {
-        lower
+        trimmed
     };
-    if no_ext.chars().count() > 16 {
-        format!("{}…", no_ext.chars().take(15).collect::<String>())
+
+    let lower = no_exe.to_ascii_lowercase();
+
+    // Mapping đặc biệt: Delta Force
+    if lower.starts_with("deltaforceclient") || lower == "deltaforce" || lower == "delta force" {
+        return "Delta Force".to_string();
+    }
+
+    // Tên khác: bỏ hậu tố -Win64-Shipping hoặc -Shipping (không phân biệt hoa thường)
+    let mut cleaned = no_exe;
+    if lower.ends_with("-win64-shipping") {
+        cleaned = &cleaned[..cleaned.len() - "-win64-shipping".len()];
+    } else if lower.ends_with("-shipping") {
+        cleaned = &cleaned[..cleaned.len() - "-shipping".len()];
+    }
+
+    cleaned.to_string()
+}
+
+/// Cắt ngắn tên game có kèm dấu chấm lửng cho danh sách cột trái.
+fn truncate_game_name(name: &str, max_chars: usize) -> String {
+    if name.chars().count() > max_chars {
+        format!("{}…", name.chars().take(max_chars.saturating_sub(1)).collect::<String>())
     } else {
-        no_ext.to_string()
+        name.to_string()
     }
 }
 
@@ -2981,10 +3000,137 @@ fn render_metric_box(
     });
 }
 
+/// Định dạng thời gian biểu đồ (giây) thành chuỗi m:ss hoặc h:mm:ss.
+fn format_plot_time(sec: f64) -> String {
+    let total_sec = sec.round() as i64;
+    let sign = if total_sec < 0 { "-" } else { "" };
+    let abs_sec = total_sec.unsigned_abs();
+    let s = abs_sec % 60;
+    let m = (abs_sec / 60) % 60;
+    let h = abs_sec / 3600;
+    if h > 0 {
+        format!("{}{}:{:02}:{:02}", sign, h, m, s)
+    } else {
+        format!("{}{}:{:02}", sign, m, s)
+    }
+}
+
+/// Chọn bước thời gian hợp lý (giây) để có khoảng 4-8 nhãn cho mọi độ dài (20s đến 2h+).
+fn pick_time_step(span: f64) -> f64 {
+    const CANDIDATES: &[f64] = &[
+        5.0,     // 20s - 35s
+        10.0,    // 40s - 70s
+        15.0,    // 75s - 105s
+        30.0,    // 120s - 210s (2m - 3.5m)
+        60.0,    // 4m - 7m
+        120.0,   // 8m - 14m
+        300.0,   // 15m - 35m
+        600.0,   // 40m - 70m
+        900.0,   // 75m - 105m
+        1200.0,  // 110m - 140m
+        1800.0,  // 2.5h+
+    ];
+    for &step in CANDIDATES {
+        if span / step <= 7.0 {
+            return step;
+        }
+    }
+    1800.0
+}
+
+/// Tạo danh sách GridMark không âm (>= 0.0) theo bước lưới cố định.
+fn generate_non_negative_grid_marks(min: f64, max: f64, step: f64) -> Vec<GridMark> {
+    let mut marks = Vec::new();
+    if step <= 0.0 || !min.is_finite() || !max.is_finite() {
+        return marks;
+    }
+    let effective_min = min.max(0.0);
+    let start = (effective_min / step).floor() as i64;
+    let end = (max / step).ceil() as i64;
+    for i in start..=end {
+        let val = (i as f64) * step;
+        if val >= 0.0 && val <= max + step * 0.001 {
+            marks.push(GridMark {
+                value: val,
+                step_size: step,
+            });
+        }
+    }
+    marks
+}
+
+/// Grid spacer cho trục X thời gian (tính bằng giây).
+fn time_x_grid_spacer(input: GridInput) -> Vec<GridMark> {
+    let (min, max) = input.bounds;
+    let span = (max - min).max(1.0);
+    let step = pick_time_step(span);
+    generate_non_negative_grid_marks(min, max, step)
+}
+
+/// Formatter nhãn trục X thời gian (0:30, 1:00, 1:02:05...).
+fn time_x_axis_formatter(mark: GridMark, _range: &std::ops::RangeInclusive<f64>) -> String {
+    format_plot_time(mark.value)
+}
+
+/// Grid spacer cho trục Y của biểu đồ RAM (bước 1, 2, 4, 8 GB tuỳ biên độ).
+fn ram_y_grid_spacer(input: GridInput) -> Vec<GridMark> {
+    let (min, max) = input.bounds;
+    let span = (max - min).max(1.0);
+    // Bước nhỏ quá thì vạch sát nhau và egui_plot làm mờ nhãn, nên giữ tối đa ~5 nhãn.
+    let step = if span <= 4.0 {
+        1.0
+    } else if span <= 10.0 {
+        2.0
+    } else if span <= 20.0 {
+        4.0
+    } else {
+        8.0
+    };
+    generate_non_negative_grid_marks(min, max, step)
+}
+
+/// Grid spacer cho trục Y phần trăm (%) (bước 25%).
+fn pct_y_grid_spacer(input: GridInput) -> Vec<GridMark> {
+    let (min, max) = input.bounds;
+    generate_non_negative_grid_marks(min, max, 25.0)
+}
+
+/// Grid spacer cho trục Y độ trễ Ping (ms) (bước 10, 20, 50, 100 ms tuỳ biên độ).
+fn ping_y_grid_spacer(input: GridInput) -> Vec<GridMark> {
+    let (min, max) = input.bounds;
+    let span = (max - min).max(1.0);
+    let step = if span <= 50.0 {
+        10.0
+    } else if span <= 120.0 {
+        20.0
+    } else if span <= 300.0 {
+        50.0
+    } else {
+        100.0
+    };
+    generate_non_negative_grid_marks(min, max, step)
+}
+
+/// Khung Plot dùng chung cho cả 4 biểu đồ báo cáo trận đấu.
+fn base_report_plot<'a>(id: &'a str) -> Plot<'a> {
+    Plot::new(id)
+        .height(175.0)
+        .show_background(false)
+        .show_axes([true, true])
+        .show_grid([true, true])
+        .allow_scroll(false)
+        .allow_drag(false)
+        .allow_zoom(false)
+        .include_y(0.0)
+        .y_axis_min_width(50.0)
+        .x_grid_spacer(time_x_grid_spacer)
+        .x_axis_formatter(time_x_axis_formatter)
+}
+
 /// Vẽ các vạch dọc mờ thể hiện sự kiện trên các biểu đồ.
 fn render_plot_events(plot_ui: &mut egui_plot::PlotUi, events: &[report::Event]) {
     for ev in events {
-        let x = (ev.t / 60.0) as f64;
+        let x = ev.t as f64;
         let color = match ev.kind.as_str() {
             "optimize" => ui::ACCENT,
             "purge" => ui::DATA_CYAN,
@@ -3008,14 +3154,19 @@ fn render_plot_events(plot_ui: &mut egui_plot::PlotUi, events: &[report::Event])
 /// Biểu đồ (a): RAM Khả dụng và Standby (GB).
 fn render_plot_ram(ui: &mut egui::Ui, report: &report::GameReport) {
     ui::card(ui, |ui| {
-        ui::section_header(ui, "// RAM", "RAM Khả dụng & Standby", Some("GB theo thời gian (phút)"));
+        ui::section_header(ui, "// RAM", "RAM Khả dụng & Standby", Some("GB theo thời gian"));
+        ui.add_space(2.0);
+        ui::plot_legend_dots(ui, &[
+            ("Khả dụng (GB)", ui::DATA_CYAN),
+            ("Standby (GB)", ui::ACCENT),
+        ]);
         ui.add_space(6.0);
 
         let avail_pts: Vec<[f64; 2]> = report.samples.iter()
-            .map(|s| [(s.t / 60.0) as f64, s.avail_gb as f64])
+            .map(|s| [s.t as f64, s.avail_gb as f64])
             .collect();
         let standby_pts: Vec<[f64; 2]> = report.samples.iter()
-            .map(|s| [(s.t / 60.0) as f64, s.standby_gb.unwrap_or(0.0) as f64])
+            .map(|s| [s.t as f64, s.standby_gb.unwrap_or(0.0) as f64])
             .collect();
 
         let l_avail = Line::new(PlotPoints::new(avail_pts))
@@ -3027,23 +3178,21 @@ fn render_plot_ram(ui: &mut egui::Ui, report: &report::GameReport) {
             .color(ui::ACCENT)
             .width(1.5_f32);
 
-        let plot = Plot::new("plot_ram")
-            .height(175.0)
-            .show_background(false)
-            .show_axes([true, true])
-            .show_grid([true, true])
-            .allow_scroll(false)
-            .allow_drag(false)
-            .allow_zoom(false)
-            .include_y(0.0)
-            .legend(egui_plot::Legend::default().position(egui_plot::Corner::RightTop))
-            .x_axis_formatter(|mark, _| format!("{:.1}m", mark.value))
-            .y_axis_formatter(|mark, _| format!("{:.1} GB", mark.value))
-            .label_formatter(|name, val| {
-                if !name.is_empty() {
-                    format!("{}: {:.2} GB · {:.1}m", name, val.y, val.x)
+        let plot = base_report_plot("plot_ram")
+            .y_grid_spacer(ram_y_grid_spacer)
+            .y_axis_formatter(|mark, _| {
+                if mark.value.fract().abs() < 1e-4 {
+                    format!("{:.0} GB", mark.value)
                 } else {
-                    format!("{:.2} GB · {:.1}m", val.y, val.x)
+                    format!("{:.1} GB", mark.value)
+                }
+            })
+            .label_formatter(|name, val| {
+                let t = format_plot_time(val.x);
+                if !name.is_empty() {
+                    format!("{}: {:.2} GB · {}", name, val.y, t)
+                } else {
+                    format!("{:.2} GB · {}", val.y, t)
                 }
             });
 
@@ -3058,11 +3207,16 @@ fn render_plot_ram(ui: &mut egui::Ui, report: &report::GameReport) {
 /// Biểu đồ (b): Bộ nhớ ảo Commit % kèm vạch ngang 90% màu đỏ.
 fn render_plot_commit(ui: &mut egui::Ui, report: &report::GameReport) {
     ui::card(ui, |ui| {
-        ui::section_header(ui, "// COMMIT", "Bộ nhớ ảo (Commit %)", Some("Vạch đỏ nguy hiểm 90%"));
+        ui::section_header(ui, "// COMMIT", "Bộ nhớ ảo (Commit %)", Some("Tải bộ nhớ ảo theo thời gian"));
+        ui.add_space(2.0);
+        ui::plot_legend_dots(ui, &[
+            ("Commit (%)", ui::ACCENT),
+            ("Cảnh báo 90%", ui::DANGER),
+        ]);
         ui.add_space(6.0);
 
         let commit_pts: Vec<[f64; 2]> = report.samples.iter()
-            .map(|s| [(s.t / 60.0) as f64, s.commit_pct as f64])
+            .map(|s| [s.t as f64, s.commit_pct as f64])
             .collect();
 
         let l_commit = Line::new(PlotPoints::new(commit_pts))
@@ -3076,24 +3230,16 @@ fn render_plot_commit(ui: &mut egui::Ui, report: &report::GameReport) {
             .stroke(Stroke::new(1.2_f32, ui::DANGER))
             .style(LineStyle::Dashed { length: 5.0 });
 
-        let plot = Plot::new("plot_commit")
-            .height(175.0)
-            .show_background(false)
-            .show_axes([true, true])
-            .show_grid([true, true])
-            .allow_scroll(false)
-            .allow_drag(false)
-            .allow_zoom(false)
-            .include_y(0.0)
+        let plot = base_report_plot("plot_commit")
             .include_y(100.0)
-            .legend(egui_plot::Legend::default().position(egui_plot::Corner::RightTop))
-            .x_axis_formatter(|mark, _| format!("{:.1}m", mark.value))
+            .y_grid_spacer(pct_y_grid_spacer)
             .y_axis_formatter(|mark, _| format!("{:.0}%", mark.value))
             .label_formatter(|name, val| {
+                let t = format_plot_time(val.x);
                 if !name.is_empty() {
-                    format!("{}: {:.1}% · {:.1}m", name, val.y, val.x)
+                    format!("{}: {:.1}% · {}", name, val.y, t)
                 } else {
-                    format!("{:.1}% · {:.1}m", val.y, val.x)
+                    format!("{:.1}% · {}", val.y, t)
                 }
             });
 
@@ -3108,11 +3254,15 @@ fn render_plot_commit(ui: &mut egui::Ui, report: &report::GameReport) {
 /// Biểu đồ (c): CPU % toàn hệ thống.
 fn render_plot_cpu(ui: &mut egui::Ui, report: &report::GameReport) {
     ui::card(ui, |ui| {
-        ui::section_header(ui, "// CPU", "Tải CPU (%)", Some("Toàn hệ thống theo thời gian (phút)"));
+        ui::section_header(ui, "// CPU", "Tải CPU (%)", Some("Toàn hệ thống theo thời gian"));
+        ui.add_space(2.0);
+        ui::plot_legend_dots(ui, &[
+            ("CPU (%)", Color32::from_rgb(130, 180, 255)),
+        ]);
         ui.add_space(6.0);
 
         let cpu_pts: Vec<[f64; 2]> = report.samples.iter()
-            .map(|s| [(s.t / 60.0) as f64, s.cpu_pct as f64])
+            .map(|s| [s.t as f64, s.cpu_pct as f64])
             .collect();
 
         let l_cpu = Line::new(PlotPoints::new(cpu_pts))
@@ -3120,24 +3270,16 @@ fn render_plot_cpu(ui: &mut egui::Ui, report: &report::GameReport) {
             .color(Color32::from_rgb(130, 180, 255))
             .width(1.5_f32);
 
-        let plot = Plot::new("plot_cpu")
-            .height(175.0)
-            .show_background(false)
-            .show_axes([true, true])
-            .show_grid([true, true])
-            .allow_scroll(false)
-            .allow_drag(false)
-            .allow_zoom(false)
-            .include_y(0.0)
+        let plot = base_report_plot("plot_cpu")
             .include_y(100.0)
-            .legend(egui_plot::Legend::default().position(egui_plot::Corner::RightTop))
-            .x_axis_formatter(|mark, _| format!("{:.1}m", mark.value))
+            .y_grid_spacer(pct_y_grid_spacer)
             .y_axis_formatter(|mark, _| format!("{:.0}%", mark.value))
             .label_formatter(|name, val| {
+                let t = format_plot_time(val.x);
                 if !name.is_empty() {
-                    format!("{}: {:.1}% · {:.1}m", name, val.y, val.x)
+                    format!("{}: {:.1}% · {}", name, val.y, t)
                 } else {
-                    format!("{:.1}% · {:.1}m", val.y, val.x)
+                    format!("{:.1}% · {}", val.y, t)
                 }
             });
 
@@ -3152,6 +3294,12 @@ fn render_plot_cpu(ui: &mut egui::Ui, report: &report::GameReport) {
 fn render_plot_ping(ui: &mut egui::Ui, report: &report::GameReport) {
     ui::card(ui, |ui| {
         ui::section_header(ui, "// NET", "Độ trễ Ping & Mất gói", Some("Internet & Router (ms)"));
+        ui.add_space(2.0);
+        ui::plot_legend_dots(ui, &[
+            ("Internet (ms)", ui::DATA_CYAN),
+            ("Router (ms)", ui::SUCCESS),
+            ("Mất gói", ui::DANGER),
+        ]);
         ui.add_space(6.0);
 
         let mut net_pts = Vec::new();
@@ -3159,16 +3307,16 @@ fn render_plot_ping(ui: &mut egui::Ui, report: &report::GameReport) {
         let mut loss_pts = Vec::new();
 
         for s in &report.samples {
-            let t_min = (s.t / 60.0) as f64;
+            let t_sec = s.t as f64;
             if let Some(p) = s.ping_net_ms {
-                net_pts.push([t_min, p as f64]);
+                net_pts.push([t_sec, p as f64]);
             }
             if let Some(p) = s.ping_gw_ms {
-                gw_pts.push([t_min, p as f64]);
+                gw_pts.push([t_sec, p as f64]);
             }
             if s.loss_net_pct > 0.0 || s.loss_gw_pct > 0.0 || s.ping_net_ms.is_none() {
                 let y = s.ping_net_ms.or(s.ping_gw_ms).unwrap_or(0.0) as f64;
-                loss_pts.push([t_min, y]);
+                loss_pts.push([t_sec, y]);
             }
         }
 
@@ -3181,23 +3329,15 @@ fn render_plot_ping(ui: &mut egui::Ui, report: &report::GameReport) {
             .color(ui::SUCCESS)
             .width(1.2_f32);
 
-        let plot = Plot::new("plot_ping")
-            .height(175.0)
-            .show_background(false)
-            .show_axes([true, true])
-            .show_grid([true, true])
-            .allow_scroll(false)
-            .allow_drag(false)
-            .allow_zoom(false)
-            .include_y(0.0)
-            .legend(egui_plot::Legend::default().position(egui_plot::Corner::RightTop))
-            .x_axis_formatter(|mark, _| format!("{:.1}m", mark.value))
+        let plot = base_report_plot("plot_ping")
+            .y_grid_spacer(ping_y_grid_spacer)
             .y_axis_formatter(|mark, _| format!("{:.0} ms", mark.value))
             .label_formatter(|name, val| {
+                let t = format_plot_time(val.x);
                 if !name.is_empty() {
-                    format!("{}: {:.1} ms · {:.1}m", name, val.y, val.x)
+                    format!("{}: {:.1} ms · {}", name, val.y, t)
                 } else {
-                    format!("{:.1} ms · {:.1}m", val.y, val.x)
+                    format!("{:.1} ms · {}", val.y, t)
                 }
             });
 
@@ -3240,7 +3380,7 @@ fn render_report_detail(
 
             if is_live {
                 ui.label(
-                    RichText::new("● ĐANG GHI SỐ LIỆU")
+                    RichText::new("ĐANG GHI SỐ LIỆU")
                         .size(11.0)
                         .strong()
                         .color(ui::DANGER),
@@ -3480,13 +3620,14 @@ impl App {
                                 if let Some(ref l_arc) = live_report_arc {
                                     let (game_name, dur_sec) = {
                                         let l = l_arc.lock().unwrap();
-                                        (clean_game_name(&l.report.game), l.report.samples.last().map(|s| s.t as u64).unwrap_or(0))
+                                        let clean = clean_game_name(&l.report.game);
+                                        (truncate_game_name(&clean, 16), l.report.samples.last().map(|s| s.t as u64).unwrap_or(0))
                                     };
                                     let is_sel = self.selected_report_id.as_deref() == Some("live");
                                     if ui::report_list_row(
                                         ui,
                                         is_sel,
-                                        "● ĐANG GHI",
+                                        "ĐANG GHI",
                                         &game_name,
                                         &format_duration(dur_sec),
                                         ui::DANGER,
@@ -3516,7 +3657,8 @@ impl App {
                                             ui::SUCCESS
                                         };
                                         let time_str = format_short_date(&meta.started_at);
-                                        let game_short = clean_game_name(&meta.game);
+                                        let game_clean = clean_game_name(&meta.game);
+                                        let game_short = truncate_game_name(&game_clean, 16);
                                         let dur_str = format_duration(meta.duration_sec);
 
                                         if ui::report_list_row(
@@ -4603,4 +4745,55 @@ delete={:?}
         options,
         Box::new(|cc| Ok(Box::new(App::new(cc)))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_clean_game_name() {
+        assert_eq!(clean_game_name("DeltaForceClient-Win64-Shipping.exe"), "Delta Force");
+        assert_eq!(clean_game_name("deltaforceclient-win64-shipping.exe"), "Delta Force");
+        assert_eq!(clean_game_name("DELTAFORCECLIENT-WIN64-SHIPPING"), "Delta Force");
+        assert_eq!(clean_game_name("DeltaForceClient.exe"), "Delta Force");
+        assert_eq!(clean_game_name("test"), "test");
+        assert_eq!(clean_game_name("ShooterGame-Win64-Shipping.exe"), "ShooterGame");
+        assert_eq!(clean_game_name("Game-Shipping.exe"), "Game");
+        assert_eq!(clean_game_name("cs2.exe"), "cs2");
+        assert_eq!(clean_game_name("cs2.EXE"), "cs2");
+    }
+
+    #[test]
+    fn test_truncate_game_name() {
+        assert_eq!(truncate_game_name("Delta Force", 16), "Delta Force");
+        assert_eq!(truncate_game_name("test", 16), "test");
+        assert_eq!(truncate_game_name("SuperUltraMegaLongGameTitle", 16), "SuperUltraMegaL…");
+    }
+
+    #[test]
+    fn test_format_plot_time() {
+        assert_eq!(format_plot_time(0.0), "0:00");
+        assert_eq!(format_plot_time(90.0), "1:30");
+        assert_eq!(format_plot_time(3725.0), "1:02:05");
+        assert_eq!(format_plot_time(20.0), "0:20");
+        assert_eq!(format_plot_time(70.0), "1:10");
+        assert_eq!(format_plot_time(3600.0), "1:00:00");
+    }
+
+    #[test]
+    fn test_pick_time_step() {
+        let durations = [20.0, 30.0, 70.0, 90.0, 180.0, 300.0, 600.0, 1800.0, 3600.0, 5400.0, 7200.0];
+        for &dur in &durations {
+            let step = pick_time_step(dur);
+            let label_count = (dur / step).floor() as usize + 1;
+            assert!(
+                label_count >= 4 && label_count <= 8,
+                "dur={}s, step={}s, count={}",
+                dur,
+                step,
+                label_count
+            );
+        }
+    }
 }

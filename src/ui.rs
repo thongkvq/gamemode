@@ -1466,7 +1466,7 @@ pub fn report_list_row(
         painter.circle_filled(pos2(text_x + 4.0, rect.top() + 15.0), 3.5, live_dot_color);
 
         let title_galley = painter.layout_no_wrap(
-            "● ĐANG GHI".to_string(),
+            "ĐANG GHI".to_string(),
             FontId::proportional(11.5),
             Color32::from_rgb(255, 80, 80),
         );
@@ -1572,3 +1572,28 @@ impl egui::Widget for DangerButton {
 pub fn danger_button_sized(text: impl Into<String>, size: f32) -> DangerButton {
     DangerButton::new(text, size)
 }
+
+// ==========================================
+// CHÚ THÍCH BIỂU ĐỒ (PLOT LEGEND ROW)
+// ==========================================
+/// Hàng chú thích đường biểu đồ dưới tiêu đề card: chấm màu + tên (cùng màu với đường, font nhỏ).
+pub fn plot_legend_dots(ui: &mut egui::Ui, items: &[(&str, Color32)]) {
+    ui.horizontal(|ui| {
+        ui.add_space(2.0);
+        for (i, &(label, color)) in items.iter().enumerate() {
+            if i > 0 {
+                ui.add_space(12.0);
+            }
+            // Font HUD không có glyph "●" (hiện thành ô vuông) nên tự vẽ chấm tròn.
+            let (dot, _) = ui.allocate_exact_size(vec2(7.0, 7.0), egui::Sense::hover());
+            ui.painter().circle_filled(dot.center(), 3.5, color);
+            ui.add_space(3.0);
+            ui.label(
+                egui::RichText::new(label)
+                    .size(10.5)
+                    .color(color),
+            );
+        }
+    });
+}
+
