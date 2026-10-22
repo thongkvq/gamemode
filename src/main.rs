@@ -2034,13 +2034,15 @@ fn start_watcher(sh: Shared) {
         let mut game_gone: Option<Instant> = None;
         let mut optimized = false;
         let mut last_mem_check = Instant::now();
-        let mut last_purge = Instant::now() - PURGE_GAP;
+        // Instant trên Windows tính từ lúc bật máy: `now() - X` panic khi máy mới chạy chưa tới X
+        // (task chạy cùng Windows mở app ngay sau đăng nhập), nên lùi mốc bằng checked_sub.
+        let mut last_purge = Instant::now().checked_sub(PURGE_GAP).unwrap_or_else(Instant::now);
         // Lỗi xả standby (thường do thiếu quyền admin) chỉ log một lần, không lặp mỗi phút.
         let mut purge_fail_logged = false;
         // Báo cáo trận đang ghi (None khi không có game nào chạy).
         let mut live: Option<Arc<Mutex<report::Live>>> = None;
-        let mut last_commit_check = Instant::now() - COMMIT_CHECK;
-        let mut last_commit_warn = Instant::now() - COMMIT_WARN_GAP;
+        let mut last_commit_check = Instant::now().checked_sub(COMMIT_CHECK).unwrap_or_else(Instant::now);
+        let mut last_commit_warn = Instant::now().checked_sub(COMMIT_WARN_GAP).unwrap_or_else(Instant::now);
         // Đợt cảnh báo commit này đã xả standby một lần chưa.
         let mut commit_purged = false;
 
@@ -2745,7 +2747,9 @@ fn render_auto_card(
                     );
                 }
                 Err(e) => {
-                    *last_task_check = Instant::now() - Duration::from_secs(20);
+                    *last_task_check = Instant::now()
+                        .checked_sub(Duration::from_secs(20))
+                        .unwrap_or_else(Instant::now);
                     sh.log(
                         format!("  ⚠ [TASK] Không đổi được task GameMode: {}", e),
                         ui::DANGER,
