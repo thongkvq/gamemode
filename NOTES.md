@@ -2,18 +2,20 @@
 
 Cập nhật: 2026-10-23. Tool Rust + eframe/egui 0.29: tắt app nền trước khi chơi Delta Force, lưu session và khôi phục lại sau.
 
-## Bản 1.4.0 (2026-10-22) — Paroda GameMode
+## Bản 1.4.0 / 1.4.1 (2026-10-22) — Paroda GameMode
 - Đổi tên hiển thị thành **Paroda GameMode** (title bar, khay, Task Manager, bộ cài, shortcut). GIỮ nguyên: `GameMode.exe`, `AppId`, mutex, task `GameMode`, thư mục cài `%LOCALAPPDATA%\Programs\GameMode`, tên bộ cài `GameMode-Setup-<ver>.exe`, `"app": "GameMode"` của manifest.
 - Mới: tab Khởi động (task-22), phím tắt toàn cục (task-23), task chạy cùng Windows bằng XML — chạy cả khi dùng pin, không giới hạn 72 giờ, tự sửa task cũ lúc mở app (task-24/26), banner + `--restore` cho phiên Boost bỏ lửng, chặn `NOT_GAMES` (task-25), hồ sơ theo game (task-26).
 - Claude sửa thêm khi thử trên laptop: `<UserId>` của task dùng **SID** (`whoami /user`) — tên `USERDOMAIN\USERNAME` từ env có thể sai (phiên SSH ra `WORKGROUP\thong`, schtasks từ chối); `--tasktest` **không tạo/xoá khi task đã có** (bản cũ từng xoá mất task thật); `show_main_window` đặt lại cỡ cửa sổ khi vị trí "bình thường" chỉ là ô thu nhỏ 160×28 (lỗi có từ 1.3.2: app mở bằng `--minimized` lúc đăng nhập thì "Mở" ở khay ra cửa sổ tí hon).
 - Đã thử trên laptop (build ở `C:\build\gamemode-1.4.0`, 71 unit test qua): cài đè 1.3.4 → shortcut/uninstall mang tên mới, shortcut "GameMode" cũ bị xoá; task cũ (pin = true) được tự sửa khi mở app; `Ctrl+Alt+G` hiện/ẩn cửa sổ khi đang ở khay; tab Khởi động khớp Task Manager (15 mục, 5 bật); `--restore` không có session → exit 1.
-- **Chưa thử**: Boost theo hồ sơ (sẽ tắt app thật), banner phiên bỏ lửng bằng mắt, đổi tổ hợp phím + Lưu, bật/tắt mục ở tab Khởi động. `.lnk` trong thư mục Startup **vẫn hiện đường dẫn .lnk** (COM IShellLinkW của task-26 không ra exe, vd `Tailscale.lnk`) — cần xem lại. Card Cập nhật/Phím tắt hơi lấn mép phải ở cửa sổ 1400 px.
+- **Chưa thử**: Boost theo hồ sơ (sẽ tắt app thật), banner phiên bỏ lửng bằng mắt, đổi tổ hợp phím + Lưu, bật/tắt mục ở tab Khởi động.
+- **1.4.1** (cùng ngày): vtable `IShellLinkW` tự khai trong `startup.rs` sai thứ tự (gọi SetRelativePath thay GetPath) nên `.lnk` không ra exe — đã sắp lại theo `shobjidl_core.h`, `Tailscale.lnk` hiện `tailscale-ipn.exe`. Card Cập nhật/Phím tắt lấn mép phải vì `ui.columns` nới max_rect của `ui` → bọc hai card trong `allocate_ui_with_layout(full_w)` với bề rộng lấy trước `columns`. Cả hai đã xem bằng ảnh chụp trên laptop.
+- Mẹo thử UI từ xa: click bằng `PostMessage(WM_MOUSEMOVE/LBUTTONDOWN/UP)` vào hwnd của app (toạ độ client), ĐỪNG dùng `SetCursorPos`+`mouse_event` — khi chủ máy đang dùng laptop, cửa sổ GameMode không lên trên cùng và click rơi vào app khác.
 - Mẹo thử UI từ xa: script PowerShell chạy bằng task `/it /rl highest` trong phiên người dùng (`SetProcessDPIAware`, `keybd_event`, `PrintWindow`) — từ phiên SSH (session 0) không thấy cửa sổ.
 
 ## Bàn giao sang laptop (2026-10-22 tối, từ PC)
-- **Bản mới nhất: v1.4.0** trên kênh OTA thật và GitHub Release. Tải trực tiếp:
-  `https://update-dhcs.paroda.net/apps/gamemode/releases/GameMode-Setup-1.4.0.exe`
-  (hoặc `https://github.com/thongkvq/gamemode/releases/download/v1.4.0/GameMode-Setup-1.4.0.exe`).
+- **Bản mới nhất: v1.4.1** trên kênh OTA thật và GitHub Release. Tải trực tiếp:
+  `https://update-dhcs.paroda.net/apps/gamemode/releases/GameMode-Setup-1.4.1.exe`
+  (hoặc `https://github.com/thongkvq/gamemode/releases/download/v1.4.1/GameMode-Setup-1.4.1.exe`).
   **Laptop đã cài 1.3.3 (2026-10-22, qua SSH)** vào `%LOCALAPPDATA%\Programs\GameMode` (trước đó chạy bản 1.1.0 portable ở `C:\Users\thong\GameMode`, thư mục cũ còn nguyên, shortcut cũ dời vào `old-shortcuts\`). Đã chép `gamemode.cfg` + `session.last.json` sang; task "GameMode" trỏ exe mới, thêm `Delay PT2M30S` ở LogonTrigger để né lỗi dưới. Từ đây các bản sau đến qua OTA.
 - **Đã sửa ở 1.3.4** (2026-10-22): crash khi mở trong ~2 phút đầu sau khi bật máy — `Instant::now() - X` (watcher và nút task trong `src/main.rs`) panic khi uptime < X; giờ dùng `checked_sub(..).unwrap_or_else(Instant::now)`. 1.3.4 build trên laptop (PC tắt) từ `main` + commit `8f3efbe` (đã push lên `main`, tag `v1.3.4` + GitHub Release kèm bộ cài), publish OTA thật lúc 18:31. Laptop đã lên 1.3.4.
 - **Config laptop**: từng có `game:msedgewebview2.exe=1` khiến auto mode Boost ngay khi mở (WebView2 luôn chạy). Đã bỏ dòng đó (bản cũ: `gamemode.cfg.bak-20261022`). Báo cáo `20261022-175503` là trận giả do lỗi này.
@@ -135,7 +137,7 @@ App đòi quyền admin nên shell thường không chụp được cửa sổ. 
 ## Bộ cài (Inno Setup)
 - Cài Inno Setup 6: `winget install JRSoftware.InnoSetup --scope user`.
 - Build: `cargo build --release`, rồi `"%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" installer\gamemode.iss`, ra file `dist\GameMode-Setup-<version>.exe` (thư mục `dist/` không đưa lên git).
-- Version (hiện 1.4.0) phải sửa ở 2 chỗ: `Cargo.toml` và `#define AppVersion` trong `installer/gamemode.iss`.
+- Version (hiện 1.4.1) phải sửa ở 2 chỗ: `Cargo.toml` và `#define AppVersion` trong `installer/gamemode.iss`.
 - Bộ cài cài theo từng user vào `%LOCALAPPDATA%\Programs\GameMode`, không cần admin khi cài. Gỡ cài đặt sẽ xoá config/session và task "chạy cùng Windows".
 - Exe chưa ký số nên lần đầu chạy sẽ bị SmartScreen cảnh báo.
 - Bộ cài có nhánh cập nhật OTA: chạy kèm `/UPDATE` thì `[Code] IsUpdateRun` bật entry `[Run]`

@@ -6704,6 +6704,10 @@ impl eframe::App for App {
                             .id_salt("auto_opt_scroll_area")
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
+                                // Bề rộng thật của tab, lấy TRƯỚC `ui.columns`: khi một cột có nội
+                                // dung rộng hơn phần chia, `columns` nới max_rect của `ui` và các
+                                // card full width bên dưới bị lấn ra ngoài mép phải.
+                                let full_w = ui.available_width();
                                 let mut save_needed = false;
                                 // Bản sao hồ sơ riêng: card sửa bản sao, cuối frame ghi lại vào
                                 // `Shared` + config khi có thay đổi.
@@ -6752,17 +6756,24 @@ impl eframe::App for App {
 
                                 // Cập nhật OTA: luôn nằm dưới cùng, phủ hết chiều rộng tab.
                                 ui.add_space(ui::SPACE_CARD_GAP);
-                                render_update_card(
-                                    ui,
-                                    &sh,
-                                    &mut opts_view,
-                                    &mut save_needed,
-                                    &mut self.update_err,
-                                );
+                                ui.allocate_ui_with_layout(
+                                    vec2(full_w, 0.0),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        ui.set_max_width(full_w);
+                                        render_update_card(
+                                            ui,
+                                            &sh,
+                                            &mut opts_view,
+                                            &mut save_needed,
+                                            &mut self.update_err,
+                                        );
 
-                                // Phím tắt toàn cục (bật/tắt + đổi tổ hợp) — dưới card cập nhật.
-                                ui.add_space(ui::SPACE_CARD_GAP);
-                                self.render_hotkey_card(ui, &mut opts_view, &mut save_needed);
+                                        // Phím tắt toàn cục (bật/tắt + đổi tổ hợp) — dưới card cập nhật.
+                                        ui.add_space(ui::SPACE_CARD_GAP);
+                                        self.render_hotkey_card(ui, &mut opts_view, &mut save_needed);
+                                    },
+                                );
 
                                 if save_needed {
                                     *sh.opts.lock().unwrap() = opts_view;

@@ -425,28 +425,17 @@ struct IPersistFileVtbl {
     get_cur_file: *const c_void,
 }
 
-/// Vtable `IShellLinkW`: `IUnknown` + các phương thức theo đúng thứ tự trong `shobjidl_core.h`
-/// (chỉ `GetPath`/`GetArguments` được gọi, phần còn lại là chỗ giữ đúng vị trí).
+/// Vtable `IShellLinkW`: `IUnknown` + các phương thức theo ĐÚNG thứ tự trong `shobjidl_core.h`
+/// (GetPath, GetIDList, SetIDList, GetDescription, SetDescription, GetWorkingDirectory,
+/// SetWorkingDirectory, GetArguments, SetArguments, GetHotkey, SetHotkey, GetShowCmd, SetShowCmd,
+/// GetIconLocation, SetIconLocation, SetRelativePath, Resolve, SetPath). Chỉ `GetPath` và
+/// `GetArguments` được gọi; sai thứ tự là gọi nhầm hàm (1.4.0 gọi SetRelativePath thay GetPath
+/// nên `.lnk` không bao giờ ra exe).
 #[cfg(windows)]
 #[allow(dead_code)]
 #[repr(C)]
 struct IShellLinkWVtbl {
     base: IUnknownVtbl,
-    get_arguments: unsafe extern "system" fn(*mut c_void, *mut u16, i32) -> windows_sys::core::HRESULT,
-    get_description: *const c_void,
-    get_working_directory: *const c_void,
-    get_hotkey: *const c_void,
-    set_arguments: *const c_void,
-    set_description: *const c_void,
-    set_working_directory: *const c_void,
-    set_hotkey: *const c_void,
-    set_show_cmd: *const c_void,
-    get_show_cmd: *const c_void,
-    get_icon_location: *const c_void,
-    set_icon_location: *const c_void,
-    set_relative_path: *const c_void,
-    resolve: *const c_void,
-    set_path: *const c_void,
     get_path: unsafe extern "system" fn(
         *mut c_void,
         *mut u16,
@@ -454,10 +443,23 @@ struct IShellLinkWVtbl {
         *mut c_void,
         u32,
     ) -> windows_sys::core::HRESULT,
-    set_id_list: *const c_void,
     get_id_list: *const c_void,
-    set_name: *const c_void,
-    get_name: *const c_void,
+    set_id_list: *const c_void,
+    get_description: *const c_void,
+    set_description: *const c_void,
+    get_working_directory: *const c_void,
+    set_working_directory: *const c_void,
+    get_arguments: unsafe extern "system" fn(*mut c_void, *mut u16, i32) -> windows_sys::core::HRESULT,
+    set_arguments: *const c_void,
+    get_hotkey: *const c_void,
+    set_hotkey: *const c_void,
+    get_show_cmd: *const c_void,
+    set_show_cmd: *const c_void,
+    get_icon_location: *const c_void,
+    set_icon_location: *const c_void,
+    set_relative_path: *const c_void,
+    resolve: *const c_void,
+    set_path: *const c_void,
 }
 
 /// Đích thật của một file `.lnk`: `(dòng lệnh, đường dẫn exe)`. `None` khi không đọc được.
