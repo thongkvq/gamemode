@@ -3,12 +3,13 @@
 Cập nhật: 2026-10-22. Tool Rust + eframe/egui 0.29: tắt app nền trước khi chơi Delta Force, lưu session và khôi phục lại sau.
 
 ## Đang dở và làm tiếp (2026-10-22)
-- **Bản đã phát hành**: **v1.3.0 trên kênh OTA thật** (`apps/gamemode`, 2026-10-22, build trên PC từ `I:\dev\GameMode`): báo cáo trận + tab biểu đồ, cảnh báo commit, cập nhật OTA, giữ con cháu của app được giữ, "Đánh dấu là game" ở menu chuột phải. GitHub Releases mới có tới v1.2.0 (chưa tạo Release 1.3.0).
-  - **Laptop đang chạy 1.2.0 chưa có bộ cập nhật**: phải cài tay `GameMode-Setup-1.3.0.exe` một lần (tải ở `https://update-dhcs.paroda.net/apps/gamemode/releases/GameMode-Setup-1.3.0.exe`), từ đó các bản sau tự đến qua OTA.
+- **Bản đã phát hành**: **v1.3.2 trên kênh OTA thật** (`apps/gamemode`, 2026-10-22, build trên PC từ `I:\dev\GameMode`) và GitHub Release v1.3.0 / v1.3.1 / v1.3.2. 1.3.0: báo cáo trận + tab biểu đồ, cảnh báo commit, cập nhật OTA, giữ con cháu của app được giữ, "Đánh dấu là game" ở menu chuột phải. 1.3.1: giữ Discord/OBS, không dừng sshd. 1.3.2: sửa tốn CPU/GPU (xem dưới), version trên title bar.
+  - **Laptop đang chạy 1.2.0 chưa có bộ cập nhật**: phải cài tay bộ cài mới nhất một lần (tải ở `https://update-dhcs.paroda.net/apps/gamemode/releases/`), từ đó các bản sau tự đến qua OTA.
+- **Hiệu năng (1.3.2)**: eframe 0.29 quay 100% một nhân khi cửa sổ bị `SW_HIDE` (cửa sổ ẩn không nhận WM_PAINT, event loop kẹt ở `ControlFlow::Poll`). Vì vậy "thu vào khay" = thu nhỏ + `WS_EX_TOOLWINDOW` (`sys::hide_main_window`), **không dùng SW_HIDE**. Khi mất focus / thu nhỏ, `update()` chỉ repaint 1–2 giây/lần, hiệu ứng nhấp nháy đi qua `ui::anim_repaint` (không repaint liên tục), và không gọi `schtasks`. Đo 2026-10-22: 1.3.1 lúc đang chơi ~1,2 nhân + ~9% GPU 3D; 1.3.2 mọi trạng thái < 1% một nhân, GPU ~0.
 - **Tab "Báo cáo trận" (task-14, Gemini)** cùng banner cảnh báo commit và biểu đồ `egui_plot` 0.29. Các bước đã làm:
   1. ~~Kiểm tra tab "Báo cáo trận"~~ — đã xem trên PC ngày 2026-10-22: danh sách, thẻ chỉ số, nhận xét, 4 biểu đồ, trận đang ghi cập nhật trực tiếp đều đúng. Nút xoá hiện bước "Bấm lại để xoá" nhưng **chưa xác nhận lần bấm thứ hai xoá thật** (chỉ test bằng click giả).
   2. Đã sửa trên PC (task-15 Gemini + vài dòng tay) và đã commit lên `main`; PC giờ có bản clone ở `I:\dev\GameMode` (ngoài thư mục đồng bộ): nhãn trục Y không còn bị mất, trục X dạng `m:ss`, chú thích chuyển ra hàng trên biểu đồ (chấm tự vẽ vì font không có glyph `●`), tên game thân thiện ("Delta Force"), thêm 4 unit test (`cargo test` cần `__COMPAT_LAYER=RunAsInvoker` vì exe test cũng đòi admin).
-  3. Còn lại: thử nút xoá báo cáo bằng tay; tạo GitHub Release 1.3.0 nếu muốn.
+  3. Còn lại: thử nút xoá báo cáo bằng tay.
 - **Tính năng còn trong danh sách đề xuất**: quản lý app khởi động cùng Windows (máy đang có ~13 mục Run + 1 file Startup), hồ sơ theo game, phím tắt toàn cục.
 - **Ngoài phần mềm (đã khuyên chủ máy)**: thêm thanh RAM 16 GB (đang single channel); đặt pagefile cố định 16–24 GB (commit từng chạm 95%); cắm dây LAN thay Wi-Fi; driver NVIDIA hiện tên "GTX 750 Ti" trong khi card thật là RTX 3060 Laptop (DEV_2520), nên cài lại driver chính hãng nếu FPS bất thường.
 - **Lưu ý khi giao việc**: launcher `delegate.sh` hay thoát sớm khi chạy nền lâu, nhưng worker trên harness vẫn chạy tiếp; theo dõi bằng file `task-NN.status.json` (`"terminal": true` là xong).
@@ -96,7 +97,7 @@ App đòi quyền admin nên shell thường không chụp được cửa sổ. 
 ## Bộ cài (Inno Setup)
 - Cài Inno Setup 6: `winget install JRSoftware.InnoSetup --scope user`.
 - Build: `cargo build --release`, rồi `"%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" installer\gamemode.iss`, ra file `dist\GameMode-Setup-<version>.exe` (thư mục `dist/` không đưa lên git).
-- Version (hiện 1.3.1) phải sửa ở 2 chỗ: `Cargo.toml` và `#define AppVersion` trong `installer/gamemode.iss`.
+- Version (hiện 1.3.2) phải sửa ở 2 chỗ: `Cargo.toml` và `#define AppVersion` trong `installer/gamemode.iss`.
 - Bộ cài cài theo từng user vào `%LOCALAPPDATA%\Programs\GameMode`, không cần admin khi cài. Gỡ cài đặt sẽ xoá config/session và task "chạy cùng Windows".
 - Exe chưa ký số nên lần đầu chạy sẽ bị SmartScreen cảnh báo.
 - Bộ cài có nhánh cập nhật OTA: chạy kèm `/UPDATE` thì `[Code] IsUpdateRun` bật entry `[Run]`

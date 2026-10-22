@@ -4,6 +4,26 @@ use eframe::egui::{
     self, pos2, vec2, viewport::ResizeDirection, Align2, Color32, CursorIcon, FontId, Margin, Rect,
     Rounding, Stroke, ViewportCommand,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+/// Cửa sổ đang được dùng (có focus, không thu nhỏ). `false` khi đang chơi game / ở khay.
+static ANIMATE: AtomicBool = AtomicBool::new(true);
+
+/// Đặt mỗi frame từ `App::update`.
+pub fn set_animate(on: bool) {
+    ANIMATE.store(on, Ordering::Relaxed);
+}
+
+/// Repaint cho hiệu ứng nhấp nháy: liên tục khi cửa sổ đang được dùng, còn khi ở nền
+/// (game đang chạy phía trước, mất focus, thu nhỏ) chỉ ~1 lần/giây để không giành CPU/GPU với game.
+pub fn anim_repaint(ctx: &egui::Context) {
+    if ANIMATE.load(Ordering::Relaxed) {
+        ctx.request_repaint();
+    } else {
+        ctx.request_repaint_after(Duration::from_secs(1));
+    }
+}
 
 // ==========================================
 // BẢNG MÀU TACTICAL HUD
@@ -747,7 +767,7 @@ impl egui::Widget for PrimaryButton {
 
         if self.busy {
             // Repaint liên tục khi busy để sọc chéo di chuyển
-            ui.ctx().request_repaint();
+            anim_repaint(ui.ctx());
 
             let bg_fill = Color32::from_rgb(32, 22, 6);
             let border_stroke = Stroke::new(1.0_f32, ACCENT);
@@ -1060,7 +1080,7 @@ pub fn status_badge(ui: &mut egui::Ui, busy: bool) {
     // LED dot: nhấp nháy khi busy
     let led_center = pos2(rect.left() + pad_x + led_radius, rect.center().y);
     let alpha = if busy {
-        ui.ctx().request_repaint(); // Repaint chỉ khi busy
+        anim_repaint(ui.ctx()); // Repaint chỉ khi busy
         let time = ui.input(|i| i.time);
         (((time * 6.0).sin().abs() * 200.0) as u8).max(45)
     } else {
@@ -1381,7 +1401,7 @@ pub fn render_commit_alert_banner(ui: &mut egui::Ui, commit_pct: f32) {
     let pad_y = 10.0_f32;
 
     let time = ui.input(|i| i.time);
-    ui.ctx().request_repaint();
+    anim_repaint(ui.ctx());
     let pulse = ((time * 4.0).sin().abs() as f32).clamp(0.25, 1.0);
     let border_color = Color32::from_rgba_premultiplied(
         255,
@@ -1571,7 +1591,7 @@ pub fn report_list_row(
 
     if is_live {
         let time = ui.input(|i| i.time);
-        ui.ctx().request_repaint();
+        anim_repaint(ui.ctx());
         let blink = ((time * 4.0).sin().abs() as f32).clamp(0.2, 1.0);
         let live_dot_color = Color32::from_rgba_premultiplied(255, 50, 50, (blink * 255.0) as u8);
 

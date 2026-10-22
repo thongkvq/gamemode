@@ -47,8 +47,9 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, FindWindowW, GetWindow, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, IsIconic, IsWindowVisible, PostMessageW, SetForegroundWindow,
-    ShowWindow, GW_OWNER, SW_HIDE, SW_RESTORE, SW_SHOW, WM_CLOSE,
+    GetWindowLongPtrW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, PostMessageW,
+    SetForegroundWindow, SetWindowLongPtrW, ShowWindow, GWL_EXSTYLE, GW_OWNER, SW_HIDE,
+    SW_RESTORE, SW_SHOW, SW_SHOWMINNOACTIVE, WM_CLOSE, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
 };
 
 /// ACCESS bị windows-sys đặt ở module khác -> dùng hằng số gốc của Win32.
@@ -1551,12 +1552,25 @@ pub fn find_window(title: &str) -> isize {
 }
 
 /// Ẩn cửa sổ chính (nút X / đóng cửa sổ -> thu xuống khay).
+///
+/// Không để cửa sổ ở trạng thái SW_HIDE: cửa sổ ẩn không nhận WM_PAINT nên event loop của
+/// eframe 0.29 chờ lần vẽ đó mãi và quay 100% một nhân CPU. Thay vào đó thu nhỏ cửa sổ và
+/// gắn WS_EX_TOOLWINDOW để bỏ nút taskbar / Alt+Tab; cửa sổ thu nhỏ vẫn vẽ được nên loop ngủ.
 pub fn hide_main_window(hwnd: isize) {
     if hwnd == 0 {
         return;
     }
     unsafe {
-        ShowWindow(hwnd as HWND, SW_HIDE);
+        let h = hwnd as HWND;
+        let ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
+        let tool = WS_EX_TOOLWINDOW as isize;
+        if ex & tool != 0 && IsIconic(h) != 0 {
+            return; // đã ở khay
+        }
+        // Đổi ex-style lúc cửa sổ đang ẩn thì taskbar mới gỡ nút.
+        ShowWindow(h, SW_HIDE);
+        SetWindowLongPtrW(h, GWL_EXSTYLE, (ex | tool) & !(WS_EX_APPWINDOW as isize));
+        ShowWindow(h, SW_SHOWMINNOACTIVE);
     }
 }
 
@@ -1567,6 +1581,13 @@ pub fn show_main_window(hwnd: isize) {
     }
     unsafe {
         let h = hwnd as HWND;
+        let ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
+        let tool = WS_EX_TOOLWINDOW as isize;
+        if ex & tool != 0 {
+            // Từ khay ra: trả lại nút taskbar (đổi style lúc ẩn như `hide_main_window`).
+            ShowWindow(h, SW_HIDE);
+            SetWindowLongPtrW(h, GWL_EXSTYLE, (ex & !tool) | WS_EX_APPWINDOW as isize);
+        }
         if IsIconic(h) != 0 {
             ShowWindow(h, SW_RESTORE);
         } else {

@@ -4408,8 +4408,16 @@ impl eframe::App for App {
             self.mem_lists = sys::memory_lists();
             self.last_ml = Instant::now();
         }
-        // Trạng thái task "GameMode" hỏi lại định kỳ (schtasks là tiến trình riêng, khá tốn).
-        if self.last_task_check.elapsed() > Duration::from_secs(20) {
+        // Ở nền = mất focus (game đang ở trước) hoặc thu nhỏ / ở khay: vẽ lại thưa, tắt nhấp nháy.
+        let (focused, minimized) = ctx.input(|i| {
+            let vp = i.viewport();
+            (vp.focused.unwrap_or(true), vp.minimized.unwrap_or(false))
+        });
+        let background = minimized || !focused;
+        ui::set_animate(!background);
+        // Trạng thái task "GameMode" hỏi lại định kỳ (schtasks là tiến trình riêng, khá tốn),
+        // chỉ khi đang xem cửa sổ: không spawn tiến trình mỗi 20 giây trong lúc chơi game.
+        if !background && self.last_task_check.elapsed() > Duration::from_secs(20) {
             self.task_on = sys::task_exists();
             self.last_task_check = Instant::now();
         }
@@ -4418,9 +4426,14 @@ impl eframe::App for App {
             self.commit_sys = sys::commit();
             self.last_commit_sys = Instant::now();
         }
-        // Với trận đang ghi: repaint mỗi ~2 giây khi tab Báo cáo đang mở
-        if self.tab == ConfigTab::Reports && self.sh.live_report.lock().unwrap().is_some() {
+        // Với trận đang ghi: repaint mỗi ~2 giây khi tab Báo cáo đang mở.
+        // Thu nhỏ / ở khay: 2 giây; mất focus (đang chơi game): 1 giây.
+        if minimized
+            || (self.tab == ConfigTab::Reports && self.sh.live_report.lock().unwrap().is_some())
+        {
             ctx.request_repaint_after(Duration::from_secs(2));
+        } else if background {
+            ctx.request_repaint_after(Duration::from_secs(1));
         } else {
             ctx.request_repaint_after(Duration::from_millis(400));
         }
