@@ -6,7 +6,7 @@
 ; Kết quả: dist\GameMode-Setup-<version>.exe
 
 #define AppName "Paroda GameMode"
-#define AppVersion "1.5.1"
+#define AppVersion "1.5.2"
 #define AppPublisher "thongkvq"
 #define AppExe "GameMode.exe"
 

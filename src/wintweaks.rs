@@ -834,14 +834,60 @@ mod winapi_io {
         }
     }
 
+    /// Đổi kiểu khởi động qua Service Control Manager (`ChangeServiceConfigW`, như `sc config`):
+    /// SCM cập nhật ngay và không đụng cờ "Delayed Start". 1.5.0–1.5.1 mở khoá registry của
+    /// service chỉ với KEY_READ rồi `set_value` nên luôn "Access is denied".
     fn write_service_start(name: &str, start: StartType) -> Result<(), String> {
-        let key = match open_service_key(name)? {
-            Some(k) => k,
-            // Service không có trên máy này -> bỏ qua, không lỗi.
-            None => return Ok(()),
+        use windows_sys::Win32::System::Services::{
+            ChangeServiceConfigW, CloseServiceHandle, OpenSCManagerW, OpenServiceW,
+            SC_MANAGER_CONNECT, SERVICE_CHANGE_CONFIG, SERVICE_NO_CHANGE,
         };
-        key.set_value("Start", &start.value())
-            .map_err(|e| format!("ghi Start của service {} lỗi: {}", name, e))
+        if open_service_key(name)?.is_none() {
+            // Service không có trên máy này -> bỏ qua, không lỗi.
+            return Ok(());
+        }
+        let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY: chuỗi UTF-16 kết thúc 0 sống tới hết khối; handle đóng ở mọi nhánh.
+        unsafe {
+            let scm = OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT);
+            if scm.is_null() {
+                return Err(format!(
+                    "mở Service Control Manager lỗi: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            let svc = OpenServiceW(scm, wide.as_ptr(), SERVICE_CHANGE_CONFIG);
+            if svc.is_null() {
+                let e = std::io::Error::last_os_error();
+                CloseServiceHandle(scm);
+                return Err(format!("mở service {} để đổi cấu hình lỗi: {}", name, e));
+            }
+            let ok = ChangeServiceConfigW(
+                svc,
+                SERVICE_NO_CHANGE,
+                start.value(),
+                SERVICE_NO_CHANGE,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+            );
+            let e = std::io::Error::last_os_error();
+            CloseServiceHandle(svc);
+            CloseServiceHandle(scm);
+            if ok == 0 {
+                return Err(format!(
+                    "đổi kiểu khởi động service {} sang {} lỗi: {}",
+                    name,
+                    start.label(),
+                    e
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn write_power_ac(sub: &str, setting: &str, v: u32) -> Result<(), String> {
@@ -967,7 +1013,13 @@ mod winapi_io {
             {
                 Some(st) => write_service_start(name, st),
                 // Giá trị Start lạ (0/1 = boot/system driver) thì ghi thẳng số gốc.
-                None => match open_service_key(name)? {
+                None => match winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE)
+                    .open_subkey_with_flags(
+                        format!("SYSTEM\\CurrentControlSet\\Services\\{}", name),
+                        winreg::enums::KEY_READ | winreg::enums::KEY_SET_VALUE,
+                    )
+                    .ok()
+                {
                     Some(k) => k
                         .set_value("Start", v)
                         .map_err(|e| format!("trả Start của service {} lỗi: {}", name, e)),

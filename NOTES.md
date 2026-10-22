@@ -17,6 +17,7 @@ Cập nhật: 2026-10-23. Tool Rust + eframe/egui 0.29: tắt app nền trước
 - **Claude sửa thêm trong 1.5.0**:
   - **FPS trong báo cáo trận chưa từng chạy trên laptop (1.3.3–1.4.1)**: Delta Force trên laptop Optimus phát event DXGI **180** (`IDXGISwapChain1_Present1`, task 81), KHÔNG có 178 nào (trace `logman` 8 s lúc đang chơi: DF 242× event 180/181 + 42/43; dwm 196/197). 3 trận 2026-10-22 tối đều `fps: null`. `fps.rs` giờ đếm cả 178 và 180, PID đã phát 180 thì bỏ 178. `--fpstest 10` sau khi sửa: ~30 FPS (lúc đó có thể đang ở sảnh/khóa FPS), frametime dao động 33↔74 ms — **cần đối chiếu bằng báo cáo một trận thật**.
   - `wintweaks`: hoàn tác `defender_games` khi lúc bật chưa có thư mục loại trừ nào trước đây không gỡ gì; đọc setting nguồn bị ẩn (CPU boost mode) bằng cách bỏ cờ ẩn rồi `/q` lại (trước luôn "Không rõ").
+  - **1.5.2**: mọi tinh chỉnh service (`telemetry_min`, `services_trim`, `sysmain_off`, `search_index_off`) báo "Access is denied" ở 1.5.0–1.5.1 vì `open_service_key` mở khoá chỉ `KEY_READ` rồi `set_value`. Giờ đổi kiểu khởi động qua Service Control Manager (`ChangeServiceConfigW`, không đụng cờ DelayedAutostart); nhánh hoàn tác giá trị Start lạ mở khoá `KEY_SET_VALUE`. Đã thử vòng bật → hoàn tác `services_trim` trên laptop: Start + Delayed của 5 service khớp đúng giá trị gốc.
   - **1.5.1**: bỏ tinh chỉnh `no_widgets` (`HKLM\SOFTWARE\Policies\Microsoft\Dsh` `AllowNewsAndInterests`): Windows 11 chặn ghi value này bằng driver **UCPD** (kể cả `reg.exe` admin; value khác trong cùng khóa ghi được). Đã cân nhắc ghi qua Group Policy (`Registry.pol` + `gpupdate`) nhưng đó là lách cơ chế bảo vệ của Windows — chủ máy chọn bỏ hẳn. Còn 25 tinh chỉnh.
   - Icon tab đổi 🪟 → 🔧 (font egui không có glyph 🪟, hiện ô vuông).
   - UI đã xem bằng ảnh chụp: card Phần cứng (8 gợi ý), đầu card Tinh chỉnh (5/26, nút gói khuyến nghị / hoàn tác mờ khi chưa có sao lưu). **Chưa xem bằng mắt các hàng tinh chỉnh bên dưới** (cuộn bằng PostMessage WM_MOUSEWHEEL không ăn khi con trỏ thật ở ngoài cửa sổ).
@@ -54,9 +55,9 @@ Cập nhật: 2026-10-23. Tool Rust + eframe/egui 0.29: tắt app nền trước
   `--tweakapply <id>` / `--tweakrevert <id>` (`wintweaks-result.txt`) — xem bảng "Cờ dòng lệnh" dưới.
 
 ## Bàn giao sang laptop (2026-10-22 tối, từ PC)
-- **Bản mới nhất: v1.5.1** trên kênh OTA thật và GitHub Release. Tải trực tiếp:
-  `https://update-dhcs.paroda.net/apps/gamemode/releases/GameMode-Setup-1.5.1.exe`
-  (hoặc `https://github.com/thongkvq/gamemode/releases/download/v1.5.1/GameMode-Setup-1.5.1.exe`).
+- **Bản mới nhất: v1.5.2** trên kênh OTA thật và GitHub Release. Tải trực tiếp:
+  `https://update-dhcs.paroda.net/apps/gamemode/releases/GameMode-Setup-1.5.2.exe`
+  (hoặc `https://github.com/thongkvq/gamemode/releases/download/v1.5.2/GameMode-Setup-1.5.2.exe`).
   **Laptop đã cài 1.3.3 (2026-10-22, qua SSH)** vào `%LOCALAPPDATA%\Programs\GameMode` (trước đó chạy bản 1.1.0 portable ở `C:\Users\thong\GameMode`, thư mục cũ còn nguyên, shortcut cũ dời vào `old-shortcuts\`). Đã chép `gamemode.cfg` + `session.last.json` sang; task "GameMode" trỏ exe mới, thêm `Delay PT2M30S` ở LogonTrigger để né lỗi dưới. Từ đây các bản sau đến qua OTA.
 - **Đã sửa ở 1.3.4** (2026-10-22): crash khi mở trong ~2 phút đầu sau khi bật máy — `Instant::now() - X` (watcher và nút task trong `src/main.rs`) panic khi uptime < X; giờ dùng `checked_sub(..).unwrap_or_else(Instant::now)`. 1.3.4 build trên laptop (PC tắt) từ `main` + commit `8f3efbe` (đã push lên `main`, tag `v1.3.4` + GitHub Release kèm bộ cài), publish OTA thật lúc 18:31. Laptop đã lên 1.3.4.
 - **Config laptop**: từng có `game:msedgewebview2.exe=1` khiến auto mode Boost ngay khi mở (WebView2 luôn chạy). Đã bỏ dòng đó (bản cũ: `gamemode.cfg.bak-20261022`). Báo cáo `20261022-175503` là trận giả do lỗi này.
@@ -184,7 +185,7 @@ App đòi quyền admin nên shell thường không chụp được cửa sổ. 
 ## Bộ cài (Inno Setup)
 - Cài Inno Setup 6: `winget install JRSoftware.InnoSetup --scope user`.
 - Build: `cargo build --release`, rồi `"%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" installer\gamemode.iss`, ra file `dist\GameMode-Setup-<version>.exe` (thư mục `dist/` không đưa lên git).
-- Version (hiện 1.5.1) phải sửa ở 2 chỗ: `Cargo.toml` và `#define AppVersion` trong `installer/gamemode.iss`.
+- Version (hiện 1.5.2) phải sửa ở 2 chỗ: `Cargo.toml` và `#define AppVersion` trong `installer/gamemode.iss`.
 - Bộ cài cài theo từng user vào `%LOCALAPPDATA%\Programs\GameMode`, không cần admin khi cài. Gỡ cài đặt sẽ xoá config/session và task "chạy cùng Windows".
 - Exe chưa ký số nên lần đầu chạy sẽ bị SmartScreen cảnh báo.
 - Bộ cài có nhánh cập nhật OTA: chạy kèm `/UPDATE` thì `[Code] IsUpdateRun` bật entry `[Run]`
