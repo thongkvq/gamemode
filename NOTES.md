@@ -12,10 +12,50 @@ Cập nhật: 2026-10-23. Tool Rust + eframe/egui 0.29: tắt app nền trước
 - Mẹo thử UI từ xa: click bằng `PostMessage(WM_MOUSEMOVE/LBUTTONDOWN/UP)` vào hwnd của app (toạ độ client), ĐỪNG dùng `SetCursorPos`+`mouse_event` — khi chủ máy đang dùng laptop, cửa sổ GameMode không lên trên cùng và click rơi vào app khác.
 - Mẹo thử UI từ xa: script PowerShell chạy bằng task `/it /rl highest` trong phiên người dùng (`SetProcessDPIAware`, `keybd_event`, `PrintWindow`) — từ phiên SSH (session 0) không thấy cửa sổ.
 
+## Tối ưu Win (1.5.0)
+- Tab **🔧 Tối ưu Win** (cột phải, sau tab "Tự động & Tối ưu", `ConfigTab::WinOpt`) — bản 1.5.0 (task-27 wintweaks, task-28 hwinfo, task-29 UI).
+- **Claude sửa thêm trong 1.5.0**:
+  - **FPS trong báo cáo trận chưa từng chạy trên laptop (1.3.3–1.4.1)**: Delta Force trên laptop Optimus phát event DXGI **180** (`IDXGISwapChain1_Present1`, task 81), KHÔNG có 178 nào (trace `logman` 8 s lúc đang chơi: DF 242× event 180/181 + 42/43; dwm 196/197). 3 trận 2026-10-22 tối đều `fps: null`. `fps.rs` giờ đếm cả 178 và 180, PID đã phát 180 thì bỏ 178. `--fpstest 10` sau khi sửa: ~30 FPS (lúc đó có thể đang ở sảnh/khóa FPS), frametime dao động 33↔74 ms — **cần đối chiếu bằng báo cáo một trận thật**.
+  - `wintweaks`: hoàn tác `defender_games` khi lúc bật chưa có thư mục loại trừ nào trước đây không gỡ gì; đọc setting nguồn bị ẩn (CPU boost mode) bằng cách bỏ cờ ẩn rồi `/q` lại (trước luôn "Không rõ").
+  - Icon tab đổi 🪟 → 🔧 (font egui không có glyph 🪟, hiện ô vuông).
+  - UI đã xem bằng ảnh chụp: card Phần cứng (8 gợi ý), đầu card Tinh chỉnh (5/26, nút gói khuyến nghị / hoàn tác mờ khi chưa có sao lưu). **Chưa xem bằng mắt các hàng tinh chỉnh bên dưới** (cuộn bằng PostMessage WM_MOUSEWHEEL không ăn khi con trỏ thật ở ngoài cửa sổ).
+  - Đã thử trên laptop: `--hwinfo` (8 gợi ý đúng máy), `--tweakstatus` (26/26 đọc được), vòng `--tweakapply/--tweakrevert startup_delay_0` (registry về "không có", backup rỗng lại) và `pcie_aspm_off_ac`.
+- **Card "Phần cứng"** (trên cùng): `hwinfo::summary_line` + danh sách `hwinfo::advice` (chấm màu: Good xanh,
+  Info accent, Warn vàng; tiêu đề đậm, chi tiết chữ mờ) + nút *Quét lại*. `hwinfo::collect()` chạy ở thread
+  nền khi mở tab lần đầu và mỗi lần *Quét lại* (WMI/PowerShell chặn vài giây) — đang quét hiện
+  "Đang đọc thông tin phần cứng…", lỗi hiện đỏ. Chỉ đọc, không đổi gì trên máy.
+- **Card "Tinh chỉnh Windows"**: dòng đếm "N/M đang bật"; nút **Áp dụng gói khuyến nghị** (các tweak
+  `recommended` chưa bật) và **Hoàn tác tất cả** (mọi tweak có trong bản sao lưu), cả hai **bấm 2 lần**
+  ("Bấm lại để xác nhận", tự huỷ sau 4 giây, `CONFIRM_WINDOW`). Từng tweak một hàng: tiêu đề (tooltip =
+  nhóm · rủi ro · số thao tác và từng thao tác), badge rủi ro (An toàn xanh / Cân nhắc vàng / Nâng cao đỏ),
+  badge "Khởi động lại" khi `needs_reboot`, mô tả chữ mờ, trạng thái (Đang bật xanh / Chưa bật mờ /
+  Một phần vàng / Không rõ + lý do trong tooltip), nút **Bật** (khi chưa bật; tweak **Nâng cao** cũng phải
+  bấm 2 lần) và **Hoàn tác** (chỉ khi có trong bản sao lưu). Trong lúc một thao tác chạy thì mọi nút bị khoá.
+- Mọi thao tác (bật/hoàn tác/đọc lại) chạy **tuần tự trên thread nền**, ghi log từng tweak
+  (`✔ [WIN] Đã bật: …`, `↺ [WIN] Đã hoàn tác: …`, lỗi `⚠ [WIN] <tiêu đề>: <lỗi>`). Trạng thái đọc lại sau
+  mỗi thao tác (powercfg / bcdedit / PowerShell chậm). Tweak `needs_reboot` vừa đổi trong lần mở này hiện
+  callout vàng "Cần khởi động lại máy để có hiệu lực: …".
+- **Bản sao lưu**: `wintweaks-backup.json` cạnh exe (cùng thư mục `config_path()`), ghi lại NGAY sau mỗi
+  tweak bật/hoàn tác. **KHÔNG** thêm vào `[UninstallDelete]` của bộ cài (bộ cài cũ chỉ xoá `{app}\*.txt`,
+  `gamemode.cfg`, `session*.json`, `reports\*`) — gỡ app vẫn giữ file này để cài lại còn hoàn tác được.
+  Đã thêm vào `.gitignore`.
+- Danh sách tweak theo nhóm (`wintweaks::all_tweaks(game_dirs)`; `game_dirs` = thư mục cha của mọi
+  `gamepath:` trong config, bỏ trùng):
+  - **Hiệu năng game**: `game_mode`, `hags`, `windowed_opt`, `mmcss_games`, `no_gamedvr`, `mouse_raw`,
+    `defender_games` (chỉ xuất hiện khi có `gamepath:`), `power_throttling_off`.
+  - **Giảm tác vụ nền**: `bg_apps_off`, `no_suggestions`, `no_widgets`, `telemetry_min`,
+    `delivery_opt_p2p_off`, `edge_bg_off`, `startup_delay_0`, `animations_off`, `services_trim`,
+    `sysmain_off`, `search_index_off`.
+  - **Bộ nhớ**: `mem_compression_on`, `pagefile_fixed`.
+  - **Hệ thống**: `fast_startup_off`, `pcie_aspm_off_ac`, `cpu_boost_aggressive_ac`, `usb_suspend_off_ac`,
+    `hypervisor_off` (rủi ro Nâng cao; tắt VBS/hypervisor — WSL2/Docker/BlueStacks không chạy cho tới khi hoàn tác).
+- Cờ dòng lệnh mới để thử từ xa: `--hwinfo` (`hwinfo.txt`), `--tweakstatus` (`wintweaks-status.txt`),
+  `--tweakapply <id>` / `--tweakrevert <id>` (`wintweaks-result.txt`) — xem bảng "Cờ dòng lệnh" dưới.
+
 ## Bàn giao sang laptop (2026-10-22 tối, từ PC)
-- **Bản mới nhất: v1.4.1** trên kênh OTA thật và GitHub Release. Tải trực tiếp:
-  `https://update-dhcs.paroda.net/apps/gamemode/releases/GameMode-Setup-1.4.1.exe`
-  (hoặc `https://github.com/thongkvq/gamemode/releases/download/v1.4.1/GameMode-Setup-1.4.1.exe`).
+- **Bản mới nhất: v1.5.0** trên kênh OTA thật và GitHub Release. Tải trực tiếp:
+  `https://update-dhcs.paroda.net/apps/gamemode/releases/GameMode-Setup-1.5.0.exe`
+  (hoặc `https://github.com/thongkvq/gamemode/releases/download/v1.5.0/GameMode-Setup-1.5.0.exe`).
   **Laptop đã cài 1.3.3 (2026-10-22, qua SSH)** vào `%LOCALAPPDATA%\Programs\GameMode` (trước đó chạy bản 1.1.0 portable ở `C:\Users\thong\GameMode`, thư mục cũ còn nguyên, shortcut cũ dời vào `old-shortcuts\`). Đã chép `gamemode.cfg` + `session.last.json` sang; task "GameMode" trỏ exe mới, thêm `Delay PT2M30S` ở LogonTrigger để né lỗi dưới. Từ đây các bản sau đến qua OTA.
 - **Đã sửa ở 1.3.4** (2026-10-22): crash khi mở trong ~2 phút đầu sau khi bật máy — `Instant::now() - X` (watcher và nút task trong `src/main.rs`) panic khi uptime < X; giờ dùng `checked_sub(..).unwrap_or_else(Instant::now)`. 1.3.4 build trên laptop (PC tắt) từ `main` + commit `8f3efbe` (đã push lên `main`, tag `v1.3.4` + GitHub Release kèm bộ cài), publish OTA thật lúc 18:31. Laptop đã lên 1.3.4.
 - **Config laptop**: từng có `game:msedgewebview2.exe=1` khiến auto mode Boost ngay khi mở (WebView2 luôn chạy). Đã bỏ dòng đó (bản cũ: `gamemode.cfg.bak-20261022`). Báo cáo `20261022-175503` là trận giả do lỗi này.
@@ -63,6 +103,10 @@ cargo build --release
 | `--reporttest` | Chạy recorder giả lập 20 giây (mẫu mỗi 2 giây, không cần game, cho phép trận < 60 s) và lưu một báo cáo `game = "test"` | `reporttest.txt` |
 | `--updatetest` | Kiểm tra manifest cập nhật; nếu có bản mới thì tải và kiểm SHA-256 (KHÔNG chạy bộ cài) | `updatetest.txt` |
 | `--fpstest [giây]` | Đo FPS / frametime của game (theo danh sách game trong config) đang chạy, mặc định 10 giây | `fpstest.txt` |
+| `--hwinfo` | Đọc phần cứng (WMI/PowerShell, chỉ đọc): dòng tóm tắt, từng gợi ý, rồi JSON thô. Exit 0 = đọc được, 1 = lỗi | `hwinfo.txt` |
+| `--tweakstatus` | Trạng thái từng tinh chỉnh Windows, mỗi dòng `id \| group \| risk \| state \| có backup`. Exit 1 nếu không đọc được trạng thái nào | `wintweaks-status.txt` |
+| `--tweakapply <id>` | Bật MỘT tinh chỉnh (cùng hàm + cùng file sao lưu như UI; in trạng thái trước/sau). Exit 0/1 | `wintweaks-result.txt` |
+| `--tweakrevert <id>` | Hoàn tác MỘT tinh chỉnh về giá trị gốc (cùng hàm như UI). Exit 0/1 | `wintweaks-result.txt` |
 | `--minimized` | Khởi động **ẩn xuống khay hệ thống** (task chạy cùng Windows dùng cờ này) | |
 
 ## Báo cáo trận đấu (2026-10-22)
@@ -92,7 +136,9 @@ cargo build --release
 - `src/tray.rs`: icon khay + menu chuột phải, thread nhận sự kiện menu/click (chạy được khi cửa sổ đã ẩn).
 - `src/startup.rs`: mục khởi động cùng Windows (`list_startup`, `set_enabled`, `StartupEntry`, `StartupLocation`) — đọc `Run` HKCU/HKLM/WOW6432Node + 2 thư mục Startup, bật/tắt bằng cờ `StartupApproved` giống Task Manager (không xoá mục). File `.lnk` trong thư mục Startup được đọc đích thật bằng `IShellLinkW`/`IPersistFile` (`CoInitializeEx` trên thread gọi, `CoUninitialize` sau); lỗi thì `command` = đường dẫn `.lnk`, `exe_path` = `None`.
 - `src/hotkey.rs`: phím tắt toàn cục (`Hotkey::parse/display`, `HotkeyAction`, `HotkeyService::start/rebind/errors`, `default_bindings`) — thread message loop riêng + `RegisterHotKey(null, …)` như `tray.rs`, vì `update()` không chạy khi cửa sổ ẩn.
-- `src/ui.rs`: bảng màu và widget dùng chung (`card`, `section_header`, `toggle_row` có switch, `ghost_button`, `primary_button`, `callout_warning`).
+- `src/ui.rs`: bảng màu và widget dùng chung (`card`, `section_header`, `toggle_row` có switch, `ghost_button`, `primary_button`, `callout_warning`, `badge` cho nhãn nhỏ, `dot` cho chấm màu).
+- `src/wintweaks.rs`: tinh chỉnh Windows lâu dài (`all_tweaks`, `Tweak`, `Group`, `Risk`, `state`, `apply`, `revert`, `Backup::load/save`, `summary`, `recommended_ids`) — mọi thay đổi đều sao lưu giá trị gốc và hoàn tác được; phần đụng registry/powercfg/bcdedit/PowerShell nằm sau `#[cfg(windows)]`, phần thuần có unit test chạy trên Linux.
+- `src/hwinfo.rs`: chẩn đoán phần cứng (`collect`, `parse`, `advice`, `summary_line`, `Advice`, `Level`) — một script PowerShell trả JSON, luật gợi ý (kênh RAM, sai tên driver NVIDIA, tuổi driver, ổ C, tần số màn hình, pin…) xếp Warn → Info → Good.
 
 ## Đã xong
 - **Khởi động cùng Windows (task-22, 26)**: tab **🚀 Khởi động** ở cột phải liệt kê mọi mục Run/Startup (tên đậm, nơi lưu, command rút gọn + tooltip đầy đủ) kèm switch bật/tắt; đọc ở thread nền khi mở tab lần đầu và khi bấm *Làm mới*; dòng đếm "N mục, M đang bật"; mục trỏ đúng exe GameMode đang chạy bị **khoá switch** (tắt nó là tự tắt app — việc chạy cùng Windows do task lo).
@@ -137,7 +183,7 @@ App đòi quyền admin nên shell thường không chụp được cửa sổ. 
 ## Bộ cài (Inno Setup)
 - Cài Inno Setup 6: `winget install JRSoftware.InnoSetup --scope user`.
 - Build: `cargo build --release`, rồi `"%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" installer\gamemode.iss`, ra file `dist\GameMode-Setup-<version>.exe` (thư mục `dist/` không đưa lên git).
-- Version (hiện 1.4.1) phải sửa ở 2 chỗ: `Cargo.toml` và `#define AppVersion` trong `installer/gamemode.iss`.
+- Version (hiện 1.5.0) phải sửa ở 2 chỗ: `Cargo.toml` và `#define AppVersion` trong `installer/gamemode.iss`.
 - Bộ cài cài theo từng user vào `%LOCALAPPDATA%\Programs\GameMode`, không cần admin khi cài. Gỡ cài đặt sẽ xoá config/session và task "chạy cùng Windows".
 - Exe chưa ký số nên lần đầu chạy sẽ bị SmartScreen cảnh báo.
 - Bộ cài có nhánh cập nhật OTA: chạy kèm `/UPDATE` thì `[Code] IsUpdateRun` bật entry `[Run]`

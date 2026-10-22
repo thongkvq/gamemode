@@ -10,6 +10,9 @@
 //!   một PID chính là frametime.
 //! - Đã kiểm chứng trên máy thật: Delta Force (DX12) phát 1177 event trong 6,16 s
 //!   ⇒ 191 FPS. Phải bật provider bằng level 5 + MatchAnyKeyword `0xFFFF...` mới có 178.
+//! - Event **180** = `IDXGISwapChain1_Present1` (task 81): cũng Delta Force nhưng trên laptop
+//!   Optimus thì CHỈ phát 180 (~30 FPS ở sảnh, không có 178 nào) — 1.3.3–1.4.1 vì chỉ đếm 178
+//!   nên báo cáo không có FPS. Giờ đếm cả hai; PID đã phát 180 thì bỏ 178 để khỏi đếm đôi.
 //!
 //! Lọc PID ngay trong callback (không đặt filter phía kernel): lưu lượng DXGI của cả
 //! máy chỉ vài nghìn event/giây, rẻ hơn nhiều so với dựng filter phức tạp.
@@ -18,7 +21,7 @@
 //! frametime và trên histogram, không đụng ETW — nhờ vậy test được trên Linux.
 //! Phần gọi API Windows nằm trong `mod win` với `#[cfg(windows)]`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Mutex, OnceLock};
 
 /// Trần frametime (ms): khoảng dài hơn mức này là game bị alt-tab/treo, không phải
@@ -76,8 +79,11 @@ struct State {
     /// Nhiều PID vì có game/app vẽ hình từ tiến trình con (vd tiến trình GPU của Chromium),
     /// chỉ tiến trình thật sự gọi Present mới phát event 178.
     pids: Vec<u32>,
-    /// Timestamp QPC của event 178 trước đó, theo từng PID.
-    last_ts: HashMap<u32, i64>,
+    /// Timestamp QPC của event Present trước đó, theo (PID, ID event).
+    last_ts: HashMap<(u32, u16), i64>,
+    /// PID đã từng phát event 180 (`Present1`): từ đó chỉ đếm 180, bỏ 178 của PID đó để một
+    /// frame không bị đếm hai lần nếu runtime phát cả hai.
+    present1: HashSet<u32>,
     /// Frametime (ms) gom được kể từ lần `take_window` trước.
     window: VecDeque<f32>,
     /// Histogram frametime cả trận (bước 0,1 ms).
@@ -139,14 +145,33 @@ fn set_pids(pids: &[u32]) {
     let mut st = lock_state();
     if st.pids != pids {
         st.last_ts.clear();
+        st.present1.clear();
         st.pids = pids.to_vec();
     }
 }
 
-/// Lấy timestamp thô của event 178 trước đó (nếu cùng PID) rồi lưu timestamp mới.
-/// Frame đầu tiên sau khi biết/đổi PID chưa có mốc để trừ (trả `None`).
-fn take_prev_ts(pid: u32, ts: i64) -> Option<i64> {
-    lock_state().last_ts.insert(pid, ts)
+/// `IDXGISwapChain_Present` (task 80, opcode start).
+const EVT_PRESENT: u16 = 178;
+/// `IDXGISwapChain1_Present1` (task 81, opcode start). Delta Force trên laptop (Optimus,
+/// DX12) chỉ phát event này, không có 178 — đo trên máy thật 2026-10-22.
+const EVT_PRESENT1: u16 = 180;
+
+/// Event Present có được dùng để đếm frame không.
+fn is_present_event(id: u16) -> bool {
+    id == EVT_PRESENT || id == EVT_PRESENT1
+}
+
+/// Lấy timestamp thô của event Present trước đó (cùng PID, cùng ID event) rồi lưu mốc mới.
+/// Frame đầu tiên sau khi biết/đổi PID chưa có mốc để trừ (trả `None`); event 178 của PID
+/// đã phát 180 bị bỏ qua (trả `None`).
+fn take_prev_ts(pid: u32, id: u16, ts: i64) -> Option<i64> {
+    let mut st = lock_state();
+    if id == EVT_PRESENT1 {
+        st.present1.insert(pid);
+    } else if st.present1.contains(&pid) {
+        return None;
+    }
+    st.last_ts.insert((pid, id), ts)
 }
 
 // ---------------------------------------------------------------------------
@@ -410,12 +435,10 @@ mod win {
     };
     use windows_sys::Win32::System::Performance::QueryPerformanceFrequency;
 
-    use super::{record_frame_ms, take_prev_ts, FpsMeter};
+    use super::{is_present_event, record_frame_ms, take_prev_ts, FpsMeter};
 
     /// Provider `Microsoft-Windows-DXGI` (event 178 = IDXGISwapChain_Present).
     const DXGI_PROVIDER: GUID = GUID::from_u128(0xCA11C036_0102_4A2D_A6AD_F03CFED5D3C9);
-    /// ID của `IDXGISwapChain_Present` (task 80, opcode start).
-    const EVT_PRESENT: u16 = 178;
     /// Handle rỗng: `ControlTraceW` hiểu handle 0 là "dừng theo tên session".
     const CONTROL_NONE: CONTROLTRACE_HANDLE = CONTROLTRACE_HANDLE { Value: 0 };
     /// Timeout của `EnableTraceEx2` (0 = không chờ thêm).
@@ -723,8 +746,9 @@ mod win {
             return;
         }
         let header = &(*record).EventHeader;
-        // Chỉ event 178 (IDXGISwapChain_Present) của provider DXGI.
-        if !same_guid(&header.ProviderId, &DXGI_PROVIDER) || header.EventDescriptor.Id != EVT_PRESENT
+        // Chỉ event Present (178) / Present1 (180) của provider DXGI.
+        if !same_guid(&header.ProviderId, &DXGI_PROVIDER)
+            || !is_present_event(header.EventDescriptor.Id)
         {
             return;
         }
@@ -738,7 +762,7 @@ mod win {
         }
         let ts = header.TimeStamp;
         // Frame đầu sau khi biết/đổi PID chưa có mốc để trừ.
-        let Some(prev) = take_prev_ts(pid, ts) else {
+        let Some(prev) = take_prev_ts(pid, header.EventDescriptor.Id, ts) else {
             return;
         };
         let freq = qpc_freq();
@@ -782,6 +806,13 @@ mod win {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dem_ca_present_va_present1() {
+        assert!(is_present_event(178));
+        assert!(is_present_event(180));
+        assert!(!is_present_event(196), "196 là event của dwm, không phải frame của game");
+    }
 
     /// 100 frame 10 ms ⇒ 100 FPS, 1% low cũng 100, không giật.
     #[test]

@@ -12,3 +12,8 @@ update-pending.json
 reports/
 /dist
 fpstest.txt
+# Tinh chỉnh Windows: bản sao lưu giá trị gốc nằm cạnh exe (giữ lại khi gỡ app).
+wintweaks-backup.json
+hwinfo.txt
+wintweaks-status.txt
+wintweaks-result.txt

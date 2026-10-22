@@ -2,12 +2,14 @@
 
 mod fps;
 mod hotkey;
+mod hwinfo;
 mod report;
 mod startup;
 mod sys;
 mod tray;
 mod ui;
 mod update;
+mod wintweaks;
 
 use eframe::egui::{self, Color32, FontId, Margin, Rect, RichText, Rounding, Stroke, pos2, vec2};
 use egui_plot::{GridInput, GridMark, HLine, Line, LineStyle, MarkerShape, Plot, PlotPoints, Points, VLine};
@@ -544,6 +546,30 @@ fn config_path() -> PathBuf {
 /// Session khôi phục nằm cạnh file config.
 fn session_path() -> PathBuf {
     config_path().with_file_name("session.json")
+}
+
+/// File sao lưu giá trị gốc của tinh chỉnh Windows — cạnh exe, cùng thư mục `config_path()`.
+/// KHÔNG xoá khi gỡ app (xem NOTES): cài lại vẫn còn để hoàn tác.
+fn wintweaks_backup_path() -> PathBuf {
+    config_path().with_file_name(wintweaks::FILE_NAME)
+}
+
+/// Thư mục cha của mọi đường dẫn `gamepath:` trong config (bỏ trùng, sắp xếp).
+/// Dùng cho tinh chỉnh `defender_games` (thêm thư mục game vào loại trừ Defender).
+fn game_dirs_from_paths(paths: &HashMap<String, String>) -> Vec<String> {
+    let mut dirs: Vec<String> = paths
+        .values()
+        .filter_map(|p| {
+            std::path::Path::new(p)
+                .parent()
+                .map(|d| d.display().to_string())
+        })
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty())
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    dirs
 }
 
 /// App mặc định giữ lại theo tên exe (viết thường).
@@ -1555,6 +1581,7 @@ enum ConfigTab {
     Services,
     Startup,
     AutoOpt,
+    WinOpt,
     Reports,
 }
 
@@ -3016,6 +3043,161 @@ fn start_watcher(sh: Shared) {
 /// Cờ `--minimized`: vào thẳng khay hệ thống (cửa sổ ẩn) thay vì thu xuống taskbar.
 static START_HIDDEN: AtomicBool = AtomicBool::new(false);
 
+/// Việc chạy ở thread nền cho tab "Tối ưu Win" (đọc trạng thái tốn `powercfg`/`bcdedit`/PowerShell).
+#[derive(Clone)]
+enum TweakJob {
+    /// Chỉ đọc lại trạng thái của mọi tinh chỉnh (mở tab lần đầu / Làm mới / sau khi bật-hoàn tác).
+    Refresh,
+    /// Bật các tinh chỉnh theo chỉ số trong `App::tweaks` (tuần tự).
+    Apply(Vec<usize>),
+    /// Hoàn tác các tinh chỉnh theo chỉ số (tuần tự).
+    Revert(Vec<usize>),
+}
+
+/// Kết quả một việc của tab "Tối ưu Win" gửi từ thread nền về UI.
+struct TweakOutcome {
+    job: TweakJob,
+    /// Dòng nhật ký (nội dung, màu) để đưa vào log của app.
+    lines: Vec<(String, Color32)>,
+    /// Trạng thái đọc lại của mọi tinh chỉnh (đúng thứ tự `App::tweaks`).
+    states: Vec<wintweaks::TweakState>,
+    /// Bản sao lưu sau thao tác (đã ghi ra file).
+    backup: wintweaks::Backup,
+    /// Tiêu đề các tinh chỉnh cần khởi động lại vừa bị đổi trong lần này.
+    reboot: Vec<String>,
+    /// Lỗi khi ghi file sao lưu (nếu có).
+    save_err: Option<String>,
+}
+
+/// Thời gian chờ bấm lần thứ hai của nút cần xác nhận (gói khuyến nghị / hoàn tác tất cả / Bật
+/// một tinh chỉnh rủi ro "Nâng cao").
+const CONFIRM_WINDOW: Duration = Duration::from_secs(4);
+
+/// Thứ tự nhóm tinh chỉnh trên tab "Tối ưu Win".
+const TWEAK_GROUPS: [wintweaks::Group; 4] = [
+    wintweaks::Group::Game,
+    wintweaks::Group::Background,
+    wintweaks::Group::Memory,
+    wintweaks::Group::System,
+];
+
+/// Vạch ngăn mờ giữa hai hàng tinh chỉnh.
+fn hairline(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), egui::Sense::hover());
+    ui.painter().rect_filled(rect, Rounding::ZERO, ui::GRID);
+}
+
+/// Mô tả một thao tác của tinh chỉnh để hiện trong tooltip (service kèm kiểu khởi động mới).
+fn action_desc(a: &wintweaks::Action) -> String {
+    match a {
+        wintweaks::Action::ServiceStart { name, start } => {
+            format!("service {} → {}", name, start.label())
+        }
+        _ => a.target(),
+    }
+}
+
+/// Tooltip của tiêu đề một hàng tinh chỉnh: nhóm · rủi ro · khởi động lại, rồi từng thao tác.
+fn tweak_tooltip(t: &wintweaks::Tweak) -> String {
+    let actions: Vec<String> = t.actions().iter().map(action_desc).collect();
+    format!(
+        "{}\n{} thao tác:\n{}",
+        t.subtitle(),
+        t.action_count(),
+        actions.join("\n")
+    )
+}
+
+/// Một hàng tinh chỉnh: tiêu đề + badge rủi ro (+ khởi động lại / có sao lưu) + mô tả + trạng
+/// thái, bên phải là nút **Bật** (khi chưa bật) và **Hoàn tác** (khi có trong bản sao lưu).
+/// Trả về `(bấm Bật, bấm Hoàn tác)` để nơi gọi quyết định (xác nhận 2 lần / chạy thread nền).
+fn tweak_row_ui(
+    ui: &mut egui::Ui,
+    t: &wintweaks::Tweak,
+    state: &wintweaks::TweakState,
+    in_backup: bool,
+    busy: bool,
+    confirming: bool,
+) -> (bool, bool) {
+    let (state_text, state_color, why) = match state {
+        wintweaks::TweakState::Applied => ("Đang bật", ui::SUCCESS, None),
+        wintweaks::TweakState::NotApplied => ("Chưa bật", ui::TEXT_MUTED, None),
+        wintweaks::TweakState::Partial => ("Một phần", ui::WARNING, None),
+        wintweaks::TweakState::Unknown(why) => ("Không rõ", ui::TEXT_DIM, Some(why.clone())),
+    };
+    let applied = state.is_applied();
+    let mut click_on = false;
+    let mut click_off = false;
+
+    ui.horizontal(|ui| {
+        // Chừa chỗ cho hai nút bên phải để chữ mô tả không bị đè (nút xác nhận dài hơn nút "Bật").
+        let text_w = (ui.available_width() - 240.0).max(140.0);
+        ui.vertical(|ui| {
+            ui.set_max_width(text_w);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.label(
+                    RichText::new(t.title)
+                        .size(11.5)
+                        .strong()
+                        .color(ui::TEXT_MAIN),
+                )
+                .on_hover_text(tweak_tooltip(t));
+                let risk_color = match t.risk {
+                    wintweaks::Risk::Safe => ui::SUCCESS,
+                    wintweaks::Risk::Consider => ui::WARNING,
+                    wintweaks::Risk::Advanced => ui::DANGER,
+                };
+                ui::badge(ui, t.risk.label(), risk_color);
+                if t.needs_reboot {
+                    ui::badge(ui, "Khởi động lại", ui::ACCENT);
+                }
+                if in_backup {
+                    ui::badge(ui, "có sao lưu", ui::DATA_CYAN);
+                }
+            });
+            ui.label(RichText::new(t.desc).size(10.5).color(ui::TEXT_MUTED));
+            ui.horizontal(|ui| {
+                ui::dot(ui, state_color);
+                let resp = ui.label(
+                    RichText::new(state_text)
+                        .size(10.5)
+                        .strong()
+                        .color(state_color),
+                );
+                if let Some(w) = why {
+                    resp.on_hover_text(w);
+                }
+            });
+        });
+
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            if ui
+                .add_enabled(
+                    !busy && !applied,
+                    ui::primary_button_sized(
+                        if confirming { "Bấm lại để xác nhận" } else { "Bật" },
+                        11.0,
+                    ),
+                )
+                .clicked()
+            {
+                click_on = true;
+            }
+            if in_backup
+                && ui
+                    .add_enabled(!busy, ui::ghost_button_sized("Hoàn tác", 11.0))
+                    .clicked()
+            {
+                click_off = true;
+            }
+        });
+    });
+
+    (click_on, click_off)
+}
+
 struct App {
     sh: Shared,
     tab: ConfigTab,
@@ -3080,6 +3262,42 @@ struct App {
     startup_row_err: HashMap<String, String>,
     /// Lỗi chung khi đọc danh sách mục khởi động.
     startup_err: Option<String>,
+    /// Số liệu phần cứng đọc ở thread nền (`hwinfo::collect`, chặn vài giây vì WMI).
+    hw_info: Option<hwinfo::HwInfo>,
+    /// Kết quả thread nền (`None` = chưa xong); `update()` lấy ra tính `summary_line` + `advice`.
+    hw_slot: Arc<Mutex<Option<Result<hwinfo::HwInfo, String>>>>,
+    hw_busy: Arc<AtomicBool>,
+    /// Đã quét phần cứng lần nào chưa (mở tab lần đầu tự quét).
+    hw_loaded: bool,
+    /// Gợi ý đã tính sẵn từ `hw_info` (tính lại khi quét xong).
+    hw_advice: Vec<hwinfo::Advice>,
+    /// Dòng tóm tắt phần cứng (`hwinfo::summary_line`).
+    hw_summary: String,
+    /// Lỗi quét phần cứng, hiện đỏ trong card "Phần cứng".
+    hw_err: Option<String>,
+    /// Danh sách tinh chỉnh Windows (`wintweaks::all_tweaks`), dựng một lần khi mở tab lần đầu.
+    tweaks: Vec<wintweaks::Tweak>,
+    /// Trạng thái hiện tại của từng tinh chỉnh (đúng thứ tự `tweaks`; đọc ở thread nền).
+    tweak_states: Vec<wintweaks::TweakState>,
+    /// `None` = chưa có việc nào xong; `Some` = kết quả một việc bật/hoàn tác/đọc lại.
+    tweak_slot: Arc<Mutex<Option<TweakOutcome>>>,
+    /// Có việc đang chạy ở thread nền (khoá mọi nút của tab khi bật).
+    tweak_busy: Arc<AtomicBool>,
+    /// Đã dựng danh sách tinh chỉnh + đọc trạng thái lần nào chưa.
+    tweak_loaded: bool,
+    /// Bản sao lưu giá trị gốc (`wintweaks-backup.json`) — nguồn sự thật cho nút Hoàn tác.
+    tweak_backup: wintweaks::Backup,
+    /// Đã đọc file sao lưu từ đĩa lần nào chưa.
+    tweak_backup_loaded: bool,
+    /// Lỗi ghi file sao lưu / lỗi chung của card tinh chỉnh.
+    tweak_err: Option<String>,
+    /// Tinh chỉnh cần khởi động lại đã bị đổi trong lần mở này (hiện callout vàng).
+    reboot_pending: Vec<String>,
+    /// Lần bấm đầu của nút "Áp dụng gói khuyến nghị" / "Hoàn tác tất cả" (bấm 2 lần, tự huỷ 4 giây).
+    confirm_apply_all: Option<Instant>,
+    confirm_revert_all: Option<Instant>,
+    /// Lần bấm đầu của nút "Bật" ở hàng rủi ro `Advanced`: (id tinh chỉnh, lúc bấm).
+    confirm_row: Option<(String, Instant)>,
     /// `egui::Context` giữ lại để tạo dịch vụ phím tắt sau này (khi bật lại từ UI).
     ctx: egui::Context,
 }
@@ -3270,6 +3488,25 @@ impl App {
             startup_loaded: false,
             startup_row_err: HashMap::new(),
             startup_err: None,
+            hw_slot: Arc::new(Mutex::new(None)),
+            hw_busy: Arc::new(AtomicBool::new(false)),
+            hw_loaded: false,
+            hw_info: None,
+            hw_advice: Vec::new(),
+            hw_summary: String::new(),
+            hw_err: None,
+            tweaks: Vec::new(),
+            tweak_states: Vec::new(),
+            tweak_slot: Arc::new(Mutex::new(None)),
+            tweak_busy: Arc::new(AtomicBool::new(false)),
+            tweak_loaded: false,
+            tweak_backup: wintweaks::Backup::new(),
+            tweak_backup_loaded: false,
+            tweak_err: None,
+            reboot_pending: Vec::new(),
+            confirm_apply_all: None,
+            confirm_revert_all: None,
+            confirm_row: None,
             ctx: cc.egui_ctx.clone(),
         };
         app.save();
@@ -3354,6 +3591,532 @@ impl App {
         if let Some(list) = done {
             self.startup_view = list;
             self.startup_loaded = true;
+        }
+    }
+
+    // =================================================================================
+    // Tab "Tối ưu Win": card Phần cứng (hwinfo) + card Tinh chỉnh Windows (wintweaks)
+    // =================================================================================
+
+    /// Quét phần cứng ở thread nền (`hwinfo::collect` chặn vài giây vì WMI/PowerShell).
+    fn start_hw_scan(&mut self) {
+        if self.hw_busy.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let slot = self.hw_slot.clone();
+        let busy = self.hw_busy.clone();
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let res = hwinfo::collect();
+            *slot.lock().unwrap() = Some(res);
+            busy.store(false, Ordering::SeqCst);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Lấy kết quả quét phần cứng (gọi mỗi frame): tính sẵn dòng tóm tắt + danh sách gợi ý.
+    fn poll_hw(&mut self) {
+        let done = self.hw_slot.lock().unwrap().take();
+        let Some(res) = done else {
+            return;
+        };
+        self.hw_loaded = true;
+        match res {
+            Ok(info) => {
+                self.hw_summary = hwinfo::summary_line(&info);
+                self.hw_advice = hwinfo::advice(&info);
+                self.hw_info = Some(info);
+                self.hw_err = None;
+            }
+            Err(e) => {
+                self.hw_advice.clear();
+                self.hw_summary.clear();
+                self.hw_info = None;
+                self.hw_err = Some(e);
+            }
+        }
+    }
+
+    /// Dựng danh sách tinh chỉnh (một lần cho mỗi lần mở app) + đọc file sao lưu, rồi đọc
+    /// trạng thái ở thread nền. `game_dirs` lấy từ `gamepath:` của config.
+    fn ensure_tweaks(&mut self) {
+        if self.tweaks.is_empty() {
+            let dirs = game_dirs_from_paths(&self.sh.game_paths.lock().unwrap());
+            self.tweaks = wintweaks::all_tweaks(&dirs);
+            self.tweak_states = vec![
+                wintweaks::TweakState::Unknown("Đang đọc trạng thái…".to_string());
+                self.tweaks.len()
+            ];
+        }
+        if !self.tweak_backup_loaded {
+            self.tweak_backup = wintweaks::Backup::load(&wintweaks_backup_path());
+            self.tweak_backup_loaded = true;
+        }
+        if !self.tweak_loaded {
+            self.start_tweak_job(TweakJob::Refresh);
+        }
+    }
+
+    /// Chạy một việc của tab Tối ưu Win ở thread nền (bật / hoàn tác / đọc lại trạng thái).
+    /// Mọi thao tác làm TUẦN TỰ và lưu file sao lưu ngay sau mỗi tinh chỉnh.
+    fn start_tweak_job(&mut self, job: TweakJob) {
+        if self.tweak_busy.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let tweaks = self.tweaks.clone();
+        let mut backup = self.tweak_backup.clone();
+        let path = wintweaks_backup_path();
+        let slot = self.tweak_slot.clone();
+        let busy = self.tweak_busy.clone();
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let mut lines: Vec<(String, Color32)> = Vec::new();
+            let mut reboot: Vec<String> = Vec::new();
+            let mut save_err: Option<String> = None;
+            let note_save = |backup: &wintweaks::Backup, save_err: &mut Option<String>, lines: &mut Vec<(String, Color32)>| {
+                if let Err(e) = backup.save(&path) {
+                    lines.push((format!("  ⚠ [WIN] Không ghi được bản sao lưu: {}", e), ui::DANGER));
+                    *save_err = Some(e);
+                }
+            };
+
+            match &job {
+                TweakJob::Apply(ids) => {
+                    for i in ids {
+                        let Some(t) = tweaks.get(*i) else { continue };
+                        match wintweaks::apply(t, &mut backup) {
+                            Ok(()) => {
+                                lines.push((format!("  ✔ [WIN] Đã bật: {}", t.title), ui::SUCCESS));
+                                if t.needs_reboot && !reboot.contains(&t.title.to_string()) {
+                                    reboot.push(t.title.to_string());
+                                }
+                                note_save(&backup, &mut save_err, &mut lines);
+                            }
+                            Err(e) => lines.push((
+                                format!("  ⚠ [WIN] {}: {}", t.title, e),
+                                ui::DANGER,
+                            )),
+                        }
+                    }
+                }
+                TweakJob::Revert(ids) => {
+                    for i in ids {
+                        let Some(t) = tweaks.get(*i) else { continue };
+                        if !backup.has(t.id) {
+                            continue;
+                        }
+                        match wintweaks::revert(t, &mut backup) {
+                            Ok(()) => {
+                                lines.push((
+                                    format!("  ↺ [WIN] Đã hoàn tác: {}", t.title),
+                                    ui::WARNING,
+                                ));
+                                if t.needs_reboot && !reboot.contains(&t.title.to_string()) {
+                                    reboot.push(t.title.to_string());
+                                }
+                                note_save(&backup, &mut save_err, &mut lines);
+                            }
+                            Err(e) => lines.push((
+                                format!("  ⚠ [WIN] {}: {}", t.title, e),
+                                ui::DANGER,
+                            )),
+                        }
+                    }
+                }
+                TweakJob::Refresh => {}
+            }
+
+            let states: Vec<wintweaks::TweakState> =
+                tweaks.iter().map(wintweaks::state).collect();
+            *slot.lock().unwrap() = Some(TweakOutcome {
+                job,
+                lines,
+                states,
+                backup,
+                reboot,
+                save_err,
+            });
+            busy.store(false, Ordering::SeqCst);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Lấy kết quả việc chạy xong ở thread nền (gọi mỗi frame): trạng thái mới + log + sao lưu.
+    fn poll_tweaks(&mut self) {
+        let done = self.tweak_slot.lock().unwrap().take();
+        let Some(o) = done else {
+            return;
+        };
+        self.tweak_states = o.states;
+        self.tweak_backup = o.backup;
+        self.tweak_loaded = true;
+        // Thông báo lỗi ghi sao lưu chỉ được thay khi việc vừa xong là bật/hoàn tác;
+        // lần đọc lại trạng thái (Refresh) không xoá thông báo cũ.
+        if matches!(o.job, TweakJob::Apply(_) | TweakJob::Revert(_)) {
+            self.tweak_err = o.save_err.map(|e| {
+                format!(
+                    "Không ghi được bản sao lưu {}: {}",
+                    wintweaks_backup_path().display(),
+                    e
+                )
+            });
+        }
+        for (text, color) in o.lines {
+            self.sh.log(text, color);
+        }
+        for title in o.reboot {
+            if !self.reboot_pending.contains(&title) {
+                self.reboot_pending.push(title);
+            }
+        }
+    }
+
+    /// Tab "🔧 Tối ưu Win": card Phần cứng trên cùng, card Tinh chỉnh Windows bên dưới.
+    fn render_winopt_tab(&mut self, ui: &mut egui::Ui) {
+        // Bề rộng lấy TRƯỚC khi vẽ: card full width trong ScrollArea không được lấn mép phải.
+        let full_w = ui.available_width();
+        egui::ScrollArea::vertical()
+            .id_salt("winopt_scroll_area")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.allocate_ui_with_layout(
+                    vec2(full_w, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_max_width(full_w);
+                        self.render_hw_card(ui);
+                        ui.add_space(ui::SPACE_CARD_GAP);
+                        self.render_tweaks_card(ui);
+                    },
+                );
+            });
+    }
+
+    /// Card "Phần cứng": dòng tóm tắt + gợi ý (chấm màu theo mức) + nút Quét lại.
+    fn render_hw_card(&mut self, ui: &mut egui::Ui) {
+        let loading = self.hw_busy.load(Ordering::SeqCst);
+        let mut rescan = false;
+
+        ui::card(ui, |ui| {
+            ui::section_header(
+                ui,
+                "PC",
+                "Phần cứng",
+                Some("Chỉ đọc — không thay đổi gì trên máy"),
+            );
+            ui.add_space(ui::SPACE_HEADER_GAP);
+
+            if let Some(err) = self.hw_err.clone() {
+                ui.label(
+                    RichText::new(format!("⚠ {}", err))
+                        .size(11.0)
+                        .color(ui::DANGER),
+                );
+                ui.add_space(6.0);
+            }
+
+            match self.hw_info.as_ref() {
+                None => {
+                    ui.label(
+                        RichText::new(if loading {
+                            "Đang đọc thông tin phần cứng…"
+                        } else {
+                            "Chưa có số liệu phần cứng."
+                        })
+                        .size(11.5)
+                        .color(ui::TEXT_MUTED),
+                    );
+                }
+                Some(_) => {
+                    if !self.hw_summary.is_empty() {
+                        ui.label(
+                            RichText::new(&self.hw_summary)
+                                .size(11.5)
+                                .strong()
+                                .color(ui::TEXT_MAIN),
+                        );
+                        ui.add_space(8.0);
+                    }
+                    if self.hw_advice.is_empty() {
+                        ui.label(
+                            RichText::new("Không có gì đáng lưu ý về phần cứng.")
+                                .size(11.0)
+                                .color(ui::TEXT_MUTED),
+                        );
+                    }
+                    for a in self.hw_advice.iter() {
+                        let color = match a.level {
+                            hwinfo::Level::Good => ui::SUCCESS,
+                            hwinfo::Level::Info => ui::ACCENT,
+                            hwinfo::Level::Warn => ui::WARNING,
+                        };
+                        ui.horizontal(|ui| {
+                            ui::dot(ui, color);
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    RichText::new(&a.title)
+                                        .size(11.5)
+                                        .strong()
+                                        .color(ui::TEXT_MAIN),
+                                );
+                                ui.label(
+                                    RichText::new(&a.detail).size(10.5).color(ui::TEXT_MUTED),
+                                );
+                            });
+                        });
+                        ui.add_space(5.0);
+                    }
+                }
+            }
+
+            ui.add_space(4.0);
+            if ui
+                .add_enabled(!loading, ui::ghost_button_sized("🔄 Quét lại", 11.0))
+                .clicked()
+            {
+                rescan = true;
+            }
+            if loading {
+                ui.label(
+                    RichText::new("Đang đọc…")
+                        .size(10.0)
+                        .color(ui::TEXT_DIM),
+                );
+            }
+        });
+
+        if rescan {
+            self.start_hw_scan();
+        }
+    }
+
+    /// Card "Tinh chỉnh Windows": hai nút gói (bấm 2 lần để xác nhận) rồi từng nhóm tinh chỉnh.
+    fn render_tweaks_card(&mut self, ui: &mut egui::Ui) {
+        let busy = self.tweak_busy.load(Ordering::SeqCst);
+        let now = Instant::now();
+
+        // Xác nhận 2 lần tự huỷ sau 4 giây.
+        if self
+            .confirm_apply_all
+            .is_some_and(|t| now.duration_since(t) > CONFIRM_WINDOW)
+        {
+            self.confirm_apply_all = None;
+        }
+        if self
+            .confirm_revert_all
+            .is_some_and(|t| now.duration_since(t) > CONFIRM_WINDOW)
+        {
+            self.confirm_revert_all = None;
+        }
+        if self
+            .confirm_row
+            .as_ref()
+            .is_some_and(|(_, t)| now.duration_since(*t) > CONFIRM_WINDOW)
+        {
+            self.confirm_row = None;
+        }
+
+        let total = self.tweaks.len();
+        let (applied, _) = wintweaks::summary(&self.tweaks, &self.tweak_states);
+        let rec_ids = wintweaks::recommended_ids(&self.tweaks);
+        let recommended: Vec<usize> = self
+            .tweaks
+            .iter()
+            .enumerate()
+            .filter(|(i, t)| {
+                rec_ids.contains(&t.id)
+                    && !self
+                        .tweak_states
+                        .get(*i)
+                        .is_some_and(|s| s.is_applied())
+            })
+            .map(|(i, _)| i)
+            .collect();
+        let backed: Vec<usize> = self
+            .tweaks
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| self.tweak_backup.has(t.id))
+            .map(|(i, _)| i)
+            .collect();
+
+        let mut confirm_apply_all = self.confirm_apply_all;
+        let mut confirm_revert_all = self.confirm_revert_all;
+        let mut confirm_row = self.confirm_row.clone();
+        let mut job: Option<TweakJob> = None;
+
+        {
+            let tweaks = &self.tweaks;
+            let states = &self.tweak_states;
+            let backup = &self.tweak_backup;
+            let reboot = &self.reboot_pending;
+            let err = self.tweak_err.clone();
+            let loaded = self.tweak_loaded;
+            let rec_count = recommended.len();
+            let backed_count = backed.len();
+
+            ui::card(ui, |ui| {
+                ui::section_header(
+                    ui,
+                    "WIN",
+                    "Tinh chỉnh Windows",
+                    Some("Đổi Windows lâu dài (không chỉ lúc chơi). Mọi thay đổi được sao lưu và hoàn tác được."),
+                );
+                ui.add_space(ui::SPACE_HEADER_GAP);
+
+                if !reboot.is_empty() {
+                    ui::callout_warning(
+                        ui,
+                        &format!(
+                            "Cần khởi động lại máy để có hiệu lực: {}",
+                            reboot.join(", ")
+                        ),
+                    );
+                    ui.add_space(8.0);
+                }
+
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = ui::SPACE_TOOLBAR_GAP;
+                    ui.label(
+                        RichText::new(if total == 0 {
+                            "Đang dựng danh sách tinh chỉnh…".to_string()
+                        } else {
+                            format!("{}/{} đang bật", applied, total)
+                        })
+                        .size(11.5)
+                        .color(ui::TEXT_MAIN),
+                    );
+                    ui.add_space(ui::SPACE_TOOLBAR_GAP);
+
+                    let apply_label = if confirm_apply_all.is_some() {
+                        "Bấm lại để xác nhận"
+                    } else {
+                        "✨ Áp dụng gói khuyến nghị"
+                    };
+                    if ui
+                        .add_enabled(
+                            !busy && rec_count > 0,
+                            ui::primary_button_sized(apply_label, 11.5),
+                        )
+                        .on_hover_text(format!("{} tinh chỉnh khuyến nghị chưa bật", rec_count))
+                        .clicked()
+                    {
+                        if confirm_apply_all.is_some() {
+                            confirm_apply_all = None;
+                            confirm_row = None;
+                            job = Some(TweakJob::Apply(recommended.clone()));
+                        } else {
+                            confirm_apply_all = Some(Instant::now());
+                        }
+                    }
+
+                    let revert_label = if confirm_revert_all.is_some() {
+                        "Bấm lại để xác nhận"
+                    } else {
+                        "↺ Hoàn tác tất cả"
+                    };
+                    if ui
+                        .add_enabled(
+                            !busy && backed_count > 0,
+                            ui::ghost_button_sized(revert_label, 11.5),
+                        )
+                        .on_hover_text(format!("{} tinh chỉnh đang có bản sao lưu", backed_count))
+                        .clicked()
+                    {
+                        if confirm_revert_all.is_some() {
+                            confirm_revert_all = None;
+                            confirm_row = None;
+                            job = Some(TweakJob::Revert(backed.clone()));
+                        } else {
+                            confirm_revert_all = Some(Instant::now());
+                        }
+                    }
+
+                    if ui
+                        .add_enabled(!busy, ui::ghost_button_sized("🔄 Làm mới", 11.0))
+                        .clicked()
+                    {
+                        job = Some(TweakJob::Refresh);
+                    }
+                });
+
+                if let Some(e) = err.as_ref() {
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(format!("⚠ {}", e))
+                            .size(10.5)
+                            .color(ui::DANGER),
+                    );
+                }
+                if !loaded {
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new("Đang đọc trạng thái (powercfg / bcdedit / PowerShell)…")
+                            .size(10.5)
+                            .color(ui::TEXT_MUTED),
+                    );
+                }
+
+                for (gi, group) in TWEAK_GROUPS.iter().enumerate() {
+                    let rows: Vec<usize> = tweaks
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, t)| t.group == *group)
+                        .map(|(i, _)| i)
+                        .collect();
+                    if rows.is_empty() {
+                        continue;
+                    }
+                    ui.add_space(if gi == 0 { 10.0 } else { 14.0 });
+                    ui.label(
+                        RichText::new(group.label().to_uppercase())
+                            .size(10.5)
+                            .strong()
+                            .extra_letter_spacing(1.0)
+                            .color(ui::ACCENT),
+                    );
+                    ui.add_space(6.0);
+
+                    for i in rows {
+                        let t = &tweaks[i];
+                        let state = states
+                            .get(i)
+                            .cloned()
+                            .unwrap_or_else(|| {
+                                wintweaks::TweakState::Unknown("Chưa đọc được trạng thái".into())
+                            });
+                        let in_backup = backup.has(t.id);
+                        let confirming = confirm_row
+                            .as_ref()
+                            .is_some_and(|(id, _)| id == t.id);
+                        let (click_on, click_off) =
+                            tweak_row_ui(ui, t, &state, in_backup, busy, confirming);
+                        if click_on {
+                            if t.risk == wintweaks::Risk::Advanced && !confirming {
+                                // Tinh chỉnh rủi ro cao: bắt bấm lần thứ hai.
+                                confirm_row = Some((t.id.to_string(), Instant::now()));
+                            } else {
+                                confirm_row = None;
+                                job = Some(TweakJob::Apply(vec![i]));
+                            }
+                        }
+                        if click_off {
+                            confirm_row = None;
+                            job = Some(TweakJob::Revert(vec![i]));
+                        }
+                        ui.add_space(6.0);
+                        hairline(ui);
+                        ui.add_space(6.0);
+                    }
+                }
+            });
+        }
+
+        self.confirm_apply_all = confirm_apply_all;
+        self.confirm_revert_all = confirm_revert_all;
+        self.confirm_row = confirm_row;
+        if let Some(j) = job {
+            self.start_tweak_job(j);
         }
     }
 
@@ -6067,6 +6830,9 @@ impl eframe::App for App {
         }
         // Danh sách mục khởi động đọc ở thread nền: lấy kết quả khi xong.
         self.poll_startup();
+        // Tab "Tối ưu Win": kết quả quét phần cứng và việc bật/hoàn tác chạy ở thread nền.
+        self.poll_hw();
+        self.poll_tweaks();
         // Danh sách trang bộ nhớ (free / standby) — rẻ, chỉ đọc khi thẻ RAM cần hiển thị.
         if self.last_ml.elapsed() > Duration::from_millis(2000) {
             self.mem_lists = sys::memory_lists();
@@ -6458,6 +7224,17 @@ impl eframe::App for App {
                         self.tab = ConfigTab::AutoOpt;
                     }
 
+                    let is_win = self.tab == ConfigTab::WinOpt;
+                    let win_tab_btn = ui::tab_button("🔧 Tối ưu Win", is_win, ui::ACCENT);
+                    if ui.add(win_tab_btn).clicked() {
+                        self.tab = ConfigTab::WinOpt;
+                        // Mở tab lần đầu: quét phần cứng + đọc trạng thái tinh chỉnh (thread nền).
+                        if !self.hw_loaded {
+                            self.start_hw_scan();
+                        }
+                        self.ensure_tweaks();
+                    }
+
                     let is_rep = self.tab == ConfigTab::Reports;
                     let rep_tab_btn = ui::tab_button(
                         "📊 Báo cáo trận",
@@ -6782,6 +7559,9 @@ impl eframe::App for App {
                                 }
                             });
                     }
+                    ConfigTab::WinOpt => {
+                        self.render_winopt_tab(ui);
+                    }
                     ConfigTab::Reports => {
                         self.render_reports_tab(ui);
                     }
@@ -6874,6 +7654,187 @@ fn restore_cli() -> (i32, String) {
     }
     lines.push(String::new());
     (code, lines.join("\n"))
+}
+
+/// Chạy `hwinfo::SCRIPT` bằng PowerShell ẩn cửa sổ và trả NGUYÊN VĂN output
+/// (phần "JSON thô" của `--hwinfo`; `hwinfo::collect` chỉ trả struct đã parse).
+#[cfg(windows)]
+fn hw_script_raw() -> Result<String, String> {
+    use std::os::windows::process::CommandExt;
+
+    let out = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            hwinfo::SCRIPT,
+        ])
+        .creation_flags(0x0800_0000)
+        .output()
+        .map_err(|e| format!("chạy powershell lỗi: {}", e))?;
+    let text = sys::decode_win_output(&out.stdout);
+    if text.trim().is_empty() {
+        let err = sys::decode_win_output(&out.stderr);
+        let err = err.trim();
+        return Err(if err.is_empty() {
+            format!("powershell không trả dữ liệu (mã {})", out.status)
+        } else {
+            format!("powershell lỗi: {}", err)
+        });
+    }
+    Ok(text)
+}
+
+#[cfg(not(windows))]
+fn hw_script_raw() -> Result<String, String> {
+    Err("chỉ đọc được phần cứng trên Windows".to_string())
+}
+
+/// `--hwinfo`: đọc phần cứng (WMI/PowerShell) và ghi `hwinfo.txt`:
+/// dòng tóm tắt, từng gợi ý, rồi JSON thô. Exit code: 0 = đọc được, 1 = lỗi.
+fn hwinfo_cli() -> (i32, String) {
+    let mut lines: Vec<String> = vec![
+        format!("Paroda GameMode --hwinfo | {}", sys::local_time_string()),
+        format!("admin={}", sys::is_admin()),
+    ];
+    let raw = match hw_script_raw() {
+        Ok(raw) => raw,
+        Err(e) => {
+            lines.push(format!("⚠ {}", e));
+            return (1, lines.join("\n"));
+        }
+    };
+    let mut code = 0;
+    match hwinfo::parse(&raw) {
+        Ok(hw) => {
+            lines.push(format!("TÓM TẮT: {}", hwinfo::summary_line(&hw)));
+            lines.push(String::new());
+            let advice = hwinfo::advice(&hw);
+            lines.push(format!("GỢI Ý ({}):", advice.len()));
+            for a in advice {
+                let level = match a.level {
+                    hwinfo::Level::Good => "TỐT",
+                    hwinfo::Level::Info => "TIN",
+                    hwinfo::Level::Warn => "CẢNH BÁO",
+                };
+                lines.push(format!("[{}] {} — {}", level, a.title, a.detail));
+            }
+        }
+        Err(e) => {
+            lines.push(format!("⚠ parse JSON phần cứng lỗi: {}", e));
+            code = 1;
+        }
+    }
+    lines.push(String::new());
+    lines.push("=== JSON THÔ ===".to_string());
+    lines.push(raw);
+    (code, lines.join("\n"))
+}
+
+/// `--tweakstatus`: ghi trạng thái từng tinh chỉnh Windows ra `wintweaks-status.txt`,
+/// mỗi dòng `id | group | risk | state | có backup`.
+/// Exit code: 0 = đọc được ít nhất một trạng thái, 1 = không đọc được cái nào.
+fn tweakstatus_cli() -> (i32, String) {
+    let cfg = load_config();
+    let tweaks = wintweaks::all_tweaks(&game_dirs_from_paths(&cfg.game_paths));
+    let path = wintweaks_backup_path();
+    let backup = wintweaks::Backup::load(&path);
+    let mut lines: Vec<String> = vec![
+        format!("Paroda GameMode --tweakstatus | {}", sys::local_time_string()),
+        format!("admin={}", sys::is_admin()),
+        format!("backup={} ({} mục)", path.display(), backup.ids().len()),
+    ];
+    let mut unknown = 0usize;
+    for t in &tweaks {
+        let st = wintweaks::state(t);
+        let known = !matches!(st, wintweaks::TweakState::Unknown(_));
+        if !known {
+            unknown += 1;
+        }
+        lines.push(format!(
+            "{} | {} | {} | {} | {}",
+            t.id,
+            t.group.label(),
+            t.risk.label(),
+            st.label(),
+            if backup.has(t.id) { "có" } else { "không" }
+        ));
+    }
+    lines.push(format!(
+        "tổng={} đọc_được={} không_rõ={}",
+        tweaks.len(),
+        tweaks.len() - unknown,
+        unknown
+    ));
+    let code = if tweaks.is_empty() || unknown == tweaks.len() {
+        1
+    } else {
+        0
+    };
+    (code, lines.join("\n"))
+}
+
+/// `--tweakapply <id>` / `--tweakrevert <id>`: bật/hoàn tác MỘT tinh chỉnh bằng đúng hàm và
+/// đúng file sao lưu như UI, ghi `wintweaks-result.txt`. Exit code: 0 = xong, 1 = lỗi.
+fn tweak_cli(id: &str, apply: bool) -> (i32, String) {
+    let cfg = load_config();
+    let tweaks = wintweaks::all_tweaks(&game_dirs_from_paths(&cfg.game_paths));
+    let path = wintweaks_backup_path();
+    let mut backup = wintweaks::Backup::load(&path);
+    let mut lines: Vec<String> = vec![
+        format!(
+            "Paroda GameMode --tweak{} {} | {}",
+            if apply { "apply" } else { "revert" },
+            id,
+            sys::local_time_string()
+        ),
+        format!("admin={}", sys::is_admin()),
+        format!("backup={}", path.display()),
+    ];
+    let Some(t) = tweaks.iter().find(|t| t.id == id) else {
+        let ids: Vec<&str> = tweaks.iter().map(|t| t.id).collect();
+        lines.push(format!(
+            "⚠ Không có tinh chỉnh id “{}”. Id hợp lệ: {}",
+            id,
+            ids.join(", ")
+        ));
+        return (1, lines.join("\n"));
+    };
+    lines.push(format!("trước: {}", wintweaks::state(t).label()));
+    let result = if apply {
+        wintweaks::apply(t, &mut backup)
+    } else {
+        wintweaks::revert(t, &mut backup)
+    };
+    match result {
+        Ok(()) => {
+            lines.push(if apply {
+                format!("✔ [WIN] Đã bật: {}", t.title)
+            } else {
+                format!("↺ [WIN] Đã hoàn tác: {}", t.title)
+            });
+            let mut code = 0;
+            match backup.save(&path) {
+                Ok(()) => lines.push(format!("đã ghi {}", path.display())),
+                Err(e) => {
+                    lines.push(format!("⚠ ghi bản sao lưu lỗi: {}", e));
+                    code = 1;
+                }
+            }
+            lines.push(format!("sau: {}", wintweaks::state(t).label()));
+            lines.push(format!(
+                "trong bản sao lưu: {}",
+                if backup.has(t.id) { "có" } else { "không" }
+            ));
+            (code, lines.join("\n"))
+        }
+        Err(e) => {
+            lines.push(format!("⚠ [WIN] {}: {}", t.title, e));
+            (1, lines.join("\n"))
+        }
+    }
 }
 
 fn main() -> eframe::Result<()> {
@@ -7123,6 +8084,34 @@ fn main() -> eframe::Result<()> {
         let text = format!("{}\n", update::self_test(&url));
         let _ = std::fs::write(config_path().with_file_name("updatetest.txt"), text);
         return Ok(());
+    }
+
+    // --hwinfo: đọc phần cứng (WMI/PowerShell) và ghi hwinfo.txt (tóm tắt, gợi ý, JSON thô).
+    if std::env::args().any(|a| a == "--hwinfo") {
+        let (code, text) = hwinfo_cli();
+        let _ = std::fs::write(config_path().with_file_name("hwinfo.txt"), text);
+        std::process::exit(code);
+    }
+
+    // --tweakstatus: trạng thái từng tinh chỉnh Windows -> wintweaks-status.txt.
+    if std::env::args().any(|a| a == "--tweakstatus") {
+        let (code, text) = tweakstatus_cli();
+        let _ = std::fs::write(config_path().with_file_name("wintweaks-status.txt"), text);
+        std::process::exit(code);
+    }
+
+    // --tweakapply <id> / --tweakrevert <id>: bật/hoàn tác một tinh chỉnh (cùng hàm, cùng file
+    // sao lưu như UI) -> wintweaks-result.txt. Exit code 0/1.
+    let argv: Vec<String> = std::env::args().collect();
+    if let Some(pos) = argv
+        .iter()
+        .position(|a| a == "--tweakapply" || a == "--tweakrevert")
+    {
+        let apply = argv[pos] == "--tweakapply";
+        let id = argv.get(pos + 1).cloned().unwrap_or_default();
+        let (code, text) = tweak_cli(&id, apply);
+        let _ = std::fs::write(config_path().with_file_name("wintweaks-result.txt"), text);
+        std::process::exit(code);
     }
 
     // --purgetest: xả standby list một lần, ghi free/standby trước & sau ra purgetest.txt.
@@ -7483,5 +8472,24 @@ mod tests {
         assert!(app_row_kept(&keep, &make(3, 3)), "mọi instance đều là con của app được giữ");
         assert!(!app_row_kept(&keep, &make(3, 1)), "còn instance sẽ tắt thì không tính là giữ");
         assert!(app_row_kept(&HashMap::from([("node.exe".to_string(), true)]), &make(3, 1)));
+    }
+
+    /// `game_dirs` cho tinh chỉnh `defender_games`: thư mục cha của mọi `gamepath:` đã bỏ trùng.
+    #[test]
+    fn test_game_dirs_from_paths() {
+        let paths = HashMap::from([
+            (
+                "deltaforceclient-win64-shipping.exe".to_string(),
+                r"D:\Games\Delta Force\DeltaForceClient-Win64-Shipping.exe".to_string(),
+            ),
+            (
+                "cs2.exe".to_string(),
+                r"D:\Games\Delta Force\cs2.exe".to_string(),
+            ),
+            ("steam.exe".to_string(), "steam.exe".to_string()),
+        ]);
+        let dirs = game_dirs_from_paths(&paths);
+        assert_eq!(dirs, vec![r"D:\Games\Delta Force".to_string()]);
+        assert!(game_dirs_from_paths(&HashMap::new()).is_empty());
     }
 }

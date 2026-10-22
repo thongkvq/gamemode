@@ -1706,6 +1706,34 @@ pub fn danger_button_sized(text: impl Into<String>, size: f32) -> DangerButton {
 }
 
 // ==========================================
+// NHÃN NHỎ (BADGE) + CHẤM MÀU
+// ==========================================
+/// Nhãn nhỏ một dòng (badge) tô theo màu mức độ, dùng cho thẻ tinh chỉnh Windows.
+/// Trả `Response` để nơi gọi gắn thêm tooltip.
+pub fn badge(ui: &mut egui::Ui, text: &str, color: Color32) -> egui::Response {
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_string(), FontId::proportional(9.5), color);
+    let pad = vec2(6.0, 2.0);
+    let desired = galley.size() + pad * 2.0;
+    let (rect, resp) = ui.allocate_exact_size(desired, egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+
+    // Nền = chính màu đó nhưng tối đi nhiều (không dùng alpha để chữ luôn đọc được trên nền tối).
+    let bg = Color32::from_rgb(color.r() / 7, color.g() / 7, color.b() / 7);
+    painter.rect_filled(rect, Rounding::same(3.0), bg);
+    painter.rect_stroke(rect, Rounding::same(3.0), Stroke::new(1.0_f32, color));
+    painter.galley(rect.min + pad, galley, color);
+    resp
+}
+
+/// Chấm tròn màu 8px, canh giữa theo chiều cao dòng (font HUD không có glyph "●").
+pub fn dot(ui: &mut egui::Ui, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(vec2(8.0, 8.0), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), 4.0, color);
+}
+
+// ==========================================
 // CHÚ THÍCH BIỂU ĐỒ (PLOT LEGEND ROW)
 // ==========================================
 /// Hàng chú thích đường biểu đồ dưới tiêu đề card: chấm màu + tên (cùng màu với đường, font nhỏ).
