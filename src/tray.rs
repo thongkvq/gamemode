@@ -189,7 +189,7 @@ fn on_menu(sh: &Shared, ctx: &eframe::egui::Context, hwnd: isize, id: &str) {
                 return;
             }
             // `do_restore` cũng xoá nhật ký ở đầu.
-            restore(sh.clone());
+            restore(sh.clone(), false);
             ctx.request_repaint();
         }
         ID_AUTO => {

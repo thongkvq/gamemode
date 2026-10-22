@@ -1,6 +1,6 @@
 [package]
 name = "gamemode"
-version = "1.3.2"
+version = "1.3.3"
 edition = "2021"
 
 [dependencies]
@@ -11,6 +11,12 @@ windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Diagnostics_Debug",
+    # FPS/frametime: ETW session real-time đọc event 178 (IDXGISwapChain_Present) của DXGI.
+    "Win32_System_Diagnostics_Etw",
+    # QueryPerformanceFrequency để đổi timestamp QPC của ETW ra ms (fps.rs).
+    "Win32_System_Performance",
+    # OpenTraceW + EVENT_TRACE_LOGFILEW nằm sau feature Win32_System_Time trong windows-sys 0.59.
+    "Win32_System_Time",
     "Win32_System_Threading",
     "Win32_System_ProcessStatus",
     "Win32_System_SystemInformation",

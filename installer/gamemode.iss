@@ -4,7 +4,7 @@
 ; Kết quả: dist\GameMode-Setup-<version>.exe
 
 #define AppName "GameMode"
-#define AppVersion "1.3.2"
+#define AppVersion "1.3.3"
 #define AppPublisher "thongkvq"
 #define AppExe "GameMode.exe"
 

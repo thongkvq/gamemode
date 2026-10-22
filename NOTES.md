@@ -2,9 +2,23 @@
 
 Cập nhật: 2026-10-22. Tool Rust + eframe/egui 0.29: tắt app nền trước khi chơi Delta Force, lưu session và khôi phục lại sau.
 
-## Đang dở và làm tiếp (2026-10-22)
-- **Bản đã phát hành**: **v1.3.2 trên kênh OTA thật** (`apps/gamemode`, 2026-10-22, build trên PC từ `I:\dev\GameMode`) và GitHub Release v1.3.0 / v1.3.1 / v1.3.2. 1.3.0: báo cáo trận + tab biểu đồ, cảnh báo commit, cập nhật OTA, giữ con cháu của app được giữ, "Đánh dấu là game" ở menu chuột phải. 1.3.1: giữ Discord/OBS, không dừng sshd. 1.3.2: sửa tốn CPU/GPU (xem dưới), version trên title bar.
-  - **Laptop đang chạy 1.2.0 chưa có bộ cập nhật**: phải cài tay bộ cài mới nhất một lần (tải ở `https://update-dhcs.paroda.net/apps/gamemode/releases/`), từ đó các bản sau tự đến qua OTA.
+## Bàn giao sang laptop (2026-10-22 tối, từ PC)
+- **Bản mới nhất: v1.3.3** trên kênh OTA thật và GitHub Release. Tải trực tiếp:
+  `https://update-dhcs.paroda.net/apps/gamemode/releases/GameMode-Setup-1.3.3.exe`
+  (hoặc `https://github.com/thongkvq/gamemode/releases/download/v1.3.3/GameMode-Setup-1.3.3.exe`).
+  **Laptop đang chạy 1.2.0, chưa có bộ cập nhật OTA**: thoát GameMode ở khay, tải bộ cài trên rồi chạy một lần (không cần admin, giữ config). Từ đó các bản sau tự đến qua banner.
+- **Code**: repo `thongkvq/gamemode`, nhánh `main`. Trên laptop `git pull` là có đủ (PC commit từ `I:\dev\GameMode`; thư mục `X:\Test AI\GameMode` là bản làm việc đồng bộ).
+- **1.3.3 có gì**: đo FPS/frametime vào báo cáo trận (`src/fps.rs`, xem mục "FPS" dưới); báo cáo không mất khi GameMode tắt giữa trận (lưu tạm `reports/<id>.partial.json` mỗi phút, chốt khi thoát, tự khôi phục lần mở sau); tự khôi phục/tự Boost không xoá log nữa; bấm Khôi phục tay giữa trận thì lúc game tắt không khôi phục lần 2; xoá báo cáo khi đang ghi trận chọn lại đúng; `--minimized` mà không tạo được icon khay thì chỉ thu nhỏ.
+- **CHƯA KIỂM CHỨNG — làm đầu tiên trên laptop**: số FPS thật với Delta Force bằng code mới. Đã kiểm bằng bản ghi ETW thô (`logman` provider DXGI) lúc DF đang chạy: 191 FPS, p99 7,2 ms — đúng nguyên lý, nhưng `FpsMeter` (session ETW real-time + callback) chưa thấy frame thật lần nào vì Edge/Discord không phát event 178. Cách thử: mở Delta Force, đợi vào sảnh, chạy `GameMode.exe --fpstest 20` (thư mục cạnh exe, config có `game:deltaforceclient-win64-shipping.exe=1`) → đọc `fpstest.txt`; hoặc chơi 1 trận rồi xem tab Báo cáo trận có thẻ "FPS TB / 1% low" và biểu đồ FPS. Nếu "không có frame nào": nghi `Wnode.ClientContext`/`PROCESS_TRACE_MODE_RAW_TIMESTAMP` hoặc `EnableTraceEx2` trong `src/fps.rs` (mục "Chưa chắc" của `.delegate/task-19.result.md`).
+- Lịch sử các bản: 1.3.0 báo cáo trận + OTA + giữ con cháu app; 1.3.1 giữ Discord/OBS, không dừng sshd; 1.3.2 sửa tốn CPU/GPU, version trên title bar; 1.3.3 như trên.
+
+## FPS / frametime trong báo cáo trận (1.3.3)
+- Không dùng PresentMon: bản 2.5.1/2.6.0 trên PC báo hàng chục nghìn "ETW events were lost" và không ghi được frame nào. Thay bằng tự đọc ETW provider **Microsoft-Windows-DXGI** (`CA11C036-0102-4A2D-A6AD-F03CFED5D3C9`), event **178** (task 80 `IDXGISwapChain_Present`); frametime = khoảng cách giữa hai event 178 cùng PID. Session tên `fps::DEFAULT_SESSION`, mở được cả khi không có quyền admin (đã thử trên PC).
+- Lọc theo **mọi PID trùng tên exe game** (`report::Live::game_pids`, dò lại mỗi mẫu 5 giây). Chromium/Edge/Discord vẽ qua DirectComposition nên KHÔNG phát event 178 — đừng dùng chúng để thử.
+- `Sample`: `fps`, `fps_low1`, `frametime_p99_ms`, `frametime_max_ms`, `hitches`. `Summary`: `fps_avg`, `fps_low1`, `fps_low01`, `frametime_p99_ms`, `frametime_max_ms`, `hitches` (số chính xác từ histogram 0,1 ms của `FpsMeter::total()` lúc `finish`; bản tạm/khôi phục thì tính gần đúng từ mẫu). Field mới đều `#[serde(default)]`, báo cáo cũ vẫn đọc được.
+- Event `hitch` khi frame > 100 ms (cách nhau ≥ 30 s); `fps_off` khi không mở được session. Nhận xét nói rõ khi khựng trùng lúc xả standby (≤ 5 s).
+- UI: thẻ "FPS TB / 1% low", "Khựng > 100 ms" (12 thẻ), biểu đồ FPS full width trên 4 biểu đồ cũ, chấm đỏ = khựng; danh sách trận ghi thêm "· 191 FPS".
+- Làm bởi harness: task-19 (fps.rs), task-20 (lưu tạm báo cáo), task-21 (nối vào báo cáo + UI), DeepSeek Flash.
 - **Hiệu năng (1.3.2)**: eframe 0.29 quay 100% một nhân khi cửa sổ bị `SW_HIDE` (cửa sổ ẩn không nhận WM_PAINT, event loop kẹt ở `ControlFlow::Poll`). Vì vậy "thu vào khay" = thu nhỏ + `WS_EX_TOOLWINDOW` (`sys::hide_main_window`), **không dùng SW_HIDE**. Khi mất focus / thu nhỏ, `update()` chỉ repaint 1–2 giây/lần, hiệu ứng nhấp nháy đi qua `ui::anim_repaint` (không repaint liên tục), và không gọi `schtasks`. Đo 2026-10-22: 1.3.1 lúc đang chơi ~1,2 nhân + ~9% GPU 3D; 1.3.2 mọi trạng thái < 1% một nhân, GPU ~0.
 - **Tab "Báo cáo trận" (task-14, Gemini)** cùng banner cảnh báo commit và biểu đồ `egui_plot` 0.29. Các bước đã làm:
   1. ~~Kiểm tra tab "Báo cáo trận"~~ — đã xem trên PC ngày 2026-10-22: danh sách, thẻ chỉ số, nhận xét, 4 biểu đồ, trận đang ghi cập nhật trực tiếp đều đúng. Nút xoá hiện bước "Bấm lại để xoá" nhưng **chưa xác nhận lần bấm thứ hai xoá thật** (chỉ test bằng click giả).
@@ -33,6 +47,7 @@ cargo build --release
 | `--pingtest` | Ping gateway (`GetBestRoute`) và host internet 5 lần mỗi đích (IP, RTT, mất gói) | `pingtest.txt` |
 | `--reporttest` | Chạy recorder giả lập 20 giây (mẫu mỗi 2 giây, không cần game, cho phép trận < 60 s) và lưu một báo cáo `game = "test"` | `reporttest.txt` |
 | `--updatetest` | Kiểm tra manifest cập nhật; nếu có bản mới thì tải và kiểm SHA-256 (KHÔNG chạy bộ cài) | `updatetest.txt` |
+| `--fpstest [giây]` | Đo FPS / frametime của game (theo danh sách game trong config) đang chạy, mặc định 10 giây | `fpstest.txt` |
 | `--minimized` | Khởi động **ẩn xuống khay hệ thống** (task chạy cùng Windows dùng cờ này) | |
 
 ## Báo cáo trận đấu (2026-10-22)
@@ -58,6 +73,7 @@ cargo build --release
   - `Shared` (các `Arc<Mutex>`) là cầu nối giữa UI và thread watcher.
 - `src/sys.rs`: WinAPI (snapshot process, cmdline, kill, WM_CLOSE, service có timeout 5 giây, standby purge, WLAN, Game DVR, GPU pref, schtasks, mở app bằng token explorer, ẩn/hiện cửa sổ chính + named mutex một bản, commit charge, `CpuMeter` từ `GetSystemTimes`, gateway + ICMP ping).
 - `src/report.rs`: báo cáo trận đấu (`Sample`, `Event`, `Summary`, `GameReport`, `ReportMeta`, `Live` đang ghi, đọc/ghi/xoá file trong `reports/`).
+- `src/fps.rs`: đo FPS / frametime bằng ETW DXGI (`FpsMeter`: start/set_target_pids/take_window/total/stop), phần tính toán thuần có unit test.
 - `src/tray.rs`: icon khay + menu chuột phải, thread nhận sự kiện menu/click (chạy được khi cửa sổ đã ẩn).
 - `src/ui.rs`: bảng màu và widget dùng chung (`card`, `section_header`, `toggle_row` có switch, `ghost_button`, `primary_button`, `callout_warning`).
 
@@ -97,7 +113,7 @@ App đòi quyền admin nên shell thường không chụp được cửa sổ. 
 ## Bộ cài (Inno Setup)
 - Cài Inno Setup 6: `winget install JRSoftware.InnoSetup --scope user`.
 - Build: `cargo build --release`, rồi `"%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" installer\gamemode.iss`, ra file `dist\GameMode-Setup-<version>.exe` (thư mục `dist/` không đưa lên git).
-- Version (hiện 1.3.2) phải sửa ở 2 chỗ: `Cargo.toml` và `#define AppVersion` trong `installer/gamemode.iss`.
+- Version (hiện 1.3.3) phải sửa ở 2 chỗ: `Cargo.toml` và `#define AppVersion` trong `installer/gamemode.iss`.
 - Bộ cài cài theo từng user vào `%LOCALAPPDATA%\Programs\GameMode`, không cần admin khi cài. Gỡ cài đặt sẽ xoá config/session và task "chạy cùng Windows".
 - Exe chưa ký số nên lần đầu chạy sẽ bị SmartScreen cảnh báo.
 - Bộ cài có nhánh cập nhật OTA: chạy kèm `/UPDATE` thì `[Code] IsUpdateRun` bật entry `[Run]`

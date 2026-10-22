@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"]
 
+mod fps;
 mod report;
 mod sys;
 mod tray;
@@ -1005,7 +1006,9 @@ fn scan_running_apps(
     out
 }
 
-fn restart_as_admin() {
+fn restart_as_admin(sh: &Shared) {
+    // Mở lại app bằng quyền admin = tiến trình này thoát: chốt báo cáo trận đang ghi trước.
+    finish_live_report(sh);
     if let Ok(exe) = std::env::current_exe() {
         let exe_str = exe.to_string_lossy().to_string();
         let _ = std::process::Command::new("powershell")
@@ -1112,6 +1115,25 @@ impl Shared {
     }
 }
 
+/// App thoát thật (đóng cửa sổ, menu "Thoát" ở khay, cài cập nhật OTA, mở lại bằng quyền
+/// admin): chốt trận đang ghi và lưu báo cáo NGAY, không đợi watcher thấy game tắt.
+/// Bản lưu tạm (`report::save_partial`) là lưới an toàn cho trường hợp tắt máy / crash.
+fn finish_live_report(sh: &Shared) {
+    // Lấy Arc ra rồi nhả khoá `live_report` trước khi khoá báo cáo (xem comment ở `Shared`).
+    let live = sh.live_report.lock().unwrap().take();
+    if let Some(l) = live {
+        let out = report::finish(l);
+        sh.log(
+            out.line.clone(),
+            if out.saved {
+                ui::SUCCESS
+            } else {
+                Color32::from_rgb(130, 150, 170)
+            },
+        );
+    }
+}
+
 /// Bắt đầu tối ưu ở thread nền. Dùng chung cho nút trên UI và watcher.
 fn optimize(sh: Shared, from_auto: bool) {
     if sh.busy.swap(true, Ordering::SeqCst) {
@@ -1134,13 +1156,17 @@ fn optimize(sh: Shared, from_auto: bool) {
 }
 
 /// Bắt đầu Restore ở thread nền (UI và watcher dùng chung).
-fn restore(sh: Shared) {
+/// `from_auto`: watcher tự khôi phục sau khi game tắt -> giữ nhật ký (dòng tóm tắt trận vừa ghi).
+fn restore(sh: Shared, from_auto: bool) {
     if sh.busy.swap(true, Ordering::SeqCst) {
         return;
     }
+    // Đã khôi phục thì phiên Game Boost tự động kết thúc: watcher không khôi phục thêm lần nữa
+    // khi game tắt (trước đây bấm Khôi phục giữa trận thì lúc game tắt lại chạy restore lần 2).
+    sh.last_auto.store(false, Ordering::SeqCst);
     sh.event("restore", "Khôi phục hệ thống (app, service, Wi-Fi, Game DVR)");
     std::thread::spawn(move || {
-        do_restore(&sh);
+        do_restore(&sh, !from_auto);
         sh.busy.store(false, Ordering::SeqCst);
     });
 }
@@ -1203,7 +1229,10 @@ fn mark_as_game(sh: &Shared, app: &RunningApp) {
 fn do_optimize(sh: &Shared) {
     let log = sh.log.clone();
     let push = |s: String, c: Color32| log.lock().unwrap().push((s, c));
-    log.lock().unwrap().clear();
+    // Tự Game Boost khi game mở: giữ nhật ký (dòng "[AUTO] Phát hiện", "Bắt đầu ghi trận").
+    if !sh.last_auto.load(Ordering::SeqCst) {
+        log.lock().unwrap().clear();
+    }
 
     let keep = sh.keep.lock().unwrap().clone();
     let svcs = sh.svc.lock().unwrap().clone();
@@ -1763,8 +1792,10 @@ fn do_optimize(sh: &Shared) {
 }
 
 /// Thân của Restore: mở lại app, bật lại service, Wi-Fi autoconf, Game DVR.
-fn do_restore(sh: &Shared) {
-    log_clear(sh);
+fn do_restore(sh: &Shared, clear_log: bool) {
+    if clear_log {
+        log_clear(sh);
+    }
     let sel = sh.restore_sel.lock().unwrap().clone();
     sh.log(
         "▶ [RESTORE] Đang khôi phục lại các ứng dụng & dịch vụ hệ thống...".into(),
@@ -2095,6 +2126,7 @@ fn start_watcher(sh: Shared) {
                     let host = sh.ping_host.lock().unwrap().clone();
                     let started = report::start(
                         &up.join(", "),
+                        &up,
                         &host,
                         report::SAMPLE_SEC,
                         report::MIN_DURATION_SEC,
@@ -2167,7 +2199,7 @@ fn start_watcher(sh: Shared) {
                             "[AUTO] Game đã tắt 15 giây — tự khôi phục lại hệ thống.".into(),
                             Color32::from_rgb(0, 229, 255),
                         );
-                        restore(sh.clone());
+                        restore(sh.clone(), true);
                     } else if !sh.busy.load(Ordering::SeqCst) {
                         optimized = false;
                     }
@@ -2345,6 +2377,11 @@ impl App {
         // Vừa cài bản cập nhật ở lần chạy trước (`update-pending.json`): báo kết quả trong nhật ký.
         if let Some((line, ok)) = update::take_startup_log() {
             boot_log.push((line, if ok { ui::SUCCESS } else { ui::DANGER }));
+        }
+        // Trận bị bỏ dở vì lần chạy trước tắt giữa trận (Thoát ở khay, khởi động lại, mất điện,
+        // crash): dựng lại báo cáo chính từ bản lưu tạm rồi báo trong nhật ký.
+        for line in report::recover_partials() {
+            boot_log.push((line, Color32::from_rgb(0, 229, 255)));
         }
 
         let sh = Shared {
@@ -3330,6 +3367,43 @@ fn synthesize_live_summary(rep: &mut report::GameReport) {
         }
     }
     rep.summary.standby_purges = rep.events.iter().filter(|e| e.kind == "purge").count() as u32;
+
+    // FPS: cùng cách tính với `report::summarize` (trung bình có trọng số theo thời gian mỗi mẫu),
+    // để số đang xem lúc ghi khớp số chốt lúc trận kết thúc.
+    let mut prev_t = 0.0_f32;
+    let mut fps_sum = 0.0_f64;
+    let mut fps_weight = 0.0_f64;
+    let mut fps_low1_sum = 0.0_f32;
+    let mut fps_low1_count = 0_u32;
+    for s in &rep.samples {
+        let dt = (s.t - prev_t).max(0.0);
+        prev_t = s.t;
+        if let Some(f) = s.fps {
+            let w = if dt > 0.0 { dt } else { report::SAMPLE_SEC as f32 };
+            fps_sum += f as f64 * w as f64;
+            fps_weight += w as f64;
+        }
+        if let Some(l) = s.fps_low1 {
+            fps_low1_sum += l;
+            fps_low1_count += 1;
+        }
+    }
+    rep.summary.fps_avg = (fps_weight > 0.0).then(|| (fps_sum / fps_weight) as f32);
+    rep.summary.fps_low1 = (fps_low1_count > 0).then(|| fps_low1_sum / fps_low1_count as f32);
+    rep.summary.frametime_max_ms = rep
+        .samples
+        .iter()
+        .filter_map(|s| s.frametime_max_ms)
+        .reduce(f32::max);
+    rep.summary.hitches = rep
+        .samples
+        .iter()
+        .map(|s| s.hitches)
+        .fold(0, u32::saturating_add);
+    // 0,1% low và p99 chỉ có khi chốt trận bằng histogram ETW — lúc đang ghi thì chưa có.
+    rep.summary.fps_low01 = None;
+    rep.summary.frametime_p99_ms = None;
+
     if rep.summary.verdict.is_empty() {
         rep.summary.verdict = vec!["Trận đang diễn ra — số liệu được cập nhật theo thời gian thực mỗi 5 giây.".to_string()];
     }
@@ -3476,6 +3550,24 @@ fn ping_y_grid_spacer(input: GridInput) -> Vec<GridMark> {
         50.0
     } else {
         100.0
+    };
+    generate_non_negative_grid_marks(min, max, step)
+}
+
+/// Grid spacer cho trục Y của biểu đồ FPS (bước 10, 20, 30, 60, 120 FPS tuỳ biên độ).
+fn fps_y_grid_spacer(input: GridInput) -> Vec<GridMark> {
+    let (min, max) = input.bounds;
+    let span = (max - min).max(1.0);
+    let step = if span <= 40.0 {
+        10.0
+    } else if span <= 90.0 {
+        20.0
+    } else if span <= 150.0 {
+        30.0
+    } else if span <= 300.0 {
+        60.0
+    } else {
+        120.0
     };
     generate_non_negative_grid_marks(min, max, step)
 }
@@ -3726,6 +3818,89 @@ fn render_plot_ping(ui: &mut egui::Ui, report: &report::GameReport) {
     });
 }
 
+/// Biểu đồ FPS (đặt full width trên 4 biểu đồ kia): FPS TB & 1% low theo thời gian,
+/// điểm đỏ ở các mẫu có khựng.
+fn render_plot_fps(ui: &mut egui::Ui, report: &report::GameReport) {
+    ui::card(ui, |ui| {
+        ui::section_header(ui, "// FPS", "FPS & Khựng hình", Some("FPS theo thời gian"));
+        ui.add_space(2.0);
+        ui::plot_legend_dots(ui, &[
+            ("FPS TB", ui::SUCCESS),
+            ("1% low", ui::WARNING),
+            ("Khựng", ui::DANGER),
+        ]);
+        ui.add_space(6.0);
+
+        let mut avg_pts: Vec<[f64; 2]> = Vec::new();
+        let mut low_pts: Vec<[f64; 2]> = Vec::new();
+        let mut hitch_pts: Vec<[f64; 2]> = Vec::new();
+        for s in &report.samples {
+            let t = s.t as f64;
+            if let Some(f) = s.fps {
+                avg_pts.push([t, f as f64]);
+            }
+            if let Some(f) = s.fps_low1 {
+                low_pts.push([t, f as f64]);
+            }
+            if s.hitches > 0 {
+                // Điểm đỏ nằm trên đường FPS TB (hoặc 1% low) để thấy khựng rơi vào lúc nào.
+                hitch_pts.push([t, s.fps.or(s.fps_low1).unwrap_or(0.0) as f64]);
+            }
+        }
+
+        // Không có mẫu FPS nào: nói rõ vì sao trống thay vì vẽ biểu đồ rỗng vô nghĩa.
+        if avg_pts.is_empty() {
+            ui.add_space(20.0);
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    RichText::new("Không có số liệu FPS (cần quyền admin, hoặc game không dùng DirectX)")
+                        .size(11.0)
+                        .color(ui::TEXT_MUTED),
+                );
+            });
+            ui.add_space(20.0);
+            return;
+        }
+
+        let l_avg = Line::new(PlotPoints::new(avg_pts))
+            .name("FPS TB")
+            .color(ui::SUCCESS)
+            .width(1.6_f32);
+        let l_low = Line::new(PlotPoints::new(low_pts))
+            .name("1% low")
+            .color(ui::WARNING)
+            .width(1.2_f32);
+
+        let plot = base_report_plot("plot_fps")
+            .y_grid_spacer(fps_y_grid_spacer)
+            .y_axis_formatter(|mark, _| format!("{:.0} FPS", mark.value))
+            .label_formatter(|name, val| {
+                let t = format_plot_time(val.x);
+                if !name.is_empty() {
+                    format!("{}: {:.0} FPS · {}", name, val.y, t)
+                } else {
+                    format!("{:.0} FPS · {}", val.y, t)
+                }
+            });
+
+        plot.show(ui, |plot_ui| {
+            plot_ui.line(l_avg);
+            plot_ui.line(l_low);
+            render_plot_events(plot_ui, &report.events);
+            // Chấm khựng vẽ sau cùng để vạch sự kiện không đè lên.
+            if !hitch_pts.is_empty() {
+                let p_hitch = Points::new(PlotPoints::new(hitch_pts))
+                    .name("Khựng")
+                    .color(ui::DANGER)
+                    .radius(4.5_f32)
+                    .filled(true)
+                    .shape(MarkerShape::Circle);
+                plot_ui.points(p_hitch);
+            }
+        });
+    });
+}
+
 fn render_report_detail(
     ui: &mut egui::Ui,
     report: &report::GameReport,
@@ -3788,7 +3963,7 @@ fn render_report_detail(
 
     ui.add_space(ui::SPACE_CARD_GAP);
 
-    // 2. Hàng thẻ chỉ số (9 chỉ số)
+    // 2. Hàng thẻ chỉ số (12 chỉ số: 3 cột × 4 hàng, hoặc 2 cột × 6 hàng khi hẹp)
     ui::card(ui, |ui| {
         ui::section_header(ui, "// STATS", "Chỉ số tổng kết trận", None);
         ui.add_space(8.0);
@@ -3816,14 +3991,18 @@ fn render_report_detail(
 
         let cpu_text = format!("{:.0}% / {:.0}%", sum.cpu_avg_pct, sum.cpu_peak_pct);
 
-        let ping_text = match (sum.ping_net_avg_ms, sum.ping_net_p95_ms, sum.ping_net_max_ms) {
-            (Some(a), Some(p), Some(m)) => format!("{:.0}/{:.0}/{:.0} ms", a, p, m),
-            (Some(a), _, _) => format!("{:.0} ms", a),
+        let ping_text = match (sum.ping_net_avg_ms, sum.ping_net_p95_ms) {
+            (Some(a), Some(p)) => format!("{:.0}/{:.0} ms", a, p),
+            (Some(a), None) => format!("{:.0} ms", a),
             _ => "—".to_string(),
         };
 
-        let jitter_text = sum.jitter_net_ms.map(|j| format!("{:.1} ms", j)).unwrap_or_else(|| "—".to_string());
+        let net_max_text = sum
+            .ping_net_max_ms
+            .map(|m| format!("{:.0} ms", m))
+            .unwrap_or_else(|| "—".to_string());
 
+        let jitter_text = sum.jitter_net_ms.map(|j| format!("{:.1} ms", j)).unwrap_or_else(|| "—".to_string());
         let loss_text = format!("{:.1}%", sum.loss_net_pct);
         let loss_color = if sum.loss_net_pct > 0.0 { ui::DANGER } else { ui::SUCCESS };
 
@@ -3832,6 +4011,23 @@ fn render_report_detail(
 
         let purge_text = format!("{} lần", sum.standby_purges);
 
+        // FPS: "TB / 1% low"; dòng phụ có 0,1% low và p99 khi chốt trận bằng histogram ETW.
+        let fps_text = match (sum.fps_avg, sum.fps_low1) {
+            (Some(a), Some(l)) => format!("{:.0} / {:.0}", a, l),
+            (Some(a), None) => format!("{:.0} / —", a),
+            _ => "—".to_string(),
+        };
+        let fps_sub: Option<String> = match (sum.fps_low01, sum.frametime_p99_ms) {
+            (Some(low01), Some(p99)) => Some(format!("0,1% low {:.0} · p99 {:.1} ms", low01, p99)),
+            (Some(low01), None) => Some(format!("0,1% low {:.0}", low01)),
+            (None, Some(p99)) => Some(format!("p99 {:.1} ms", p99)),
+            (None, None) => None,
+        };
+
+        let hitch_text = format!("{} lần", sum.hitches);
+        let hitch_color = if sum.hitches > 0 { ui::WARNING } else { ui::SUCCESS };
+
+        // 12 thẻ: lưới 3 cột × 4 hàng (rộng) hoặc 2 cột × 6 hàng (hẹp) cho cân đối.
         let is_wide = ui.available_width() >= 540.0;
         if is_wide {
             ui.columns(3, |cols| {
@@ -3840,18 +4036,24 @@ fn render_report_detail(
                 render_metric_box(&mut cols[0], "RAM trống thấp nhất", &ram_min_text, Some(&format!("TB: {:.2} GB", sum.ram_avail_avg_gb)), ram_color);
                 cols[0].add_space(8.0);
                 render_metric_box(&mut cols[0], "Commit đỉnh", &commit_text, Some(&commit_sub), commit_color);
+                cols[0].add_space(8.0);
+                render_metric_box(&mut cols[0], "Xả Standby", &purge_text, Some("Giải phóng RAM"), ui::ACCENT);
 
+                render_metric_box(&mut cols[1], "FPS TB / 1% low", &fps_text, fps_sub.as_deref(), ui::SUCCESS);
+                cols[1].add_space(8.0);
+                render_metric_box(&mut cols[1], "Khựng > 100 ms", &hitch_text, Some("Frame dài bất thường"), hitch_color);
+                cols[1].add_space(8.0);
                 render_metric_box(&mut cols[1], "CPU TB / Đỉnh", &cpu_text, Some("Toàn hệ thống"), ui::DATA_CYAN);
                 cols[1].add_space(8.0);
-                render_metric_box(&mut cols[1], "Ping Net TB/P95/Max", &ping_text, Some("Internet"), ui::DATA_CYAN);
-                cols[1].add_space(8.0);
-                render_metric_box(&mut cols[1], "Jitter độ trễ", &jitter_text, Some("Biên độ dao động"), ui::TEXT_MAIN);
+                render_metric_box(&mut cols[1], "Ping Net TB / P95", &ping_text, Some("Internet"), ui::DATA_CYAN);
 
+                render_metric_box(&mut cols[2], "Ping Net Max", &net_max_text, Some("Gói chậm nhất"), ui::DATA_CYAN);
+                cols[2].add_space(8.0);
+                render_metric_box(&mut cols[2], "Jitter độ trễ", &jitter_text, Some("Biên độ dao động"), ui::TEXT_MAIN);
+                cols[2].add_space(8.0);
                 render_metric_box(&mut cols[2], "Mất gói Net", &loss_text, Some("Tỉ lệ rớt gói"), loss_color);
                 cols[2].add_space(8.0);
                 render_metric_box(&mut cols[2], "Ping Router TB", &gw_text, Some(&gw_sub), ui::SUCCESS);
-                cols[2].add_space(8.0);
-                render_metric_box(&mut cols[2], "Xả Standby", &purge_text, Some("Giải phóng RAM"), ui::ACCENT);
             });
         } else {
             ui.columns(2, |cols| {
@@ -3861,11 +4063,17 @@ fn render_report_detail(
                 cols[0].add_space(8.0);
                 render_metric_box(&mut cols[0], "Commit đỉnh", &commit_text, Some(&commit_sub), commit_color);
                 cols[0].add_space(8.0);
-                render_metric_box(&mut cols[0], "CPU TB / Đỉnh", &cpu_text, None, ui::DATA_CYAN);
-                cols[0].add_space(8.0);
                 render_metric_box(&mut cols[0], "Xả Standby", &purge_text, None, ui::ACCENT);
+                cols[0].add_space(8.0);
+                render_metric_box(&mut cols[0], "FPS TB / 1% low", &fps_text, fps_sub.as_deref(), ui::SUCCESS);
+                cols[0].add_space(8.0);
+                render_metric_box(&mut cols[0], "Khựng > 100 ms", &hitch_text, None, hitch_color);
 
-                render_metric_box(&mut cols[1], "Ping Net TB/P95/Max", &ping_text, None, ui::DATA_CYAN);
+                render_metric_box(&mut cols[1], "CPU TB / Đỉnh", &cpu_text, None, ui::DATA_CYAN);
+                cols[1].add_space(8.0);
+                render_metric_box(&mut cols[1], "Ping Net TB / P95", &ping_text, None, ui::DATA_CYAN);
+                cols[1].add_space(8.0);
+                render_metric_box(&mut cols[1], "Ping Net Max", &net_max_text, None, ui::DATA_CYAN);
                 cols[1].add_space(8.0);
                 render_metric_box(&mut cols[1], "Jitter độ trễ", &jitter_text, None, ui::TEXT_MAIN);
                 cols[1].add_space(8.0);
@@ -3899,7 +4107,7 @@ fn render_report_detail(
 
     ui.add_space(ui::SPACE_CARD_GAP);
 
-    // 4. 4 biểu đồ đường
+    // 4. Biểu đồ FPS full width + 4 biểu đồ đường
     if report.samples.is_empty() {
         ui::card(ui, |ui| {
             ui.add_space(20.0);
@@ -3914,6 +4122,9 @@ fn render_report_detail(
         });
     } else {
         let is_wide = ui.available_width() >= 620.0;
+        // Biểu đồ FPS full width, nằm trên 4 biểu đồ cũ ở cả hai bố cục.
+        render_plot_fps(ui, report);
+        ui.add_space(ui::SPACE_CARD_GAP);
         if is_wide {
             ui.columns(2, |cols| {
                 render_plot_ram(&mut cols[0], report);
@@ -4028,7 +4239,15 @@ impl App {
                                         let time_str = format_short_date(&meta.started_at);
                                         let game_clean = clean_game_name(&meta.game);
                                         let game_short = truncate_game_name(&game_clean, 16);
-                                        let dur_str = format_duration(meta.duration_sec);
+                                        // Dòng phụ: thời lượng, kèm FPS TB khi trận có đo được.
+                                        let dur_str = match meta.fps_avg {
+                                            Some(f) => format!(
+                                                "{} · {:.0} FPS",
+                                                format_duration(meta.duration_sec),
+                                                f
+                                            ),
+                                            None => format_duration(meta.duration_sec),
+                                        };
 
                                         if ui::report_list_row(
                                             ui,
@@ -4128,6 +4347,10 @@ impl App {
         }
         if let Some(id) = delete_req {
             report::delete_report(&id);
+            // Bỏ chọn báo cáo vừa xoá để `refresh_reports` chọn lại (kể cả khi có trận đang ghi).
+            if self.selected_report_id.as_deref() == Some(id.as_str()) {
+                self.selected_report_id = None;
+            }
             self.delete_confirm = None;
             self.cached_report = None;
             self.refresh_reports();
@@ -4388,16 +4611,21 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.start_hidden {
             self.start_hidden = false;
-            // --minimized: vào thẳng khay (cửa sổ ẩn) chứ không thu xuống taskbar.
-            // eframe tự hiện cửa sổ sau frame đầu, nên ẩn lại thêm vài lần trong giây đầu.
             let hwnd = self.hwnd;
-            sys::hide_main_window(hwnd);
-            std::thread::spawn(move || {
-                for ms in [150u64, 400, 900] {
-                    std::thread::sleep(Duration::from_millis(ms));
-                    sys::hide_main_window(hwnd);
-                }
-            });
+            if self.tray.is_none() || hwnd == 0 {
+                // Không có icon khay thì ẩn đi sẽ không mở lại được -> chỉ thu nhỏ xuống taskbar.
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            } else {
+                // --minimized: vào thẳng khay (cửa sổ ẩn) chứ không thu xuống taskbar.
+                // eframe tự hiện cửa sổ sau frame đầu, nên ẩn lại thêm vài lần trong giây đầu.
+                sys::hide_main_window(hwnd);
+                std::thread::spawn(move || {
+                    for ms in [150u64, 400, 900] {
+                        std::thread::sleep(Duration::from_millis(ms));
+                        sys::hide_main_window(hwnd);
+                    }
+                });
+            }
         }
         if self.last_mem.elapsed() > Duration::from_millis(800) {
             self.mem = sys::memory();
@@ -4457,6 +4685,9 @@ impl eframe::App for App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 sys::hide_main_window(self.hwnd);
             } else {
+                // Thoát thật: chốt báo cáo trận đang ghi và lưu NGAY (trận dài chưa tới lúc
+                // watcher chốt vẫn còn số liệu). Bản lưu tạm là lưới an toàn cho crash/tắt máy.
+                finish_live_report(&sh);
                 // Bỏ icon khay trước khi đóng app.
                 if let Some(mut t) = self.tray.take() {
                     t.remove();
@@ -4581,7 +4812,7 @@ impl eframe::App for App {
                 ui.columns(2, |cols| {
                     let restore_btn = ui::ghost_button("↩  Khôi phục");
                     if cols[0].add_sized([cols[0].available_width(), ui::BTN_SUB_HEIGHT], restore_btn).clicked() && !busy {
-                        restore(sh.clone());
+                        restore(sh.clone(), false);
                     }
 
                     let clear_btn = ui::ghost_button("Xoá nhật ký");
@@ -4952,7 +5183,7 @@ impl eframe::App for App {
                                     .stroke(Stroke::new(1.0_f32, ui::WARNING))
                                     .rounding(Rounding::same(4.0));
                                     if ui.add(btn).clicked() {
-                                        restart_as_admin();
+                                        restart_as_admin(&sh);
                                     }
                                 }
                             });
@@ -5255,7 +5486,7 @@ fn main() -> eframe::Result<()> {
     // lưu báo cáo game="test" vào reports/ rồi ghi đường dẫn ra reporttest.txt.
     if std::env::args().any(|a| a == "--reporttest") {
         let cfg = load_config();
-        let live = report::start("test", &cfg.ping_host, 2, 0);
+        let live = report::start("test", &[], &cfg.ping_host, 2, 0);
         for _ in 0..10 {
             std::thread::sleep(Duration::from_secs(2));
         }
@@ -5336,6 +5567,31 @@ delete={:?}
         return Ok(());
     }
 
+    // --fpstest [giây]: đo FPS / frametime của game đầu tiên trong danh sách đang chạy (cần admin),
+    // ghi kết quả ra fpstest.txt.
+    if std::env::args().any(|a| a == "--fpstest") {
+        let secs = std::env::args()
+            .skip_while(|a| a != "--fpstest")
+            .nth(1)
+            .and_then(|a| a.parse().ok())
+            .unwrap_or(10);
+        let cfg = load_config();
+        // Mọi tiến trình trùng tên game: có app vẽ hình từ tiến trình con (vd GPU process).
+        let procs: Vec<sys::Proc> = sys::list_processes()
+            .into_iter()
+            .filter(|p| cfg.games.iter().any(|g| g.eq_ignore_ascii_case(&p.name)))
+            .collect();
+        let text = match procs.first() {
+            Some(p) => {
+                let pids: Vec<u32> = procs.iter().map(|p| p.pid).collect();
+                format!("game = {}
+{}", p.name, fps::self_test(&pids, secs))
+            }
+            None => "Không có game nào trong danh sách đang chạy.".to_string(),
+        };
+        let _ = std::fs::write(config_path().with_file_name("fpstest.txt"), text);
+        return Ok(());
+    }
     if std::env::args().any(|a| a == "--purgetest") {
         let before = sys::memory_lists();
         let result = sys::purge_standby();
