@@ -62,7 +62,7 @@ cargo build --release
 
 ## Đã xong
 - Danh sách app đang chạy có công tắc "Giữ lại", lựa chọn nhớ trong `keep:` của config.
-- Mặc định giữ lại: Discord, Steam, JBL Quantum, Tailscale, WARP, UniKey/EVKey, Claude, NVIDIA, webview2, NitroSense, game và anti-cheat ACE.
+- Mặc định giữ lại: mọi exe bắt đầu bằng `discord` (gồm DiscordSystemHelper — cần cho livestream), OBS (`obs64.exe`), Steam, JBL Quantum, Tailscale, WARP, UniKey/EVKey, Claude, NVIDIA, webview2, NitroSense, game và anti-cheat ACE. Discord/OBS cũng không bị nén RAM (giật stream).
 - Session chỉ lưu app thật: do explorer mở, có cửa sổ hoặc nằm trong danh sách tự khởi động. Restore không bao giờ chạy lại shell, Python hay agent nền.
 - Tự động theo game (`auto:enabled`): tối ưu khi `DeltaForceClient-Win64-Shipping.exe` mở, tự Restore 15 giây sau khi game tắt.
 - Xả standby list thay cho trim working set. Trong lúc chơi, tự xả khi RAM free < 1 GB.
@@ -87,7 +87,7 @@ App đòi quyền admin nên shell thường không chụp được cửa sổ. 
 
 ## Lưu ý vận hành
 - Service Office `ClickToRunSvc` phản hồi lệnh dừng rất chậm (từng kẹt ở `StopPending`). Nên bỏ tick nếu không cần.
-- `svc:sshd=1` trong config sẽ dừng SSH server khi bật Game Mode.
+- OpenSSH Server (`sshd`) không còn trong danh sách service bị dừng (từ sau 1.3.0): Game Boost không cắt SSH vào máy; dòng `svc:sshd=` cũ trong config bị bỏ qua. `ssh.exe` do Claude mở được giữ vì là con cháu của `claude.exe`.
 - Auto mode mặc định tắt, phải tự bật trong UI.
 - Chạy quyền thường (vd mở bằng `__COMPAT_LAYER=RunAsInvoker` khi test) thì không xả được standby; lỗi này chỉ log một lần mỗi lần mở app, kèm gợi ý mở lại bằng quyền admin.
 - `--selftest` ghi `kept_children` / `kept_by` ở mỗi dòng `APP` để kiểm quy tắc giữ con cháu của app được giữ.

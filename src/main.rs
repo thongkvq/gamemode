@@ -54,12 +54,6 @@ const SERVICE_TARGETS: &[(&str, &str, &str, bool)] = &[
         true,
     ),
     (
-        "sshd",
-        "OpenSSH Server",
-        "Máy chủ SSH nhận kết nối từ xa",
-        true,
-    ),
-    (
         "WpcMonSvc",
         "Parental Controls",
         "Giám sát trẻ em ngầm của Windows",
@@ -170,6 +164,8 @@ const DEFAULT_KEEP: &[&str] = &[
     "windowsterminal.exe",
     "openconsole.exe",
     "msedgewebview2.exe",
+    // OBS: phát trực tiếp / quay màn hình trong lúc chơi.
+    "obs64.exe",
     // NitroSense (Acer): quạt & profile hiệu năng, phải giữ để máy không bị khóa quạt.
     "psagent.exe",
     "psadminagent.exe",
@@ -178,7 +174,9 @@ const DEFAULT_KEEP: &[&str] = &[
 /// Exe game mặc định (dùng khi config chưa có dòng `game:` nào).
 const DEFAULT_GAMES: &[&str] = &["deltaforceclient-win64-shipping.exe"];
 /// Tiền tố tên exe mặc định được giữ (Tailscale: tailscale.exe, tailscaled.exe...).
-const DEFAULT_KEEP_PREFIX: &[&str] = &["tailscale", "deltaforce", "df_garena", "sguard", "unrealcef", "ace-", "gamebar"];
+/// "discord" phủ cả DiscordSystemHelper.exe (chạy tách khỏi cây Discord.exe) và bản PTB/Canary,
+/// cần cho livestream / chia sẻ màn hình trên Discord.
+const DEFAULT_KEEP_PREFIX: &[&str] = &["discord", "tailscale", "deltaforce", "df_garena", "sguard", "unrealcef", "ace-", "gamebar"];
 /// Chuỗi con trong tên exe mặc định được giữ (JBL Quantum).
 const DEFAULT_KEEP_CONTAINS: &[&str] = &["quantum", "-win64-shipping", "无极画质"];
 
@@ -195,6 +193,8 @@ const ACE_SKIP: &[&str] = &[
 /// Process hệ thống KHÔNG nén working set: nén audiodg (âm thanh) / dwm (compositor, vẽ hình)
 /// / csrss sẽ gây giật âm thanh và hình ngay khi đang chơi.
 const TRIM_SKIP_EXE: &[&str] = &["audiodg.exe", "dwm.exe", "csrss.exe"];
+/// App livestream không nén working set: nén Discord / OBS giữa lúc phát làm giật hình, tiếng.
+const TRIM_SKIP_PREFIX: &[&str] = &["discord", "obs"];
 
 /// Danh sách exe không được mở quyền đọc bộ nhớ: exe game + process anti-cheat.
 fn skip_list(games: &[String]) -> Vec<String> {
@@ -1668,6 +1668,7 @@ fn do_optimize(sh: &Shared) {
             if exe.is_empty()
                 || is_ace_or_game(&exe, &skip)
                 || TRIM_SKIP_EXE.contains(&exe.as_str())
+                || TRIM_SKIP_PREFIX.iter().any(|p| exe.starts_with(p))
             {
                 continue;
             }
@@ -2788,12 +2789,16 @@ fn render_auto_card(
                         };
                         let path_max_w = (text_max_w - exe_w - 8.0).max(0.0);
                         if path_max_w > 20.0 {
-                            let path_galley = painter.layout(
+                            // Một dòng, cắt "…" khi hẹp: xuống dòng trong khe hẹp bị che mất chữ.
+                            let mut path_job = egui::text::LayoutJob::simple(
                                 path_desc,
                                 FontId::proportional(10.5),
                                 ui::TEXT_DIM,
                                 path_max_w,
                             );
+                            path_job.wrap.max_rows = 1;
+                            path_job.wrap.break_anywhere = true;
+                            let path_galley = painter.layout_job(path_job);
                             painter.galley(
                                 pos2(rect.left() + 2.0 + exe_w + 6.0, rect.center().y - path_galley.size().y / 2.0),
                                 path_galley,
@@ -5411,6 +5416,18 @@ mod tests {
         assert_eq!(clean_game_name("Game-Shipping.exe"), "Game");
         assert_eq!(clean_game_name("cs2.exe"), "cs2");
         assert_eq!(clean_game_name("cs2.EXE"), "cs2");
+    }
+
+    #[test]
+    fn test_streaming_and_ssh_are_kept() {
+        for exe in ["discord.exe", "discordsystemhelper.exe", "discordptb.exe", "obs64.exe", "claude.exe"] {
+            assert!(default_keep(exe), "{exe} phải được giữ mặc định");
+        }
+        assert!(!default_keep("chrome.exe"));
+        assert!(
+            SERVICE_TARGETS.iter().all(|(name, ..)| !name.eq_ignore_ascii_case("sshd")),
+            "Game Boost không được dừng OpenSSH Server"
+        );
     }
 
     #[test]
