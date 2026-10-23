@@ -2,6 +2,11 @@
 
 Cập nhật: 2026-10-23. Tool Rust + eframe/egui 0.29: tắt app nền trước khi chơi Delta Force, lưu session và khôi phục lại sau.
 
+## Bản 1.5.3 (2026-10-23)
+- **Crash lúc mới bật máy vẫn còn ở 1.5.2**: `gamemode-crash.log` trên laptop ghi `overflow when subtracting duration from instant` lúc 10:08:19, máy boot 10:07:48 (hôm trước 19:32 cũng vậy). Task XML từ 1.4.0 đã làm mất `Delay PT2M30S` nên app mở ngay khi đăng nhập. Worker (task-30) và Claude dò `src/` + crate khoá (ureq, eframe/egui/winit, crossbeam, parking_lot…) theo kiểu dữ liệu: **không tìm ra** chỗ `Instant - Duration` nào. 1.5.3 chưa sửa được gốc, chỉ thêm chẩn đoán: panic hook ghi tên thread + `Backtrace::force_capture()`, `[profile.release]` `strip = "none"` + `debug = "line-tables-only"`, bộ cài kèm `GameMode.pdb` (bộ cài 4,7 → 8,3 MB), mọi thread có tên (`watcher`, `update`, `report-sample`, `etw-fps`…). **Lần crash sau đọc `gamemode-crash.log` là biết thread + hàm**; nghi đầu tiên thread `update` (kiểm tra lần đầu sau 20 s + timeout 10 s ≈ mốc 31 s).
+- **FPS trong báo cáo trận vẫn sai ở 1.5.2**: trận 2026-10-23 10:54 (4 giờ 45 phút) chỉ 1 mẫu có FPS (t = 20 s, 40404 FPS, frametime 0,044 ms = Present trùng), còn lại `null`; tổng kết lấy luôn số rác. task-31 sửa `fps.rs`/`report.rs`: bỏ frametime < 0,2 ms, mẫu cần ≥ 10 frame, tổng kết cần ≥ 1000 frame và nhất quán (`max ≥ p99`, `low01 ≤ low1 ≤ avg`), FPS mẫu tính trên PID Present nhiều nhất, watchdog im lặng 30 s khi game chạy → mở lại session ETW (tối đa 3 lần, event `fps_restart`/`fps_off` kèm PID lạ đang Present), histogram reset khi mở meter mới, đọc báo cáo cũ FPS > 2000 coi như null. Claude: `--fpstest` dùng session riêng `GameModeFpsTest` (mở session trùng tên sẽ DỪNG session của app đang ghi trận) và đi đúng đường chọn PID của báo cáo (`fps::self_test_exes`).
+- **Chưa kiểm chứng**: nguyên nhân thật của việc mất frame (worker nghi lọc PID theo tên exe / session bị dừng từ ngoài — chưa chứng minh). Lúc build xong thì Delta Force vừa tắt nên chưa chạy được `--fpstest`. **Việc đầu tiên**: chơi một trận bằng 1.5.3 rồi xem báo cáo có FPS liên tục không, có event `fps_restart`/`fps_off` không; hoặc chạy `GameMode.exe --fpstest 15` (admin) khi game đang chạy → `fpstest.txt` in PID đang đếm, số event 178/180, PID lạ đang Present.
+
 ## Bản 1.4.0 / 1.4.1 (2026-10-22) — Paroda GameMode
 - Đổi tên hiển thị thành **Paroda GameMode** (title bar, khay, Task Manager, bộ cài, shortcut). GIỮ nguyên: `GameMode.exe`, `AppId`, mutex, task `GameMode`, thư mục cài `%LOCALAPPDATA%\Programs\GameMode`, tên bộ cài `GameMode-Setup-<ver>.exe`, `"app": "GameMode"` của manifest.
 - Mới: tab Khởi động (task-22), phím tắt toàn cục (task-23), task chạy cùng Windows bằng XML — chạy cả khi dùng pin, không giới hạn 72 giờ, tự sửa task cũ lúc mở app (task-24/26), banner + `--restore` cho phiên Boost bỏ lửng, chặn `NOT_GAMES` (task-25), hồ sơ theo game (task-26).
@@ -185,7 +190,7 @@ App đòi quyền admin nên shell thường không chụp được cửa sổ. 
 ## Bộ cài (Inno Setup)
 - Cài Inno Setup 6: `winget install JRSoftware.InnoSetup --scope user`.
 - Build: `cargo build --release`, rồi `"%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" installer\gamemode.iss`, ra file `dist\GameMode-Setup-<version>.exe` (thư mục `dist/` không đưa lên git).
-- Version (hiện 1.5.2) phải sửa ở 2 chỗ: `Cargo.toml` và `#define AppVersion` trong `installer/gamemode.iss`.
+- Version (hiện 1.5.3) phải sửa ở 2 chỗ: `Cargo.toml` và `#define AppVersion` trong `installer/gamemode.iss`.
 - Bộ cài cài theo từng user vào `%LOCALAPPDATA%\Programs\GameMode`, không cần admin khi cài. Gỡ cài đặt sẽ xoá config/session và task "chạy cùng Windows".
 - Exe chưa ký số nên lần đầu chạy sẽ bị SmartScreen cảnh báo.
 - Bộ cài có nhánh cập nhật OTA: chạy kèm `/UPDATE` thì `[Code] IsUpdateRun` bật entry `[Run]`

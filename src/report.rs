@@ -38,6 +38,12 @@ const SUMMARY_SPIKE_MS: f32 = 100.0;
 /// Ngưỡng commit coi là nguy hiểm (nhận xét + cảnh báo).
 pub const COMMIT_WARN_PCT: f32 = 90.0;
 
+/// Trần FPS hợp lý khi ĐỌC lại báo cáo: cao hơn là số rác của bản cũ, coi như không đo được.
+/// (Một nguồn sự thật duy nhất với `fps::MAX_PLAUSIBLE_FPS`.)
+pub const MAX_PLAUSIBLE_FPS: f32 = fps::MAX_PLAUSIBLE_FPS;
+/// Frametime nhỏ hơn mức này (ms) là Present trùng, không phải một frame (xem `fps`).
+pub const MIN_PLAUSIBLE_FRAMETIME_MS: f32 = fps::MIN_FRAMETIME_MS;
+
 /// Frametime lớn hơn mức này (ms) trong một mẫu thì ghi event "hitch" (khựng hình).
 const HITCH_EVENT_MS: f32 = 100.0;
 /// Hai event khựng cách nhau tối thiểu (giống `SPIKE_MIN_GAP` của ping).
@@ -47,8 +53,7 @@ const HITCH_PURGE_GAP_SEC: f32 = 5.0;
 
 /// Chu kỳ ghi bản lưu tạm `reports/<id>.partial.json` trong lúc chơi: app/máy tắt giữa trận
 /// (Thoát ở khay, khởi động lại, mất điện, crash) vẫn còn số liệu để khôi phục.
-const PARTIAL_GAP: Duration = Duration::from_secs(60);
-/// Hậu tố bản lưu tạm. Tên file thành `<id>.partial.json` nên `valid_id` (chỉ chữ số và '-')
+const PARTIAL_GAP: Duration = Duration::from_secs(60);/// Hậu tố bản lưu tạm. Tên file thành `<id>.partial.json` nên `valid_id` (chỉ chữ số và '-')
 /// tự loại nó khỏi `list_reports` / `load_report` / `delete_report`.
 const PARTIAL_SUFFIX: &str = ".partial";
 /// `ended_at` của báo cáo khôi phục: mốc kết thúc thật không đọc được (app đã chết giữa trận),
@@ -87,8 +92,11 @@ pub struct Sample {
     pub ping_net_max_ms: Option<f32>,
     pub loss_gw_pct: f32,
     pub loss_net_pct: f32,
-    /// FPS trung bình của cửa sổ mẫu; None khi không có frame nào (menu/alt-tab/không đo được).
+    /// FPS trung bình của cửa sổ mẫu; None khi không có frame nào (menu/alt-tab/không đo được)
+    /// hoặc khi cửa sổ không đủ frame (`fps::MIN_WINDOW_FRAMES`).
     pub fps: Option<f32>,
+    /// Số frame của cửa sổ mẫu (0 = bản cũ chưa ghi field này).
+    pub frames: u32,
     /// 1% low của cửa sổ mẫu.
     pub fps_low1: Option<f32>,
     /// Frametime phân vị 99% trong cửa sổ mẫu (ms).
@@ -255,7 +263,90 @@ pub fn delete_report(id: &str) -> bool {
 
 fn read_report(path: &std::path::Path) -> Option<GameReport> {
     let text = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&text).ok()
+    let mut report: GameReport = serde_json::from_str(&text).ok()?;
+    // Bản cũ trên đĩa có thể chứa số rác (40404 FPS): làm sạch bản TRONG BỘ NHỚ, không sửa file.
+    sanitize_report(&mut report);
+    Some(report)
+}
+
+/// FPS hợp lý: 0 < fps <= `MAX_PLAUSIBLE_FPS` (cao hơn là số rác của bản cũ).
+fn plausible_fps(v: Option<f32>) -> Option<f32> {
+    v.filter(|f| f.is_finite() && *f > 0.0 && *f <= MAX_PLAUSIBLE_FPS)
+}
+
+/// Frametime hợp lý (ms): dưới `MIN_PLAUSIBLE_FRAMETIME_MS` là Present trùng, trên 60 giây
+/// là alt-tab/treo máy — cả hai không phải một frame.
+fn plausible_ms(v: Option<f32>) -> Option<f32> {
+    v.filter(|m| m.is_finite() && *m >= MIN_PLAUSIBLE_FRAMETIME_MS && *m <= 60_000.0)
+}
+
+/// Bỏ số FPS vô lý của một mẫu (bản ghi cũ hoặc bản lưu tạm hỏng).
+fn sanitize_sample(s: &mut Sample) {
+    if plausible_fps(s.fps).is_none() {
+        s.fps = None;
+        s.fps_low1 = None;
+    } else {
+        s.fps_low1 = plausible_fps(s.fps_low1);
+    }
+    // Cửa sổ ghi rõ số frame mà ít hơn `MIN_WINDOW_FRAMES` ⇒ không phải FPS (bản cũ không có
+    // field `frames` — 0 — thì giữ nguyên, đừng xoá số của báo cáo cũ đọc được).
+    if s.frames > 0 && s.frames < fps::MIN_WINDOW_FRAMES {
+        s.fps = None;
+        s.fps_low1 = None;
+    }
+    s.frametime_p99_ms = plausible_ms(s.frametime_p99_ms);
+    s.frametime_max_ms = plausible_ms(s.frametime_max_ms);
+}
+
+/// Làm sạch số FPS của cả báo cáo (gọi khi đọc từ đĩa).
+fn sanitize_report(report: &mut GameReport) {
+    for s in &mut report.samples {
+        sanitize_sample(s);
+    }
+    sanitize_summary(&mut report.summary, &report.samples);
+}
+
+/// Làm sạch bản tóm tắt: bỏ số vô lý, ÉP thứ tự (`fps_low01 <= fps_low1 <= fps_avg`,
+/// `frametime_max_ms >= frametime_p99_ms`), và nếu tổng kết trống mà mẫu còn số dùng được thì
+/// tính lại từ mẫu — bản cũ chốt bằng số rác nên không dùng lại được.
+fn sanitize_summary(s: &mut Summary, samples: &[Sample]) {
+    s.fps_avg = plausible_fps(s.fps_avg);
+    s.fps_low1 = plausible_fps(s.fps_low1);
+    s.fps_low01 = plausible_fps(s.fps_low01);
+    s.frametime_p99_ms = plausible_ms(s.frametime_p99_ms);
+    s.frametime_max_ms = plausible_ms(s.frametime_max_ms);
+
+    if s.fps_avg.is_none() {
+        s.fps_avg = weighted_fps_avg(samples);
+    }
+    if s.fps_low1.is_none() {
+        let lows: Vec<f32> = samples.iter().filter_map(|s| plausible_fps(s.fps_low1)).collect();
+        if !lows.is_empty() {
+            s.fps_low1 = Some(lows.iter().sum::<f32>() / lows.len() as f32);
+        }
+    }
+    if s.frametime_max_ms.is_none() {
+        s.frametime_max_ms = samples.iter().filter_map(|s| plausible_ms(s.frametime_max_ms)).reduce(f32::max);
+    }
+
+    // Thứ tự bắt buộc: nhóm tệ nhất 0,1% không thể tốt hơn nhóm 1%, và cả hai không thể tốt
+    // hơn trung bình; p99 không thể lớn hơn max.
+    if let (Some(avg), Some(low1)) = (s.fps_avg, s.fps_low1) {
+        if low1 > avg {
+            s.fps_low1 = Some(avg);
+        }
+    }
+    if let (Some(low1), Some(low01)) = (s.fps_low1, s.fps_low01) {
+        if low01 > low1 {
+            s.fps_low01 = Some(low1);
+        }
+    }
+    match (s.frametime_p99_ms, s.frametime_max_ms) {
+        (Some(p99), Some(max)) if p99 > max => s.frametime_p99_ms = Some(max),
+        // p99 có mà max thiếu: max >= p99 là ràng buộc, lấy luôn p99 làm chặn dưới.
+        (Some(p99), None) => s.frametime_max_ms = Some(p99),
+        _ => {}
+    }
 }
 
 /// Khôi phục các bản lưu tạm còn sót lại khi mở app (lần chạy trước bị tắt giữa trận).
@@ -459,6 +550,10 @@ pub struct Live {
     game_exes: Vec<String>,
     /// Meter ETW đo FPS. None khi không mở được session (thường là thiếu quyền admin).
     fps: Option<fps::FpsMeter>,
+    /// Mốc `elapsed()` của lần lấy cửa sổ FPS trước — độ dài THẬT của cửa sổ mẫu.
+    last_fps_elapsed: f32,
+    /// Meter đã chết hẳn (`fps_off` đã ghi): thôi hỏi lại mỗi 5 giây cho khỏi rác event.
+    fps_dead: bool,
     /// Lần ghi event "hitch" gần nhất.
     last_hitch: Option<Instant>,
     sample_every: Duration,
@@ -533,6 +628,8 @@ pub fn start(
         net_target,
         game_exes,
         fps: meter,
+        last_fps_elapsed: 0.0,
+        fps_dead: false,
         last_hitch: None,
         sample_every: Duration::from_secs(sample_secs.max(1)),
         min_duration_sec,
@@ -545,9 +642,13 @@ pub fn start(
     live.lock().unwrap().cpu.pct();
 
     let weak = Arc::downgrade(&live);
-    std::thread::spawn(move || ping_loop(weak));
+    let _ = std::thread::Builder::new()
+        .name("report-ping".to_string())
+        .spawn(move || ping_loop(weak));
     let weak = Arc::downgrade(&live);
-    std::thread::spawn(move || sample_loop(weak));
+    let _ = std::thread::Builder::new()
+        .name("report-sample".to_string())
+        .spawn(move || sample_loop(weak));
     live
 }
 
@@ -580,30 +681,59 @@ impl Live {
         });
     }
 
-    /// PID của tiến trình game đầu tiên khớp tên exe (không phân biệt hoa thường).
-    /// Dò lại mỗi lần lấy mẫu vì game khởi động lại là PID khác.
+    /// PID của mọi tiến trình game khớp tên exe (không phân biệt hoa thường).
+    /// Dò lại mỗi lần lấy mẫu vì game khởi động lại là PID khác; dùng CHUNG một hàm với
+    /// `--fpstest` (`fps::game_pids`) để hai đường đi không lệch nhau.
     fn game_pids(&self) -> Vec<u32> {
-        if self.game_exes.is_empty() {
-            return Vec::new();
-        }
-        sys::list_processes()
-            .into_iter()
-            .filter(|p| self.game_exes.iter().any(|g| g.eq_ignore_ascii_case(&p.name)))
-            .map(|p| p.pid)
-            .collect()
+        fps::game_pids(&self.game_exes)
     }
 
     /// Số liệu FPS của khoảng vừa qua từ meter ETW (`None` khi không có meter, chưa dò được
-    /// PID, hoặc khoảng đó không có frame nào — game đang ở menu loading / alt-tab).
-    fn take_fps_window(&self) -> Option<fps::FpsWindow> {
+    /// PID, hoặc khoảng đó không đủ frame — game đang ở menu loading / alt-tab / meter chết).
+    ///
+    /// Việc phụ: giữ meter sống. Game đang chạy mà meter im lặng >= `fps::STALE_RESTART_SEC`
+    /// thì mở lại session (event `fps_restart`), hết lượt thì ghi `fps_off` kèm lý do — trước
+    /// 1.5.3 meter chết im lặng cả trận mà báo cáo không có dấu vết nào.
+    fn take_fps_window(&mut self, window_secs: f32) -> Option<fps::FpsWindow> {
+        if self.fps.is_none() {
+            return None;
+        }
+        let pids = self.game_pids();
+        let health = {
+            // `meter` mượn `self` bất biến: mọi thứ cần sửa `self` phải làm SAU khối này.
+            let meter = self.fps.as_ref().expect("vừa kiểm tra là Some");
+            meter.set_target_pids(&pids);
+            if self.fps_dead {
+                fps::FpsHealth::Ok
+            } else {
+                meter.check_health(!pids.is_empty())
+            }
+        };
+        match health {
+            fps::FpsHealth::Ok => {}
+            fps::FpsHealth::Restarted(n) => self.push_event(
+                "fps_restart",
+                format!(
+                    "Không nhận được frame nào suốt {:.0} giây dù game đang chạy — đã mở lại session ETW (lần {n}/{})",
+                    fps::STALE_RESTART_SEC,
+                    fps::MAX_RESTARTS
+                ),
+            ),
+            fps::FpsHealth::Dead(why) => {
+                self.fps_dead = true;
+                self.push_event("fps_off", format!("Đo FPS dừng hẳn: {why}"));
+            }
+        }
         let meter = self.fps.as_ref()?;
-        meter.set_target_pids(&self.game_pids());
-        meter.take_window()
+        meter.take_window(window_secs)
     }
 
     /// Chốt FPS bằng số chính xác cả trận từ histogram ETW (nếu meter còn sống) rồi DỪNG meter.
     /// Gọi ở mọi đường kết thúc `Live` (finish, Drop) để session ETW `DEFAULT_SESSION`
     /// không treo lại sau khi trận kết thúc.
+    ///
+    /// `meter.total()` trả `None` khi chưa đủ `fps::MIN_TOTAL_FRAMES` frame, hoặc khi con số
+    /// suy ra vô lý — lúc đó giữ nguyên số tính từ các mẫu (và số rác đã bị lọc).
     fn finish_fps(&mut self) {
         let Some(meter) = self.fps.take() else {
             return;
@@ -626,14 +756,18 @@ impl Live {
         let lists = sys::memory_lists();
         let (commit_used, commit_limit) = sys::commit();
         let cpu = self.cpu.pct();
-        let fps_win = self.take_fps_window();
+        // Độ dài THẬT của cửa sổ FPS vừa qua (không giả định đúng 5 giây: mẫu có thể trễ).
+        let now = self.elapsed();
+        let window_secs = (now - self.last_fps_elapsed).max(0.0);
+        self.last_fps_elapsed = now;
+        let fps_win = self.take_fps_window(window_secs);
         let (gw, net) = {
             let mut p = self.ping.lock().unwrap();
             (std::mem::take(&mut p.gw), std::mem::take(&mut p.net))
         };
 
         let sample = Sample {
-            t: self.elapsed(),
+            t: now,
             avail_gb: mem.avail as f32 / GIB,
             ram_used_pct: if mem.total > 0 {
                 (mem.total - mem.avail) as f32 * 100.0 / mem.total as f32
@@ -656,6 +790,7 @@ impl Live {
             loss_gw_pct: gw.loss_pct(),
             loss_net_pct: net.loss_pct(),
             fps: fps_win.map(|w| w.fps_avg),
+            frames: fps_win.map(|w| w.frames).unwrap_or(0),
             fps_low1: fps_win.map(|w| w.fps_low1),
             frametime_p99_ms: fps_win.map(|w| w.frametime_p99_ms),
             frametime_max_ms: fps_win.map(|w| w.frametime_max_ms),
@@ -848,10 +983,14 @@ fn summarize(report: &GameReport, duration_sec: u64) -> Summary {
 
     // FPS: bản lưu tạm và bản khôi phục không có histogram của meter, nên tự tính từ mẫu.
     // `fps_avg` là trung bình CÓ TRỌNG SỐ theo thời gian mỗi mẫu đại diện.
-    let fps_low1_samples: Vec<f32> = samples.iter().filter_map(|s| s.fps_low1).collect();
+    // Mẫu có số vô lý (fps > MAX_PLAUSIBLE_FPS, frametime < 0,2 ms) bị loại — xem `plausible_*`.
+    let fps_low1_samples: Vec<f32> = samples
+        .iter()
+        .filter_map(|s| plausible_fps(s.fps_low1))
+        .collect();
     let frametime_max = samples
         .iter()
-        .filter_map(|s| s.frametime_max_ms)
+        .filter_map(|s| plausible_ms(s.frametime_max_ms))
         .reduce(f32::max);
 
     let mut summary = Summary {
@@ -892,13 +1031,17 @@ fn summarize(report: &GameReport, duration_sec: u64) -> Summary {
             .count() as u32,
         verdict: Vec::new(),
     };
+    // Ép thứ tự + bỏ số vô lý TRƯỚC khi tính nhận xét: bản lưu tạm / bản khôi phục cũng đi
+    // qua đây, và nhận xét "1% low tụt" chỉ có nghĩa khi số liệu đã nhất quán.
+    sanitize_summary(&mut summary, samples);
     summary.verdict = verdicts(&summary, &report.events);
     summary
 }
 
 /// FPS trung bình có trọng số theo thời gian: mỗi mẫu đại diện cho khoảng thời gian của nó
 /// (mẫu mỗi `SAMPLE_SEC` giây nên trọng số thường đúng bằng chu kỳ lấy mẫu), và CHỈ tính trên
-/// các mẫu thật sự có FPS — mẫu ở menu loading / alt-tab không có frame nào nên bị bỏ.
+/// các mẫu thật sự có FPS — mẫu ở menu loading / alt-tab không có frame nào nên bị bỏ, mẫu có
+/// số vô lý (> `MAX_PLAUSIBLE_FPS`) cũng bị bỏ.
 fn weighted_fps_avg(samples: &[Sample]) -> Option<f32> {
     let mut prev_t = 0.0_f32;
     let mut sum = 0.0_f64;
@@ -906,7 +1049,7 @@ fn weighted_fps_avg(samples: &[Sample]) -> Option<f32> {
     for s in samples {
         let dt = (s.t - prev_t).max(0.0);
         prev_t = s.t;
-        let Some(fps) = s.fps else { continue };
+        let Some(fps) = plausible_fps(s.fps) else { continue };
         // Mốc thời gian trùng/không hợp lệ: lùi về chu kỳ lấy mẫu để không mất mẫu FPS.
         let w = if dt > 0.0 { dt } else { SAMPLE_SEC as f32 };
         sum += fps as f64 * w as f64;
@@ -1233,8 +1376,7 @@ mod tests {
 
     /// Khựng trùng lúc xả standby: event `hitch` cách event `purge` ≤ 5 giây.
     #[test]
-    fn verdict_noi_khung_trung_luc_xa_standby() {
-        let s = Summary {
+    fn verdict_noi_khung_trung_luc_xa_standby() {        let s = Summary {
             fps_avg: Some(180.0),
             fps_low1: Some(150.0),
             hitches: 3,
@@ -1271,5 +1413,125 @@ mod tests {
         assert!(verdicts(&khong_fps, &ev)
             .iter()
             .any(|l| l.contains("quyền admin")));
+    }
+
+    /// Một mẫu chỉ được có FPS khi cửa sổ đủ frame: bản cũ ghi FPS cho cửa sổ 1–2 frame.
+    #[test]
+    fn mau_it_frame_bi_coi_nhu_khong_do_duoc() {
+        let mut it = Sample { t: 20.0, fps: Some(40404.04), fps_low1: Some(22573.36), frames: 2, frametime_max_ms: Some(0.0443), ..Default::default() };
+        sanitize_sample(&mut it);
+        assert_eq!(it.fps, None);
+        assert_eq!(it.fps_low1, None);
+        assert_eq!(it.frametime_max_ms, None, "frametime 0,0443 ms là Present trùng");
+
+        // Đủ frame + số hợp lý thì giữ nguyên.
+        let mut du = Sample { t: 25.0, fps: Some(30.0), fps_low1: Some(20.0), frames: 150, frametime_max_ms: Some(74.0), ..Default::default() };
+        sanitize_sample(&mut du);
+        assert_eq!(du.fps, Some(30.0));
+        assert_eq!(du.fps_low1, Some(20.0));
+        assert_eq!(du.frametime_max_ms, Some(74.0));
+    }
+
+    /// Bản tóm tắt phải nhất quán: bỏ số vô lý, ép `low01 <= low1 <= avg` và `p99 <= max`.
+    #[test]
+    fn summary_duoc_ep_nhat_quan() {
+        // Số rác đúng như báo cáo 2026-10-23 (max < p99).
+        let mut s = Summary {
+            fps_avg: Some(40404.04),
+            fps_low1: Some(20000.0),
+            fps_low01: Some(20000.0),
+            frametime_p99_ms: Some(0.05),
+            frametime_max_ms: Some(0.0443),
+            ..Default::default()
+        };
+        sanitize_summary(&mut s, &[]);
+        assert_eq!(s.fps_avg, None, "40404 FPS > {MAX_PLAUSIBLE_FPS} ⇒ coi như không đo được");
+        assert_eq!(s.fps_low1, None);
+        assert_eq!(s.fps_low01, None);
+        assert_eq!(s.frametime_p99_ms, None);
+        assert_eq!(s.frametime_max_ms, None);
+
+        // Số dùng được nhưng sai thứ tự ⇒ ép lại.
+        let mut s = Summary {
+            fps_avg: Some(100.0),
+            fps_low1: Some(150.0),
+            fps_low01: Some(180.0),
+            frametime_p99_ms: Some(40.0),
+            frametime_max_ms: Some(12.0),
+            ..Default::default()
+        };
+        sanitize_summary(&mut s, &[]);
+        assert_eq!(s.fps_low1, Some(100.0));
+        assert_eq!(s.fps_low01, Some(100.0));
+        assert_eq!(s.frametime_p99_ms, Some(12.0), "p99 không thể lớn hơn max");
+    }
+
+    /// Đọc LẠI báo cáo cũ có số rác: không hiện FPS > 2000, và không sửa file trên đĩa.
+    #[test]
+    fn doc_lai_bao_cao_cu_co_so_rac() {
+        let dir = temp_dir("garbage");
+        let id = "20261023-105444";
+        // Trích đúng phần FPS của reports/20261023-105444.json.
+        let garbage = r#"{
+            "id": "20261023-105444",
+            "game": "DeltaForce.exe",
+            "started_at": "2026-10-23 10:54:44",
+            "ended_at": "2026-10-23 15:39:45",
+            "samples": [
+                {"t": 5.03, "cpu_pct": 20.0, "fps": null},
+                {"t": 20.03, "cpu_pct": 21.0, "fps": 40404.04, "fps_low1": 22573.363,
+                 "frametime_p99_ms": 0.0443, "frametime_max_ms": 0.0443, "hitches": 0},
+                {"t": 17131.0, "cpu_pct": 25.0, "fps": null}
+            ],
+            "events": [{"t": 90.0, "kind": "purge", "text": "Xả standby"}],
+            "summary": {"duration_sec": 17131, "commit_peak_pct": 80.0,
+                        "fps_avg": 40404.04, "fps_low1": 20000.0, "fps_low01": 20000.0,
+                        "frametime_p99_ms": 0.05, "frametime_max_ms": 0.0443, "hitches": 0}
+        }"#;
+        let path = dir.join(format!("{}.json", id));
+        std::fs::write(&path, garbage).unwrap();
+
+        let report = read_report(&path).expect("báo cáo phải parse được");
+        assert_eq!(report.samples.len(), 3);
+        assert_eq!(report.samples[1].fps, None, "FPS > 2000 coi như null");
+        assert_eq!(report.samples[1].fps_low1, None);
+        assert_eq!(report.samples[1].frametime_max_ms, None);
+        assert_eq!(report.summary.fps_avg, None);
+        assert_eq!(report.summary.fps_low1, None);
+        assert_eq!(report.summary.fps_low01, None);
+        assert_eq!(report.summary.frametime_max_ms, None);
+        // Số khác của báo cáo cũ vẫn nguyên (không sửa file, không bịa thêm số).
+        assert_eq!(report.summary.duration_sec, 17131);
+        assert_eq!(report.summary.commit_peak_pct, 80.0);
+        assert_eq!(report.events.len(), 1);
+        // Danh sách báo cáo (`list_reports`) lấy đúng field này ⇒ cột FPS cũng không hiện số rác.
+        let meta = ReportMeta {
+            id: report.id.clone(),
+            fps_avg: report.summary.fps_avg,
+            ..Default::default()
+        };
+        assert_eq!(meta.fps_avg, None);
+        // File trên đĩa KHÔNG bị sửa.
+        assert!(std::fs::read_to_string(&path).unwrap().contains("40404.04"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Bản cũ có số rác ở tổng kết NHƯNG mẫu còn số dùng được ⇒ tổng kết tính lại từ mẫu.
+    #[test]
+    fn doc_lai_tinh_lai_tong_ket_tu_mau() {
+        let mut report = GameReport {
+            id: "20261023-105444".to_string(),
+            samples: vec![
+                Sample { t: 5.0, fps: Some(30.0), fps_low1: Some(20.0), frames: 150, frametime_max_ms: Some(74.0), ..Default::default() },
+                Sample { t: 10.0, fps: Some(40404.04), frames: 2, frametime_max_ms: Some(0.0443), ..Default::default() },
+            ],
+            summary: Summary { fps_avg: Some(40404.04), ..Default::default() },
+            ..Default::default()
+        };
+        sanitize_report(&mut report);
+        assert_eq!(report.summary.fps_avg, Some(30.0), "chỉ còn mẫu hợp lệ");
+        assert_eq!(report.summary.fps_low1, Some(20.0));
+        assert_eq!(report.summary.frametime_max_ms, Some(74.0));
     }
 }

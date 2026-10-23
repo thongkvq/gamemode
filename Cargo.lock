@@ -690,7 +690,7 @@ dependencies = [
 
 [[package]]
 name = "gamemode"
-version = "1.5.2"
+version = "1.5.3"
 dependencies = [
  "eframe",
  "egui_plot",

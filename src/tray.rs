@@ -142,13 +142,13 @@ pub fn start_event_thread(sh: Shared, ctx: eframe::egui::Context, hwnd: isize) {
     {
         let sh = sh.clone();
         let ctx = ctx.clone();
-        std::thread::spawn(move || {
+        let _ = std::thread::Builder::new().name("tray-menu".to_string()).spawn(move || {
             for event in MenuEvent::receiver().iter() {
                 on_menu(&sh, &ctx, hwnd, event.id().as_ref());
             }
         });
     }
-    std::thread::spawn(move || {
+    let _ = std::thread::Builder::new().name("tray-event".to_string()).spawn(move || {
         for event in TrayIconEvent::receiver().iter() {
             match event {
                 TrayIconEvent::Click {
@@ -225,7 +225,7 @@ fn quit(ctx: &eframe::egui::Context, hwnd: isize) {
     QUIT.store(true, Ordering::SeqCst);
     sys::post_close(hwnd);
     ctx.request_repaint();
-    std::thread::spawn(|| {
+    let _ = std::thread::Builder::new().name("tray-test".to_string()).spawn(|| {
         std::thread::sleep(Duration::from_millis(1500));
         std::process::exit(0);
     });

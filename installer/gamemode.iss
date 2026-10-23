@@ -6,7 +6,7 @@
 ; Kết quả: dist\GameMode-Setup-<version>.exe
 
 #define AppName "Paroda GameMode"
-#define AppVersion "1.5.2"
+#define AppVersion "1.5.3"
 #define AppPublisher "thongkvq"
 #define AppExe "GameMode.exe"
 
@@ -63,6 +63,10 @@ Type: dirifempty; Name: "{userprograms}\GameMode"
 
 [Files]
 Source: "..\target\release\gamemode.exe"; DestDir: "{app}"; DestName: "{#AppExe}"; Flags: ignoreversion
+; Bảng debug (profile.release: strip = "none" + debug = "line-tables-only") để backtrace trong
+; gamemode-crash.log có tên hàm:file:dòng, không chỉ địa chỉ. Cargo sinh pdb theo tên package
+; (`gamemode.pdb`), cài thành `GameMode.pdb` cạnh exe; thiếu file thì bỏ qua.
+Source: "..\target\release\gamemode.pdb"; DestDir: "{app}"; DestName: "GameMode.pdb"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\assets\fonts\OFL-ChakraPetch.txt"; DestDir: "{app}\licenses"; Flags: ignoreversion
 Source: "..\assets\fonts\OFL-JetBrainsMono.txt"; DestDir: "{app}\licenses"; Flags: ignoreversion
 

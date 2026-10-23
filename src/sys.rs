@@ -1900,7 +1900,7 @@ fn with_timeout(name: &str, f: fn(&str) -> Result<(), u32>) -> Result<(), u32> {
     const SERVICE_WAIT: Duration = Duration::from_secs(5);
     let (tx, rx) = std::sync::mpsc::channel();
     let owned = name.to_string();
-    std::thread::spawn(move || {
+    let _ = std::thread::Builder::new().name("svc-timeout".to_string()).spawn(move || {
         let _ = tx.send(f(&owned));
     });
     rx.recv_timeout(SERVICE_WAIT).unwrap_or(Err(SERVICE_TIMEOUT))

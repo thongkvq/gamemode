@@ -1736,7 +1736,7 @@ fn finish_live_report(sh: &Shared) {
 /// `task_needs_repair()` trả `false` khi task chưa tồn tại — việc tạo task vẫn do người dùng chọn
 /// bằng công tắc trong tab Tự động & Tối ưu.
 fn repair_task_in_background(sh: Shared) {
-    std::thread::spawn(move || {
+    let _ = std::thread::Builder::new().name("task-repair".to_string()).spawn(move || {
         if !sys::task_needs_repair() {
             return;
         }
@@ -1774,7 +1774,7 @@ fn optimize(sh: Shared, from_auto: bool) {
             "Tối ưu bằng tay (nút Game Boost / menu khay / phím tắt)"
         },
     );
-    std::thread::spawn(move || {
+    let _ = std::thread::Builder::new().name("optimize".to_string()).spawn(move || {
         do_optimize(&sh);
         sh.busy.store(false, Ordering::SeqCst);
     });
@@ -1795,7 +1795,7 @@ fn restore(sh: Shared, from_auto: bool) {
         log_clear(&sh);
     }
     sh.event("restore", "Khôi phục hệ thống (app, service, Wi-Fi, Game DVR)");
-    std::thread::spawn(move || {
+    let _ = std::thread::Builder::new().name("restore".to_string()).spawn(move || {
         do_restore(&sh, false);
         sh.busy.store(false, Ordering::SeqCst);
     });
@@ -1809,7 +1809,7 @@ fn restore_keep_log(sh: Shared) {
     }
     sh.last_auto.store(false, Ordering::SeqCst);
     sh.event("restore", "Khôi phục phiên Game Boost bị bỏ lửng");
-    std::thread::spawn(move || {
+    let _ = std::thread::Builder::new().name("restore-keep".to_string()).spawn(move || {
         do_restore(&sh, false);
         sh.busy.store(false, Ordering::SeqCst);
     });
@@ -2770,7 +2770,7 @@ fn running_games(games: &[String]) -> Vec<String> {
 }
 
 fn start_watcher(sh: Shared) {
-    std::thread::spawn(move || {
+    let _ = std::thread::Builder::new().name("watcher".to_string()).spawn(move || {
         const SCAN: Duration = Duration::from_secs(3);
         const GAME_STABLE: Duration = Duration::from_secs(5);
         const GAME_GONE: Duration = Duration::from_secs(15);
@@ -3578,7 +3578,7 @@ impl App {
         }
         let slot = self.startup_slot.clone();
         let busy = self.startup_busy.clone();
-        std::thread::spawn(move || {
+        let _ = std::thread::Builder::new().name("startup-scan".to_string()).spawn(move || {
             let list = startup::list_startup();
             *slot.lock().unwrap() = Some(list);
             busy.store(false, Ordering::SeqCst);
@@ -3606,7 +3606,7 @@ impl App {
         let slot = self.hw_slot.clone();
         let busy = self.hw_busy.clone();
         let ctx = self.ctx.clone();
-        std::thread::spawn(move || {
+        let _ = std::thread::Builder::new().name("hw-scan".to_string()).spawn(move || {
             let res = hwinfo::collect();
             *slot.lock().unwrap() = Some(res);
             busy.store(false, Ordering::SeqCst);
@@ -3669,7 +3669,7 @@ impl App {
         let slot = self.tweak_slot.clone();
         let busy = self.tweak_busy.clone();
         let ctx = self.ctx.clone();
-        std::thread::spawn(move || {
+        let _ = std::thread::Builder::new().name("tweak-job".to_string()).spawn(move || {
             let mut lines: Vec<(String, Color32)> = Vec::new();
             let mut reboot: Vec<String> = Vec::new();
             let mut save_err: Option<String> = None;
@@ -4458,7 +4458,7 @@ impl App {
         let games = self.sh.games.lock().unwrap().clone();
         let keep = self.sh.keep.lock().unwrap().clone();
         let skip = skip_list(&games);
-        std::thread::spawn(move || {
+        let _ = std::thread::Builder::new().name("app-scan".to_string()).spawn(move || {
             let list = scan_running_apps(&skip, &games, &keep);
             *running.lock().unwrap() = list;
             scanning.store(false, Ordering::SeqCst);
@@ -6816,7 +6816,7 @@ impl eframe::App for App {
                 // --minimized: vào thẳng khay (cửa sổ ẩn) chứ không thu xuống taskbar.
                 // eframe tự hiện cửa sổ sau frame đầu, nên ẩn lại thêm vài lần trong giây đầu.
                 sys::hide_main_window(hwnd);
-                std::thread::spawn(move || {
+                let _ = std::thread::Builder::new().name("hide-window".to_string()).spawn(move || {
                     for ms in [150u64, 400, 900] {
                         std::thread::sleep(Duration::from_millis(ms));
                         sys::hide_main_window(hwnd);
@@ -7839,9 +7839,19 @@ fn tweak_cli(id: &str, apply: bool) -> (i32, String) {
 
 fn main() -> eframe::Result<()> {
     // Bản release là panic=abort + không có console: ghi lý do panic ra file cạnh exe.
+    // Ghi kèm TÊN THREAD (mọi thread app tự tạo đều đặt tên qua `thread::Builder::name`) và
+    // backtrace đã tượng trưng hoá — bản release giữ `debug = "line-tables-only"` +
+    // `strip = "none"` (kèm `GameMode.pdb`) nên backtrace có tên hàm:file:dòng.
     std::panic::set_hook(Box::new(|info| {
-        let msg = format!("[{}] {}
-", sys::local_time_string(), info);
+        let thread = std::thread::current();
+        let name = thread.name().unwrap_or("(unnamed)").to_string();
+        let msg = format!(
+            "[{}] thread \"{}\": {}\n{}\n",
+            sys::local_time_string(),
+            name,
+            info,
+            std::backtrace::Backtrace::force_capture()
+        );
         let path = config_path().with_file_name("gamemode-crash.log");
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
             use std::io::Write;
@@ -8164,18 +8174,11 @@ delete={:?}
             .and_then(|a| a.parse().ok())
             .unwrap_or(10);
         let cfg = load_config();
-        // Mọi tiến trình trùng tên game: có app vẽ hình từ tiến trình con (vd GPU process).
-        let procs: Vec<sys::Proc> = sys::list_processes()
-            .into_iter()
-            .filter(|p| cfg.games.iter().any(|g| g.eq_ignore_ascii_case(&p.name)))
-            .collect();
-        let text = match procs.first() {
-            Some(p) => {
-                let pids: Vec<u32> = procs.iter().map(|p| p.pid).collect();
-                format!("game = {}
-{}", p.name, fps::self_test(&pids, secs))
-            }
-            None => "Không có game nào trong danh sách đang chạy.".to_string(),
+        // Cùng cách chọn PID (theo tên exe, đọc lại mỗi giây) và cùng bộ lọc như báo cáo trận.
+        let text = if fps::game_pids(&cfg.games).is_empty() {
+            "Không có game nào trong danh sách đang chạy.".to_string()
+        } else {
+            fps::self_test_exes(&cfg.games, secs)
         };
         let _ = std::fs::write(config_path().with_file_name("fpstest.txt"), text);
         return Ok(());

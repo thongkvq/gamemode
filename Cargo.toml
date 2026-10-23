@@ -1,6 +1,6 @@
 [package]
 name = "gamemode"
-version = "1.5.2"
+version = "1.5.3"
 edition = "2021"
 
 [dependencies]
@@ -54,7 +54,11 @@ sha2 = "0.10"
 [profile.release]
 opt-level = 3
 lto = true
-strip = true
+# strip = "none" + debug = "line-tables-only": giữ bảng dòng (không kèm biến/local) trong
+# GameMode.exe và sinh GameMode.pdb cạnh exe (MSVC) — nhờ đó backtrace trong
+# gamemode-crash.log có tên hàm:file:dòng thay vì chỉ địa chỉ.
+strip = "none"
+debug = "line-tables-only"
 codegen-units = 1
 panic = "abort"
 

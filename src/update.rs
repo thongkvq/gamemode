@@ -379,7 +379,7 @@ pub fn request_check(sh: &Shared) {
 
 /// Thread nền: kiểm tra 20 giây sau khi app mở, rồi mỗi 6 giờ; có yêu cầu từ UI thì chạy luôn.
 pub fn start_update_thread(sh: Shared) {
-    std::thread::spawn(move || {
+    let _ = std::thread::Builder::new().name("update".to_string()).spawn(move || {
         let mut next = Instant::now() + FIRST_CHECK_DELAY;
         loop {
             let asked = sh.update_request.swap(false, Ordering::SeqCst);
@@ -435,7 +435,7 @@ pub fn start_download(sh: Shared) {
         );
         return;
     };
-    std::thread::spawn(move || {
+    let _ = std::thread::Builder::new().name("update-download".to_string()).spawn(move || {
         set_state(&sh, UpdateState::Downloading { done: 0, total: m.size });
         let progress_sh = sh.clone();
         let result = download_to(&m, move |done, total| {
@@ -522,7 +522,7 @@ fn quit_app() {
     let hwnd = sys::find_window(crate::WINDOW_TITLE);
     sys::post_close(hwnd);
     // Dự phòng: không còn frame nào chạy thì thoát cứng (giống `tray::quit`).
-    std::thread::spawn(|| {
+    let _ = std::thread::Builder::new().name("quit".to_string()).spawn(|| {
         std::thread::sleep(Duration::from_millis(1500));
         std::process::exit(0);
     });

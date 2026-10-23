@@ -283,7 +283,7 @@ impl HotkeyService {
         let worker_pending = pending.clone();
         let worker_errors = errors.clone();
         let spawned = std::thread::Builder::new()
-            .name("gamemode-hotkey".to_string())
+            .name("hotkey".to_string())
             .spawn(move || {
                 worker(
                     worker_bindings,
